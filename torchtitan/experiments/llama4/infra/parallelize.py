@@ -123,7 +123,7 @@ def parallelize_llama(
 
     # turn on per-TransformerBlock compile after AC wrapping and before FSDP
     if model_compile_enabled:
-        apply_compile(model)
+        apply_compile(model, job_config)
 
     dp_mesh: DeviceMesh | None = None
     if parallel_dims.fsdp_enabled or parallel_dims.ep_enabled:
@@ -502,7 +502,7 @@ def apply_moe_ep_tp(
         )
 
 
-def apply_compile(model: nn.Module):
+def apply_compile(model: nn.Module, job_config: JobConfig):
     """
     Apply torch.compile to each TransformerBlock, which makes compilation efficient due to
     repeated structure. Alternatively one can compile the whole model (after applying DP).
@@ -515,7 +515,11 @@ def apply_compile(model: nn.Module):
         fullgraph = True
         if transformer_block.moe_enabled:
             fullgraph = False
-        transformer_block = torch.compile(transformer_block, fullgraph=fullgraph)
+        transformer_block = torch.compile(
+            transformer_block,
+            backend=job_config.compile.backend,
+            fullgraph=fullgraph,
+        )
         model.layers.register_module(layer_id, transformer_block)
 
     logger.info("Compiling each TransformerBlock with torch.compile")
