@@ -161,7 +161,20 @@ def apply_graph_ac(
         )
 
     joint_pass_names = getattr(compile_config, "joint_passes", [])
-    if "apply_sac" not in joint_pass_names:
+
+    if ac_config.force_explicit_ac:
+        # Use force_explicit_ac pass which matches FSDP2 eager policy exactly
+        if "force_explicit_ac" not in joint_pass_names:
+            # Remove apply_sac if present to avoid double-annotation
+            joint_pass_names = [p for p in joint_pass_names if p != "apply_sac"]
+            compile_config.joint_passes = list(joint_pass_names) + [
+                "force_explicit_ac"
+            ]
+            logger.info(
+                "activation_checkpoint.force_explicit_ac is set, added "
+                "force_explicit_ac to compile.joint_passes (FSDP2-matching policy)"
+            )
+    elif "apply_sac" not in joint_pass_names:
         compile_config.joint_passes = list(joint_pass_names) + ["apply_sac"]
         logger.info(
             "activation_checkpoint.mode is 'selective', added apply_sac to "

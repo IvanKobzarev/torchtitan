@@ -202,6 +202,35 @@ llama3_configs = {
             scaling="llama",
         ),
     ),
+    "8B_8K": Llama3Model.Config(
+        dim=8192,
+        n_layers=32,
+        tok_embeddings=Embedding.Config(),
+        norm=RMSNorm.Config(),
+        output=Linear.Config(),
+        layer=Llama3TransformerBlock.Config(
+            attention_norm=RMSNorm.Config(),
+            ffn_norm=RMSNorm.Config(),
+            feed_forward=FeedForward.Config(
+                hidden_dim=compute_ffn_hidden_dim(
+                    8192, multiple_of=1024, ffn_dim_multiplier=1.3
+                ),
+            ),
+            attention=GQAttention.Config(
+                n_heads=32,
+                n_kv_heads=8,
+                attn_backend="sdpa",
+                rope_backend="complex",
+            ),
+        ),
+        rope=RoPE.Config(
+            dim=8192 // 32,
+            max_seq_len=131072,
+            theta=500000,
+            backend="complex",
+            scaling="llama",
+        ),
+    ),
     "8B_flex": Llama3Model.Config(
         dim=4096,
         n_layers=32,

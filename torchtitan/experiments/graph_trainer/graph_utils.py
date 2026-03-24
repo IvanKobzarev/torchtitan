@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import os
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -495,6 +496,34 @@ def get_compiler_passes_from_config(
                     serializable=True,
                 )
             )
+        elif pass_name == "auto_bucketing":
+            import os
+
+            from torch._inductor.config import (
+                aten_distributed_optimizations as dist_opts,
+            )
+
+            pgle_path = getattr(
+                compile_config, "profile_guided_estimation_path", None
+            )
+            if not pgle_path:
+                pgle_path = os.environ.get("PGLE_TRACE_PATH")
+            if pgle_path:
+                dist_opts.profile_guided_estimation_path = pgle_path
+                logger.info(
+                    f"PGLE: using profile-guided estimation from {pgle_path}"
+                )
+
+            bucket_mode = getattr(compile_config, "bucket_mode", "default")
+            if bucket_mode != "default":
+                compiler_passes.append(
+                    functools.partial(
+                        AVAILABLE_COMPILER_PASSES[pass_name],
+                        bucket_mode=bucket_mode,
+                    )
+                )
+            else:
+                compiler_passes.append(AVAILABLE_COMPILER_PASSES[pass_name])
         else:
             compiler_passes.append(AVAILABLE_COMPILER_PASSES[pass_name])
 
@@ -540,7 +569,14 @@ def get_joint_custom_passes_from_config(
         joint_custom_passes.append(validate_flex_attn_annotation_pass)
 
     # Handle joint passes from config (excluding inductor_decomposition)
-    joint_pass_names = getattr(compile_config, "joint_passes", [])
+    joint_pass_names = list(getattr(compile_config, "joint_passes", []))
+    # Support FORCE_EXPLICIT_AC env var for parity with simple_fsdp
+    if (
+        os.environ.get("FORCE_EXPLICIT_AC", "0") == "1"
+        and "force_explicit_ac" not in joint_pass_names
+    ):
+        joint_pass_names.append("force_explicit_ac")
+        logger.info("FORCE_EXPLICIT_AC env var set, adding force_explicit_ac joint pass")
     for pass_name in joint_pass_names:
         if pass_name not in AVAILABLE_JOINT_PASSES:
             raise ValueError(

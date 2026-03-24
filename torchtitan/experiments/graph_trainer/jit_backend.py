@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
 from typing import Any
 
 import torch
@@ -13,6 +14,7 @@ from torchtitan.tools.logging import logger
 
 from .configs import GraphTrainerCompileConfig as CompileConfig
 from .passes import (
+    AVAILABLE_JOINT_PASSES,
     autobucketing_reordering_pass,
     fsdp_reshard_after_fwd_pass,
     transformer_block_bucketing_reordering_pass,
@@ -54,10 +56,24 @@ def get_compile_backend_with_passes(
     if jit_pass_name == "auto_bucketing":
         # Perform auto optimization in aten fx-level and execute code in aot_eager/inductor backend
         # The autobucketing logic is here: https://github.com/pytorch/pytorch/pull/163960
+        import os
+
         from torch._inductor.config import aten_distributed_optimizations as dist_opts
         from torch._inductor.fx_passes.overlap_scheduling import (
             schedule_overlap_bucketing_from_inductor_configs,
         )
+
+        # Wire PGLE config into inductor dist_opts
+        pgle_path = getattr(compile_config, "profile_guided_estimation_path", None)
+        if not pgle_path:
+            pgle_path = os.environ.get("PGLE_TRACE_PATH")
+        if pgle_path:
+            dist_opts.profile_guided_estimation_path = pgle_path
+            logger.info(f"PGLE: using profile-guided estimation from {pgle_path}")
+
+        bucket_mode = getattr(compile_config, "bucket_mode", "default")
+        if bucket_mode != "default":
+            dist_opts.bucket_mode = bucket_mode
 
         if compile_config.backend == "aot_eager":
             from torch._dynamo.backends.common import (
@@ -144,9 +160,25 @@ def get_compile_backend_with_passes(
     else:
         logger.info("No bucketing or overlapping pass is applied")
 
+    # Resolve joint passes from config (e.g. apply_sac, force_explicit_ac)
+    joint_pass_fns = []
+    joint_pass_names = list(getattr(compile_config, "joint_passes", []))
+    # Support FORCE_EXPLICIT_AC env var for parity with simple_fsdp
+    if (
+        os.environ.get("FORCE_EXPLICIT_AC", "0") == "1"
+        and "force_explicit_ac" not in joint_pass_names
+    ):
+        joint_pass_names.append("force_explicit_ac")
+        logger.info("FORCE_EXPLICIT_AC env var set, adding force_explicit_ac joint pass")
+    for pass_name in joint_pass_names:
+        if pass_name in AVAILABLE_JOINT_PASSES:
+            joint_pass_fns.append(AVAILABLE_JOINT_PASSES[pass_name])
+
     def joint_ac_pass(
         gm: torch.fx.GraphModule, example_inputs: Any
     ) -> torch.fx.GraphModule:
+        for pass_fn in joint_pass_fns:
+            pass_fn(gm)
         return fsdp_reshard_after_fwd_pass(gm, fsdp_reshard_after_forward)
 
     def graph_trainer_custom_pass(*args, **kwargs):

@@ -51,6 +51,20 @@ class GraphTrainerCompileConfig(CompileConfig):
     path (e.g. under the job output directory).
     """
 
+    bucket_mode: str = "default"
+    """
+    Bucket mode for collective bucketing in overlap scheduling.
+    Options: default, custom_ops, custom_ops_multidtype, coalesced
+    """
+
+    profile_guided_estimation_path: str | None = None
+    """
+    Path to a Chrome Trace JSON profile for profile-guided latency
+    estimation (PGLE). When set, overlap scheduling uses kernel runtimes
+    from the profile instead of analytical/benchmark estimates.
+    Also reads from PGLE_TRACE_PATH env var if not set here.
+    """
+
 
 @dataclass(kw_only=True, slots=True)
 class GraphTrainerConfig(Trainer.Config):
@@ -79,6 +93,8 @@ def to_graph_trainer_config(
     # non-"none" AC mode to "selective" so callers don't need per-config fixups.
     ac = d.get("activation_checkpoint")
     if ac is not None and ac.mode != "none":
-        d["activation_checkpoint"] = ActivationCheckpointConfig(mode="selective")
+        d["activation_checkpoint"] = ActivationCheckpointConfig(
+            mode="selective", force_explicit_ac=True
+        )
 
     return GraphTrainer.Config(**d)

@@ -138,6 +138,17 @@ def llama3_8b() -> Trainer.Config:
     )
 
 
+def llama3_8b_8k() -> Trainer.Config:
+    config = llama3_8b()
+    config.model_spec = model_registry("8B_8K")
+    config.training = TrainingConfig(
+        local_batch_size=1,
+        seq_len=8192,
+        steps=1000,
+    )
+    return config
+
+
 def llama3_70b() -> Trainer.Config:
     return Trainer.Config(
         hf_assets_path="./assets/hf/Llama-3.1-70B",

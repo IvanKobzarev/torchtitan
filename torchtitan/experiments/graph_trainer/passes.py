@@ -39,7 +39,7 @@ from torchtitan.tools.logging import logger
 
 
 def autobucketing_reordering_pass(
-    gm: torch.fx.GraphModule, example_inputs=None
+    gm: torch.fx.GraphModule, example_inputs=None, bucket_mode=None
 ) -> torch.fx.GraphModule:
     """
     Apply autobucketing and reordering optimization.
@@ -47,7 +47,10 @@ def autobucketing_reordering_pass(
     This pass applies schedule_overlap_bucketing with collective_bucketing enabled
     to optimize comm/compute overlap patterns in the graph.
     """
-    schedule_overlap_bucketing(gm, collective_bucketing=True)
+    kwargs: dict[str, Any] = {"collective_bucketing": True}
+    if bucket_mode is not None:
+        kwargs["bucket_mode"] = bucket_mode
+    schedule_overlap_bucketing(gm, **kwargs)
     gm.recompile()
     return gm
 
@@ -482,6 +485,108 @@ def tlparse_log_graph_pass(
     return gm
 
 
+def force_explicit_ac_pass(
+    gm: torch.fx.GraphModule,
+) -> torch.fx.GraphModule:
+    """
+    Apply activation checkpointing with MUST_SAVE / MUST_RECOMPUTE exactly
+    matching the FSDP2 eager selective-AC policy.
+
+    This uses the same op list from
+    ``torchtitan.distributed.activation_checkpoint._get_save_ops`` and the same
+    mm counting logic (every second mm is recomputed, separate per-AC-region
+    counters).  The key difference from ``apply_sac_pass`` is that this pass
+    uses ``MUST_RECOMPUTE`` instead of ``PREFER_RECOMPUTE`` and includes all ops
+    from the FSDP2 policy (``aten.linear``, ``aten.max``, CUDA→CPU ``_to_copy``,
+    optional vendor ops).
+
+    Usage: set ``--activation_checkpoint.mode selective`` and
+    ``--activation_checkpoint.force_explicit_ac`` (or add ``force_explicit_ac``
+    to ``--compile.joint_passes``).
+    """
+    from torchtitan.distributed.activation_checkpoint import _get_save_ops
+
+    save_ops = _get_save_ops()
+    mm_ops = {torch.ops.aten.mm.default, torch.ops.aten.linear.default}
+
+    ac_region_stats: dict[int, dict[str, int]] = defaultdict(
+        lambda: {"save": 0, "recompute": 0}
+    )
+    # Per-AC-region mm counters, matching FSDP2's per-module counter reset
+    mm_counts: dict[int, int] = defaultdict(int)
+
+    for node in gm.graph.nodes:
+        if node.op != "call_function":
+            continue
+
+        if node.target in (
+            operator.getitem,
+            torch.ops._c10d_functional.wait_tensor.default,
+        ):
+            parent = node.args[0]
+            if isinstance(parent, torch.fx.Node) and "recompute" in parent.meta:
+                node.meta["recompute"] = parent.meta["recompute"]
+                node.meta["ac_graph_id"] = parent.meta.get("ac_graph_id", 0)
+            continue
+
+        custom_meta = node.meta.get("custom", {})
+        # Only annotate nodes inside AC regions (transformer blocks).
+        # Nodes outside AC regions (embedding, output, loss) are left for
+        # the partitioner to decide, matching FSDP2's per-module compile
+        # where only transformer block internals get AC annotations.
+        if _AC_REGION_ID not in custom_meta:
+            continue
+        ac_region_id = custom_meta[_AC_REGION_ID]
+        node.meta["ac_graph_id"] = ac_region_id
+
+        # CUDA→CPU _to_copy: always save (matches FSDP2 eager policy)
+        if node.target == torch.ops.aten._to_copy.default:
+            args = node.args
+            kwargs = node.kwargs
+            if (
+                len(args) >= 1
+                and hasattr(args[0], "meta")
+                and "cuda" in str(args[0].meta.get("val", torch.tensor(0)).device)
+                and "device" in kwargs
+                and str(kwargs["device"]) == "cpu"
+            ):
+                policy = CheckpointPolicy.MUST_SAVE
+                node.meta["recompute"] = policy
+                ac_region_stats[ac_region_id]["save"] += 1
+                continue
+
+        if node.target in mm_ops:
+            mm_counts[ac_region_id] += 1
+            if mm_counts[ac_region_id] % 2 == 0:
+                policy = CheckpointPolicy.MUST_RECOMPUTE
+            else:
+                policy = CheckpointPolicy.MUST_SAVE
+        elif node.target in save_ops:
+            policy = CheckpointPolicy.MUST_SAVE
+        else:
+            policy = CheckpointPolicy.MUST_RECOMPUTE
+
+        node.meta["recompute"] = policy
+        if policy == CheckpointPolicy.MUST_SAVE:
+            ac_region_stats[ac_region_id]["save"] += 1
+        else:
+            ac_region_stats[ac_region_id]["recompute"] += 1
+
+    gm.recompile()
+    logger.info(
+        "Applied FORCE_EXPLICIT_AC: selective activation checkpointing "
+        "with MUST_SAVE/MUST_RECOMPUTE matching FSDP2 eager policy."
+    )
+    for ac_region_id in sorted(ac_region_stats):
+        stats = ac_region_stats[ac_region_id]
+        logger.info(
+            f"  AC region {ac_region_id}: "
+            f"{stats['save']} nodes annotated with MUST_SAVE, "
+            f"{stats['recompute']} nodes annotated with MUST_RECOMPUTE"
+        )
+    return gm
+
+
 # Registry mapping pass names to pass functions (for AOT mode fwd/bwd passes)
 AVAILABLE_COMPILER_PASSES = {
     "auto_bucketing": autobucketing_reordering_pass,
@@ -497,4 +602,5 @@ AVAILABLE_JOINT_PASSES = {
     "fsdp_reshard_after_fwd": fsdp_reshard_after_fwd_pass,
     "validate_flex_attn_annotation": validate_flex_attn_annotation_pass,
     "apply_sac": apply_sac_pass,
+    "force_explicit_ac": force_explicit_ac_pass,
 }

@@ -16,6 +16,7 @@ from torchtitan.config import (
 )
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.tensor_parallel import maybe_enable_async_tp
+from torchtitan.distributed.activation_checkpoint import apply_ac
 from torchtitan.experiments.graph_trainer.common_utils import (
     annotate_ac_regions,
     apply_graph_ac,
@@ -105,7 +106,16 @@ def parallelize_llama(
         maybe_enable_async_tp(parallelism, compile_config, tp_mesh)
 
     if ac_config.mode != "none":
-        apply_graph_ac(compile_config, ac_config)
+        if ac_config.force_explicit_ac:
+            # Use eager AC (checkpoint wrapping per transformer block) to
+            # create checkpoint HOPs. This gives per-block min-cut
+            # partitioning via run_joint_graph_passes_on_hops, matching
+            # simple_fsdp's memory behavior. Without this, the entire
+            # model is partitioned as one flat graph, which uses
+            # significantly more activation memory with TP.
+            apply_ac(model, ac_config)
+        else:
+            apply_graph_ac(compile_config, ac_config)
 
     # apply data parallel
     if (

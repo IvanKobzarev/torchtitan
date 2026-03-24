@@ -346,6 +346,14 @@ class ActivationCheckpointConfig:
     https://docs.pytorch.org/docs/stable/checkpoint.html for details.
     """
 
+    force_explicit_ac: bool = False
+    """
+    When True, the graph_trainer uses MUST_SAVE / MUST_RECOMPUTE annotations
+    that exactly match the FSDP2 eager selective-AC policy (same op list,
+    same mm counting). This replaces the default apply_sac joint pass with
+    force_explicit_ac.
+    """
+
 
 @dataclass(kw_only=True, slots=True)
 class CompileConfig:
