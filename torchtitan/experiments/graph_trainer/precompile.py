@@ -145,7 +145,7 @@ class PrecompiledFxTraceArtifact:
     output_subclass_layouts: dict[int, SubclassLayout]
     output_spec: pytree.TreeSpec
     tensor_input_indices: list[int]
-    user_inputs_spec: pytree.TreeSpec
+    user_inputs_spec: pytree.TreeSpec | None
     config_fingerprint: ConfigFingerprint = ConfigFingerprint("")
 
     @classmethod
@@ -162,19 +162,35 @@ class PrecompiledFxTraceArtifact:
         (e.g. the embedding vocab offset from
         _runtime_compute_coordinate_on_dim).
         """
+        from torch._inductor.output_code import RegionalOutputCode
         from torch.fx._graph_pickler import GraphPickler, Options
 
         from torchtitan.experiments.graph_trainer.inductor_passes import (
             _node_metadata_key_filter_distributed,
         )
 
-        serialized_gm = GraphPickler.dumps(
-            traced_result.gm,
-            Options(
-                ops_filter=None,
-                node_metadata_key_filter=_node_metadata_key_filter_distributed,
-            ),
-        )
+        gm = traced_result.gm
+        if isinstance(gm, RegionalOutputCode):
+            gm.prepare_for_serialization()
+            serialized_gm = pickle.dumps(gm)
+        else:
+            serialized_gm = GraphPickler.dumps(
+                gm,
+                Options(
+                    ops_filter=None,
+                    node_metadata_key_filter=_node_metadata_key_filter_distributed,
+                ),
+            )
+
+        try:
+            pickle.dumps(traced_result.user_inputs_spec)
+            user_inputs_spec = traced_result.user_inputs_spec
+        except TypeError:
+            logger.warning(
+                "user_inputs_spec is not picklable (likely due to BlockMask "
+                "context); storing None -- runtime spec validation will be skipped"
+            )
+            user_inputs_spec = None
 
         return cls(
             serialized_gm=serialized_gm,
@@ -185,7 +201,7 @@ class PrecompiledFxTraceArtifact:
             output_subclass_layouts=traced_result.output_subclass_layouts,
             output_spec=traced_result.output_spec,
             tensor_input_indices=traced_result.tensor_input_indices,
-            user_inputs_spec=traced_result.user_inputs_spec,
+            user_inputs_spec=user_inputs_spec,
             config_fingerprint=config_fingerprint or ConfigFingerprint(""),
         )
 
@@ -199,15 +215,40 @@ class PrecompiledFxTraceArtifact:
         """
         _register_coor_ops()
 
+        from torch._inductor.output_code import RegionalOutputCode
         from torch._subclasses import FakeTensorMode
         from torch.fx._graph_pickler import GraphPickler
 
-        fake_mode = FakeTensorMode(
-            allow_non_fake_inputs=True,
-            shape_env=torch.fx.experimental.symbolic_shapes.ShapeEnv(),
-        )
-        gm = GraphPickler.loads(self.serialized_gm, fake_mode)
-        gm.recompile()
+        gm = None
+        try:
+            obj = pickle.loads(self.serialized_gm)
+        except Exception:
+            obj = None
+
+        if isinstance(obj, RegionalOutputCode):
+            fake_mode = FakeTensorMode(
+                allow_non_fake_inputs=True,
+                shape_env=torch.fx.experimental.symbolic_shapes.ShapeEnv(),
+            )
+            fake_input = fake_mode.from_tensor(torch.empty(1, device="cpu"))
+            obj.post_compile([fake_input], constants=None, graph_kwargs={})
+
+            class _RegionalWrapper:
+                def __init__(self, roc):
+                    self._roc = roc
+
+                def __call__(self, *args):
+                    return self._roc(list(args))
+
+            gm = _RegionalWrapper(obj)
+
+        if gm is None:
+            fake_mode = FakeTensorMode(
+                allow_non_fake_inputs=True,
+                shape_env=torch.fx.experimental.symbolic_shapes.ShapeEnv(),
+            )
+            gm = GraphPickler.loads(self.serialized_gm, fake_mode)
+            gm.recompile()
 
         return TracedResult(
             gm=gm,

@@ -278,14 +278,14 @@ def _precompile_aot_fx_trace(
         compile_time_passes,
     )
 
-    passes = compile_time_passes(traced_result, config)
+    passes = compile_time_passes(traced_result, config, serializable=True)
 
     traced_result.gm = apply_graph_passes(
         traced_result.gm, traced_result.example_inputs, passes
     )
     logger.info(
         f"Applied {len(passes)} precompile graph passes, "
-        f"graph now has {len(list(traced_result.gm.graph.nodes))} nodes"
+        f"graph now has {len(list(traced_result.gm.graph.nodes)) if hasattr(traced_result.gm, 'graph') else 'N/A (compiled)'} nodes"
     )
 
     storage = DiskStorageAdapter(compile_config.precompile_artifact_dir)

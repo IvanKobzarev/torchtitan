@@ -128,6 +128,7 @@ def compile_time_passes(
     config: "GraphTrainer.Config",
     *,
     use_cudagraph: bool = False,
+    serializable: bool = False,
 ) -> list[Callable]:
     """Cleanup, FlexAttention annotation, and regional_inductor passes.
 
@@ -176,11 +177,14 @@ def compile_time_passes(
 
     inductor_compilation = config.compile.inductor_compilation
     if inductor_compilation == "full":
-        # Compile the entire graph into optimized Triton kernels. Must
-        # be terminal — the FX graph is no longer authoritative after
-        # this pass, so custom_codegen_pass and
-        # insert_kernel_annotations_pass cannot follow.
-        passes.append(full_inductor_compilation_pass)
+        if serializable:
+            passes.append(
+                functools.partial(
+                    full_inductor_compilation_pass, serializable=True
+                )
+            )
+        else:
+            passes.append(full_inductor_compilation_pass)
     if inductor_compilation == "regional":
         # FlexAttention HOPs must be compiled (via regional_inductor) to
         # produce bitwise identical results to the eager Trainer path.
@@ -199,8 +203,13 @@ def compile_time_passes(
             )
 
             passes.append(annotate_rmsnorm_for_regional_inductor_pass)
-        passes.append(regional_inductor_pass)
-        if use_cudagraph:
+        if serializable:
+            passes.append(
+                functools.partial(regional_inductor_pass, serializable=True)
+            )
+        else:
+            passes.append(regional_inductor_pass)
+        if use_cudagraph and not serializable:
             # Must run before custom_codegen_pass (last in pre_passes)
             # which replaces the GraphModule's forward().
             # Also must run before cudagraph_pass.
@@ -214,7 +223,8 @@ def compile_time_passes(
         # 3. User-editable codegen: users can directly modify the generated
         #    program on disk for fine-grain scheduling optimizations, with
         #    hot-reload picking up changes at runtime
-        passes.append(custom_codegen_pass)
+        if not serializable:
+            passes.append(custom_codegen_pass)
     return passes
 
 
@@ -319,9 +329,14 @@ def apply_graph_passes(
             before_snapshot = snapshot_graph(gm)
             start = time.perf_counter()
         gm = pass_fn(gm, example_inputs)
-        assert isinstance(
-            gm, torch.fx.GraphModule
-        ), f"Pass {pass_name} returned {type(gm).__name__}, expected GraphModule"
+        if not isinstance(gm, torch.fx.GraphModule):
+            from torch._inductor.output_code import RegionalOutputCode
+
+            if not isinstance(gm, RegionalOutputCode):
+                raise TypeError(
+                    f"Pass {pass_name} returned {type(gm).__name__}, "
+                    f"expected GraphModule or RegionalOutputCode"
+                )
         if debug:
             elapsed = time.perf_counter() - start
             logger.info(f"Pass {pass_name} took {elapsed:.3f}s")

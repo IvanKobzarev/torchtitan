@@ -36,6 +36,7 @@ def _ops_filter_with_distributed(name: str) -> bool:
             "torch.ops._c10d_functional",
             "torch.ops._dtensor",
             "torch.ops.device_mesh",
+            "torch.ops.bucketing",
         )
     )
 
@@ -200,7 +201,10 @@ def annotate_flex_attention_for_regional_inductor_pass(
 
 
 def full_inductor_compilation_pass(
-    gm: torch.fx.GraphModule, example_inputs: tuple
+    gm: torch.fx.GraphModule,
+    example_inputs: tuple,
+    *,
+    serializable: bool = False,
 ) -> torch.fx.GraphModule:
     """Apply full Inductor compilation with code generation.
 
@@ -242,6 +246,14 @@ def full_inductor_compilation_pass(
         return gm
 
     gm = _apply_decompositions(gm, example_inputs)
+
+    if serializable:
+        logger.warning(
+            "full_inductor_compilation_pass: serializable=True not yet supported. "
+            "Returning graph without inductor compilation."
+        )
+        return gm
+
     output_code = compile_fx_inner(gm, example_inputs)
 
     # compile_fx_inner returns OutputCode with boxed calling convention
