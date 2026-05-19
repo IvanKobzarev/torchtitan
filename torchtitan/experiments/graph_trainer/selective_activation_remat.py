@@ -24,6 +24,62 @@ from torchtitan.experiments.graph_trainer.common_utils import _is_backward_node
 log = logging.getLogger(__name__)
 
 
+def _repropagate_fake_tensors(
+    recomputed_nodes: dict[fx.Node, fx.Node],
+    fake_mode: torch._subclasses.fake_tensor.FakeTensorMode,
+) -> None:
+    """Re-execute recomputed nodes to give each a fresh ``meta["val"]``.
+
+    ``graph.node_copy`` shallow-copies ``meta``, so every duplicate's
+    ``meta["val"]`` shares the exact same FakeTensor (and storage
+    ``_cdata``) as the original forward node.  Downstream passes (e.g.,
+    ``MemoryTracker`` in overlap scheduling) rely on distinct storages
+    to track allocations; shared storages between forward and recomputed
+    nodes cause assertion failures when the scheduler reorders them.
+
+    Follows the ``FakeTensorUpdater`` pattern: re-execute under fake
+    mode, then ``rebind_unbacked`` + ``compute_unbacked_bindings`` to
+    remap new unbacked symbols (from data-dependent ops like MoE
+    routing) back to the originals.  Propagation is bounded to the
+    recomputed set with forward wavefront through users, keeping
+    data-dependent symbol chains self-consistent.
+    """
+    from torch._dispatch.python import enable_python_dispatcher
+    from torch.fx.experimental.symbolic_shapes import (
+        compute_unbacked_bindings,
+        rebind_unbacked,
+    )
+
+    def get_val(x: object) -> object:
+        if isinstance(x, fx.Node):
+            return x.meta.get("val")
+        return x
+
+    shape_env = fake_mode.shape_env
+    must_process: set[fx.Node] = set(recomputed_nodes.values())
+
+    for dup in recomputed_nodes.values():
+        if dup not in must_process:
+            continue
+        if dup.op != "call_function" or "val" not in dup.meta:
+            continue
+
+        fake_args = torch.fx.map_arg(dup.args, get_val)
+        fake_kwargs = torch.fx.map_arg(dup.kwargs, get_val)
+
+        with fake_mode, enable_python_dispatcher():
+            result = dup.target(*fake_args, **fake_kwargs)
+
+        rebind_unbacked(shape_env, dup, result)
+
+        dup.meta["val"] = result
+        if symbol_to_path := compute_unbacked_bindings(shape_env, result):
+            dup.meta["unbacked_bindings"] = symbol_to_path
+
+        for user in dup.users:
+            must_process.add(user)
+
+
 def _collect_backward_regions(
     gm: fx.GraphModule,
 ) -> list[tuple[int, int, bool]]:
@@ -91,6 +147,12 @@ def selective_activation_remat_pass(
             "in recompute regions. Please move RNG operations outside "
             "of recompute regions, or use joint graph mode (where partitioner handles RNG)."
         )
+
+    from torch._dynamo.utils import detect_fake_mode
+
+    fake_mode = detect_fake_mode(
+        tuple(node.meta.get("val") for node in gm.graph.find_nodes(op="placeholder"))
+    )
 
     regions = _collect_backward_regions(gm)
     if not regions:
@@ -291,6 +353,8 @@ def selective_activation_remat_pass(
         log.debug(
             "Recomputing %s before backward node %s", fwd_node.name, bwd_target.name
         )
+
+    _repropagate_fake_tensors(recomputed_nodes, fake_mode)
 
     # Redirect every direct backward consumer of a recomputed forward node
     # to read from the dup. Backward consumers of offloaded forward nodes
