@@ -248,6 +248,19 @@ def full_inductor_compilation_pass(
         for node in module.graph.nodes:
             if node.op in ("placeholder", "output"):
                 continue
+            # Exclude tensor constant get_attrs (e.g. DTensor DeviceMesh,
+            # _MaskPartial fills) from the compiled region. If included,
+            # they become module attributes on the scooped submodule and
+            # AOT autograd lifts them as extra compiled-function inputs.
+            # The precompile deserialization wrapper does not prepend
+            # these, causing an input count mismatch at training time.
+            # Leaving them outside makes them regular runtime args passed
+            # by the outer graph. GraphModule get_attrs (flex attention
+            # subgraphs) must stay inside the compiled region.
+            if node.op == "get_attr":
+                attr = getattr(module, node.target, None)
+                if not isinstance(attr, torch.fx.GraphModule):
+                    continue
             node.meta.setdefault("custom", {}).setdefault(
                 "compile_with_inductor", {"inductor_configs": {}}
             )
