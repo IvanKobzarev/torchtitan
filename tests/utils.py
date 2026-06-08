@@ -34,10 +34,8 @@ def _hash_model_impl(
             else:
                 t = obj.cpu().contiguous()
 
-            # NOTE: data.numpy().tobytes() is the fastest way to convert a
-            # tensor to a bytestream. See benchmark results at
-            # https://github.com/pytorch/pytorch/issues/108565#issuecomment-3067330004
-            raw_bytes = t.numpy().tobytes()
+            # Reinterpret as uint8 for dtype-agnostic raw bytes (bf16 etc.)
+            raw_bytes = t.view(torch.uint8).numpy().tobytes()
             if per_tensor:
                 tensor_hash = hashlib.new(algo)
                 tensor_hash.update(raw_bytes)

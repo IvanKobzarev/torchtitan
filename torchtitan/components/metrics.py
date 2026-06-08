@@ -63,10 +63,15 @@ class DeviceMemoryMonitor:
         device_info = device_module.memory_stats(self.device)
 
         max_active = device_info.get("active_bytes.all.peak", -1)
+
+        # Physical HBM from driver -- comparable across CG and non-CG runs.
+        # reserved_bytes.all.peak is virtual address space with
+        # expandable_segments and excludes CG private pools.
+        free, total = device_module.mem_get_info(self.device_index)
+        max_reserved = total - free
+
         max_active_gib = self._to_gib(max_active)
         max_active_pct = self._to_pct(max_active)
-
-        max_reserved = device_info.get("reserved_bytes.all.peak", -1)
         max_reserved_gib = self._to_gib(max_reserved)
         max_reserved_pct = self._to_pct(max_reserved)
 

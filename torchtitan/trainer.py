@@ -193,6 +193,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
     def __init__(self, config: Config):
         torch._C._log_api_usage_once("torchtitan.train")
 
+        # Workaround: MAST conda fbpkg's patch_pytorch_triton.py patches nvsmi
+        # to use pynvml which may not be installed. Bypass by hardcoding H100
+        # max SM clock (1980 MHz) - only affects inductor runtime estimation.
+        try:
+            torch._utils_internal.max_clock_rate()
+        except (ImportError, ModuleNotFoundError):
+            torch._utils_internal.max_clock_rate = lambda: 1980
+
         self.config = config
         assert (
             config.model_spec is not None
@@ -808,6 +816,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             "n_tokens_seen": global_ntokens_seen,
             "lr": lr,
         }
+
+        from tests.utils import hash_model
+
+        weight_hashes = [hash_model(m) for m in self.model_parts]
+        if weight_hashes[0]:
+            logger.info(
+                f"[step {self.step}] weight_hash: {'|'.join(weight_hashes)}"
+            )
+
         self.metrics_processor.log(
             self.step,
             global_avg_loss,
