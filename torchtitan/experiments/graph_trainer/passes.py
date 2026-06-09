@@ -42,6 +42,7 @@ from torchtitan.experiments.graph_trainer.debug_utils import (
     snapshot_graph,
 )
 from torchtitan.experiments.graph_trainer.fsdp_passes import (
+    get_fsdp_param_module_order,
     joint_transformer_block_bucketing_reordering_pass,
     overlap_fsdp_ag_rs_pass,
 )
@@ -169,6 +170,9 @@ def compile_time_passes(
         functools.partial(
             joint_transformer_block_bucketing_reordering_pass,
             module_bucket_plans=get_default_transformer_block_buckets(n_layers),
+            fsdp_param_module_order=get_fsdp_param_module_order(
+                traced_result.state_fqns
+            ),
         ),
     ]
     if config.parallelism.enable_async_tensor_parallel:
