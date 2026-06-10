@@ -20,16 +20,13 @@ from typing import Any
 
 import torch
 import torch.fx as fx
-from torch._dynamo.graph_deduplication import _stable_topological_sort
 from torch._inductor.fx_passes.bucketing import (
     BucketMode,
-    _get_collective_node_from_wait,
     is_all_gather_into_tensor as is_all_gather,
-    is_reduce_scatter_tensor as is_reduce_scatter,
     is_wait_tensor,
-    merge_reduce_scatter_bucket,
 )
 from torch._inductor.fx_passes.overlap_manual_scheduling import (
+    _move_overlap_nodes,
     manual_overlap_bucketing,
     ManualOverlapPreservingBucketer,
     ManualOverlapScheduler,
@@ -41,6 +38,7 @@ from torch._inductor.fx_passes.overlap_scheduling import (
 from torch.utils._ordered_set import OrderedSet
 
 from torchtitan.experiments.graph_trainer.common_utils import (
+    _get_layer_id,
     _is_backward_node,
     _MODULE_FQN,
 )
@@ -178,66 +176,65 @@ def get_fsdp_param_module_order(state_fqns: list[str]) -> dict[str, int]:
 
 
 class FSDPParamOrderBucketer(ManualOverlapPreservingBucketer):
-    """Pack FSDP reduce-scatter buckets in Eager FSDP parameter order."""
+    """Pack FSDP buckets in Eager FSDP2 parameter order."""
 
     def __init__(
         self,
         *args: Any,
         fsdp_param_module_order: dict[str, int] | None = None,
+        unbucket_final_bwd_layer_all_gather: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
         self.fsdp_param_module_order = fsdp_param_module_order or {}
+        self.unbucket_final_bwd_layer_all_gather = unbucket_final_bwd_layer_all_gather
+        self.final_layer_id = max(
+            (
+                int(parts[1])
+                for fqn in self.fsdp_param_module_order
+                if (parts := fqn.split("."))[0] == "layers"
+                and len(parts) > 1
+                and parts[1].isdigit()
+            ),
+            default=None,
+        )
 
     def _param_order_key(self, node: fx.Node) -> tuple[int, int]:
         module_fqn = node.meta.get("custom", {}).get(_MODULE_FQN)
         param_idx = self.fsdp_param_module_order.get(module_fqn, len(self.node_idx))
         return (param_idx, self.node_idx[node])
 
+    def _mark_all_gather_prefetch_without_bucket(self, coll_nodes: list[fx.Node]) -> None:
+        for node in coll_nodes:
+            wait = self.collective_info[node].wait_node
+            self.bucketed_node_types[node] = "bucketed_all_gather"
+            self.bucketed_node_types[wait] = "bucketed_all_gather_wait"
+            self.node_to_wait_map[wait] = wait
+
+    def _is_final_backward_layer_all_gather_group(
+        self, coll_nodes: list[fx.Node]
+    ) -> bool:
+        if self.final_layer_id is None or not _is_backward_node(coll_nodes[0]):
+            return False
+        return _get_layer_id(coll_nodes[0]) == self.final_layer_id
+
     def _bucket_group(self, coll_nodes: list[fx.Node]) -> None:
-        if not (
-            self.fsdp_param_module_order
-            and coll_nodes
-            and is_reduce_scatter(coll_nodes[0])
+        if self.fsdp_param_module_order:
+            coll_nodes = sorted(coll_nodes, key=self._param_order_key)
+        if (
+            self.unbucket_final_bwd_layer_all_gather
+            and is_all_gather(coll_nodes[0])
+            and self._is_final_backward_layer_all_gather_group(coll_nodes)
         ):
-            return super()._bucket_group(coll_nodes)
-
-        waits = [self.collective_info[n].wait_node for n in coll_nodes]
-        first_wait = min(waits, key=lambda w: self.node_idx[w])
-
-        first_by_graph = min(coll_nodes, key=lambda n: self.node_idx[n])
-        next_node = first_by_graph
-        while next_node in coll_nodes:
-            next_node = next_node.next
-
-        ordered_coll_nodes = sorted(coll_nodes, key=self._param_order_key)
-        new_nodes, _ = merge_reduce_scatter_bucket(
-            self.graph,
-            ordered_coll_nodes,
-            wait_insertion_point=first_wait,
-            insert_before=next_node,
-            mode=self.bucket_mode,
-        )
-
-        wait_to_start = {
-            n: start
-            for n in new_nodes
-            if (start := _get_collective_node_from_wait(n)) is not None
-        }
-        assert len(wait_to_start) >= 1, (
-            f"Expected at least one new wait, got none in {new_nodes}"
-        )
-        new_waits = list(wait_to_start)
-        new_start: fx.Node = wait_to_start[new_waits[0]]
-        new_wait = new_waits[-1]
-
-        wait_set = OrderedSet(new_waits)
-        for n in new_nodes:
-            if n in wait_set:
-                self.bucketed_node_types[n] = "bucketed_reduce_scatter_wait"
-                self.node_to_wait_map[n] = new_wait
-            elif n is new_start:
-                self.bucketed_node_types[n] = "bucketed_reduce_scatter"
+            # There is no following transformer layer to amortize a merged
+            # all-gather bucket, so preserve prefetching without the bucket temp.
+            logger.info(
+                "Skipped all-gather bucketing for final backward layer "
+                f"{self.final_layer_id} ({len(coll_nodes)} node(s))"
+            )
+            self._mark_all_gather_prefetch_without_bucket(coll_nodes)
+            return
+        return super()._bucket_group(coll_nodes)
 
 
 class JointManualOverlapScheduler(ManualOverlapScheduler):
@@ -276,6 +273,7 @@ class JointManualOverlapScheduler(ManualOverlapScheduler):
         module_stack_fn: Callable[[fx.Node], list[tuple[str, type[Any]]]],
         bucket_mode: BucketMode | None = None,
         fsdp_param_module_order: dict[str, int] | None = None,
+        unbucket_final_bwd_layer_all_gather: bool = False,
     ) -> None:
         super().__init__(
             gm,
@@ -292,6 +290,7 @@ class JointManualOverlapScheduler(ManualOverlapScheduler):
             scheduled=OrderedSet(self.graph.nodes),
             bucket_mode=effective_bucket_mode,
             fsdp_param_module_order=fsdp_param_module_order,
+            unbucket_final_bwd_layer_all_gather=unbucket_final_bwd_layer_all_gather,
         )
 
     def _manual_bucket_collectives(self) -> None:
@@ -304,6 +303,8 @@ class JointManualOverlapScheduler(ManualOverlapScheduler):
                 self.bucketer.manual_bucket_collectives(nodes=fwd_nodes)
             if bwd_nodes:
                 self.bucketer.manual_bucket_collectives(nodes=bwd_nodes)
+
+        from torch._dynamo.graph_deduplication import _stable_topological_sort
 
         _stable_topological_sort(self.graph, {})
         self.graph.lint()
@@ -320,7 +321,9 @@ class JointManualOverlapScheduler(ManualOverlapScheduler):
         self._schedule_rs_prefetch(overlap_deps)
         self._schedule_ag_prefetch(overlap_deps)
 
-        _stable_topological_sort(self.graph, overlap_deps)
+        _move_overlap_nodes(
+            self.graph, overlap_deps, self.bucketer.bucketed_node_types
+        )
         self.graph.lint()
 
         if self.insert_overlap_deps:
@@ -449,6 +452,7 @@ def joint_transformer_block_bucketing_reordering_pass(
     insert_overlap_deps: bool = False,
     bucket_mode: BucketMode | None = None,
     fsdp_param_module_order: dict[str, int] | None = None,
+    unbucket_final_bwd_layer_all_gather: bool = False,
 ) -> torch.fx.GraphModule:
     """Run joint-graph manual bucketing and reordering.
 
@@ -467,6 +471,9 @@ def joint_transformer_block_bucketing_reordering_pass(
             ``preserve_node_ordering`` after the topological sort.
         bucket_mode: bucket mode forwarded to the underlying bucketer;
             defaults to ``"custom_ops"`` via the parent class.
+        unbucket_final_bwd_layer_all_gather: keep final backward layer
+            all-gathers as individual collectives while still scheduling
+            their prefetches.
     """
 
     def _stack_fn(node: torch.fx.Node) -> list[tuple[str, type]]:
@@ -483,6 +490,7 @@ def joint_transformer_block_bucketing_reordering_pass(
         module_stack_fn=_stack_fn,
         bucket_mode=bucket_mode,
         fsdp_param_module_order=fsdp_param_module_order,
+        unbucket_final_bwd_layer_all_gather=unbucket_final_bwd_layer_all_gather,
     ).run()
     overlapped_gm.recompile()
     return overlapped_gm

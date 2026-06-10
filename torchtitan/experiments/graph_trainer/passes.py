@@ -173,6 +173,9 @@ def compile_time_passes(
             fsdp_param_module_order=get_fsdp_param_module_order(
                 traced_result.state_fqns
             ),
+            unbucket_final_bwd_layer_all_gather=(
+                config.compile.memory_policy == "full"
+            ),
         ),
     ]
     if config.parallelism.enable_async_tensor_parallel:

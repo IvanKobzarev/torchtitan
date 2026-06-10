@@ -88,9 +88,28 @@ def _make_eager_memory_policy(save_ops: set | None = None) -> Callable:
 
 def _make_full_memory_policy() -> Callable:
     def policy_fn(node: torch.fx.Node) -> CheckpointPolicy:
+        if node.target is torch.ops.higher_order.flex_attention:
+            return CheckpointPolicy.MUST_SAVE
         return CheckpointPolicy.PREFER_RECOMPUTE
 
     return policy_fn
+
+
+def _tag_flex_attention_outputs_for_offload(gm: torch.fx.GraphModule) -> int:
+    tagged = 0
+    for node in gm.graph.nodes:
+        if node.target is not torch.ops.higher_order.flex_attention:
+            continue
+        for user in node.users:
+            if user.target is not operator.getitem:
+                continue
+            if not isinstance(user.meta.get("val"), torch.Tensor):
+                continue
+            if not any(_is_backward_node(u) for u in user.users):
+                continue
+            user.meta["recompute"] = CheckpointPolicy.MUST_CPU_OFFLOAD
+            tagged += 1
+    return tagged
 
 
 def tag_sac_policy(
@@ -243,8 +262,11 @@ def _full_memory_policy_pass(
     *,
     config: "GraphTrainer.Config",
 ) -> torch.fx.GraphModule:
-    """Full AC policy: recompute all per-layer activations."""
+    """Full AC policy: recompute per-layer activations and offload FlexAttention."""
     tag_sac_policy(gm, policy_fn=_make_full_memory_policy())
+    tagged = _tag_flex_attention_outputs_for_offload(gm)
+    if tagged:
+        logger.info(f"Full AC: tagged {tagged} FlexAttention outputs for CPU offload")
     return gm
 
 
