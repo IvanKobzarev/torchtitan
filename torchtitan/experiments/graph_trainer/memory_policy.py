@@ -86,6 +86,13 @@ def _make_eager_memory_policy(save_ops: set | None = None) -> Callable:
     return policy_fn
 
 
+def _make_full_memory_policy() -> Callable:
+    def policy_fn(node: torch.fx.Node) -> CheckpointPolicy:
+        return CheckpointPolicy.PREFER_RECOMPUTE
+
+    return policy_fn
+
+
 def tag_sac_policy(
     gm: torch.fx.GraphModule,
     example_inputs: tuple | None = None,
@@ -230,6 +237,17 @@ def _eager_memory_policy_pass(
     return gm
 
 
+@register_memory_policy("full")
+def _full_memory_policy_pass(
+    gm: torch.fx.GraphModule,
+    *,
+    config: "GraphTrainer.Config",
+) -> torch.fx.GraphModule:
+    """Full AC policy: recompute all per-layer activations."""
+    tag_sac_policy(gm, policy_fn=_make_full_memory_policy())
+    return gm
+
+
 @register_memory_policy("sac_and_offload")
 def _sac_and_offload_memory_policy_pass(
     gm: torch.fx.GraphModule,
@@ -255,6 +273,7 @@ def tag_with_memory_policy_pass(
     The ``config.compile.memory_policy`` selects the tagging strategy:
         default: SAC with all compute-intensive ops saved.
         eager: SAC alternating mm ops between save/recompute.
+        full: full activation checkpointing at transformer-block granularity.
         sac_and_offload: SAC + CPU offload within budget.
 
     Other memory policies combining SAC and CPU offload can be added

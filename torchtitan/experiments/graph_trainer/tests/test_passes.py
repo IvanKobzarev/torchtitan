@@ -1775,6 +1775,54 @@ class TestSelectiveActivationRematPass(TestCase):
         for inp in middle_bwd.all_input_nodes:
             self.assertIs(inp, bwd_wait)
 
+    def test_flex_attention_graphmodule_get_attr_is_duplicated(self):
+        """Recomputed FlexAttention HOPs must own their GraphModule attrs."""
+        from torchtitan.experiments.graph_trainer import selective_activation_remat
+
+        sub_graph = torch.fx.Graph()
+        sub_inp = sub_graph.placeholder("sub_inp")
+        sub_graph.output(sub_inp)
+        sub_gm = torch.fx.GraphModule(torch.nn.Module(), sub_graph)
+
+        root = torch.nn.Module()
+        root.score_graph = sub_gm
+
+        graph = torch.fx.Graph()
+        q = graph.placeholder("q")
+        k = graph.placeholder("k")
+        v = graph.placeholder("v")
+        score_graph = graph.get_attr("score_graph")
+        flex = graph.call_function(
+            torch.ops.higher_order.flex_attention,
+            args=(q, k, v, score_graph),
+        )
+        flex_out = graph.call_function(operator.getitem, args=(flex, 0))
+        bwd = graph.call_function(torch.ops.aten.clone.default, args=(flex_out,))
+        graph.output(bwd)
+
+        flex.meta["recompute"] = CheckpointPolicy.MUST_RECOMPUTE
+        flex_out.meta["recompute"] = CheckpointPolicy.MUST_RECOMPUTE
+        bwd.meta["autograd_backward"] = True
+
+        gm = torch.fx.GraphModule(root, graph)
+        with patch.object(selective_activation_remat, "_repropagate_fake_tensors"):
+            result = selective_activation_remat.selective_activation_remat_pass(gm)
+
+        flex_dup = next(
+            n
+            for n in result.graph.nodes
+            if n.target is torch.ops.higher_order.flex_attention
+            and n.name.endswith("_recomputed")
+        )
+        get_attr_inputs = [
+            n
+            for n in flex_dup.all_input_nodes
+            if n.op == "get_attr" and n.target == "score_graph"
+        ]
+        self.assertEqual(len(get_attr_inputs), 1)
+        self.assertEqual(get_attr_inputs[0].name, "score_graph_recomputed")
+        self.assertIsNot(get_attr_inputs[0], score_graph)
+
 
 if __name__ == "__main__":
     from torch.testing._internal.common_utils import run_tests

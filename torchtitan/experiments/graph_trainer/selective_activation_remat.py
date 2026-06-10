@@ -349,6 +349,17 @@ def selective_activation_remat_pass(
             dup = gm.graph.node_copy(fwd_node, remat_input)
         dup.name = fwd_node.name + "_recomputed"
         dup.meta["autograd_backward"] = True
+        if fwd_node.target is torch.ops.higher_order.flex_attention:
+            for inp in fwd_node.all_input_nodes:
+                if inp.op != "get_attr":
+                    continue
+                if not isinstance(getattr(gm, inp.target, None), fx.GraphModule):
+                    continue
+                with gm.graph.inserting_before(dup):
+                    new_inp = gm.graph.get_attr(inp.target)
+                new_inp.name = inp.name + "_recomputed"
+                new_inp.meta = inp.meta.copy()
+                dup.replace_input_with(inp, new_inp)
         recomputed_nodes[fwd_node] = dup
         log.debug(
             "Recomputing %s before backward node %s", fwd_node.name, bwd_target.name
