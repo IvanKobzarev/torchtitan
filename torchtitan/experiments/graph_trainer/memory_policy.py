@@ -29,6 +29,7 @@ from torchtitan.experiments.graph_trainer.common_utils import (
     _is_backward_node,
     _MODULE_FQN,
     _NOT_IN_LAYERS,
+    apply_save_layer_inputs_ac,
 )
 from torchtitan.experiments.graph_trainer.cpu_offload import (
     tag_all_offloadable_activations,
@@ -224,6 +225,20 @@ def _default_memory_policy_pass(
         fsdp_reshard_after_forward=fsdp_reshard_after_forward,
     )
     tag_sac_policy(gm, policy_fn=policy_fn)
+    return gm
+
+
+@register_memory_policy("save_layer_inputs")
+def _save_layer_inputs_memory_policy_pass(
+    gm: torch.fx.GraphModule,
+    *,
+    config: "GraphTrainer.Config",
+) -> torch.fx.GraphModule:
+    """Save each transformer layer's input; recompute the layer interior.
+
+    Tag-based equivalent of full per-layer activation checkpointing.
+    """
+    apply_save_layer_inputs_ac(gm, layer_prefix="layers")
     return gm
 
 

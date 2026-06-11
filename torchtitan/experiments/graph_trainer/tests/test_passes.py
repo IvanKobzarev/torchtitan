@@ -37,6 +37,7 @@ from torchtitan.experiments.graph_trainer.graph_utils import export_joint
 from torchtitan.experiments.graph_trainer.make_fx_tracer import minimal_fx_tracer
 from torchtitan.experiments.graph_trainer.memory_policy import (
     _make_default_memory_policy,
+    _make_eager_memory_policy,
     tag_sac_policy,
 )
 from torchtitan.experiments.graph_trainer.passes import (
@@ -501,6 +502,27 @@ class TestApplySACPass(TestCase):
         self.assertEqual(nodes[0].meta["recompute"], CheckpointPolicy.MUST_SAVE)
         self.assertEqual(nodes[1].meta["recompute"], CheckpointPolicy.PREFER_RECOMPUTE)
 
+    def test_eager_policy_keeps_saved_ops_hard(self):
+        """Eager policy mirrors eager SAC; relaxation is a separate min-cut pass."""
+        custom_save = {torch.ops.aten.add.Tensor, torch.ops.aten.relu.default}
+        gm = self._build_gm(
+            [
+                torch.ops.aten.add.Tensor,
+                torch.ops.aten.relu.default,
+                torch.ops.aten.mul.Tensor,
+            ]
+        )
+        nodes = self._get_call_function_nodes(gm)
+        nodes[0].meta["custom"] = {_MODULE_FQN: "layers.0.feed_forward"}
+        nodes[1].meta["custom"] = {_MODULE_FQN: "layers.0.feed_forward"}
+        nodes[2].meta["custom"] = {_MODULE_FQN: "layers.1.attention"}
+
+        tag_sac_policy(gm, policy_fn=_make_eager_memory_policy(custom_save))
+
+        self.assertEqual(nodes[0].meta["recompute"], CheckpointPolicy.MUST_SAVE)
+        self.assertEqual(nodes[1].meta["recompute"], CheckpointPolicy.MUST_SAVE)
+        self.assertEqual(nodes[2].meta["recompute"], CheckpointPolicy.PREFER_RECOMPUTE)
+
     def test_custom_op_list_to_save(self):
         """A custom op_list_to_save should override the defaults."""
         custom_save = {torch.ops.aten.relu.default}
@@ -555,6 +577,11 @@ class TestApplySACPass(TestCase):
         graph.output(bwd)
         gm = torch.fx.GraphModule(torch.nn.Module(), graph)
 
+        fake_mode = torch._subclasses.FakeTensorMode()
+        with fake_mode:
+            x.meta["val"] = torch.randn(2, 2)
+            fwd.meta["val"] = x.meta["val"] + x.meta["val"]
+            bwd.meta["val"] = fwd.meta["val"] * 2
         fwd.meta["recompute"] = CheckpointPolicy.PREFER_RECOMPUTE
         bwd.meta["autograd_backward"] = True
 
@@ -1614,6 +1641,12 @@ class TestAsyncTensorParallelPass(FSDPTest):
 class TestSelectiveActivationRematPass(TestCase):
     """Unit tests for ``selective_activation_remat_pass``."""
 
+    def _add_fake_tensor_meta(self, *nodes):
+        fake_mode = torch._subclasses.FakeTensorMode()
+        with fake_mode:
+            for node in nodes:
+                node.meta["val"] = torch.randn(2, 2)
+
     def test_topological_insertion_order(self):
         """
         When multiple independent ``must_recompute`` deps share a downstream
@@ -1648,6 +1681,7 @@ class TestSelectiveActivationRematPass(TestCase):
         for n in (a, b, c, d, e):
             n.meta["recompute"] = CheckpointPolicy.MUST_RECOMPUTE
         bwd.meta["autograd_backward"] = True
+        self._add_fake_tensor_meta(inp1, inp2, inp3, a, b, d, c, e, bwd)
 
         original_names_in_order = [n.name for n in (a, b, d, c, e)]
         e_name = e.name
@@ -1696,6 +1730,7 @@ class TestSelectiveActivationRematPass(TestCase):
         graph.output((fwd_use, bwd))
         a.meta["recompute"] = CheckpointPolicy.MUST_RECOMPUTE
         bwd.meta["autograd_backward"] = True
+        self._add_fake_tensor_meta(inp, a, fwd_use, bwd)
 
         a_name = a.name
 
@@ -1776,6 +1811,18 @@ class TestSelectiveActivationRematPass(TestCase):
         reload_op.meta["autograd_backward"] = True
         bwd_wait.meta["autograd_backward"] = True
         bwd_other.meta["autograd_backward"] = True
+        self._add_fake_tensor_meta(
+            inp1,
+            inp2,
+            f,
+            offload_op,
+            fwd_wait,
+            n,
+            bwd_use,
+            reload_op,
+            bwd_wait,
+            bwd_other,
+        )
 
         gm = torch.fx.GraphModule(torch.nn.Module(), graph)
         result = selective_activation_remat_pass(gm)
@@ -1873,6 +1920,19 @@ class TestSelectiveActivationRematPass(TestCase):
         bwd_wait.meta["autograd_backward"] = True
         middle_bwd.meta["autograd_backward"] = True
         bwd_use.meta["autograd_backward"] = True
+        self._add_fake_tensor_meta(
+            inp1,
+            inp2,
+            f,
+            offload_op,
+            fwd_wait,
+            n,
+            early_bwd,
+            reload_op,
+            bwd_wait,
+            middle_bwd,
+            bwd_use,
+        )
 
         gm = torch.fx.GraphModule(torch.nn.Module(), graph)
         result = selective_activation_remat_pass(gm)

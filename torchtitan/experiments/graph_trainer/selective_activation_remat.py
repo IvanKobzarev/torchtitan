@@ -19,6 +19,10 @@ from torch._functorch.partitioners import (
 )
 
 from torchtitan.experiments.graph_trainer.common_utils import _is_backward_node
+from torchtitan.experiments.graph_trainer.memory_utils import (
+    _normalize_soft_tags_for_remat,
+    _refresh_fake_tensor_meta,
+)
 
 
 log = logging.getLogger(__name__)
@@ -82,6 +86,8 @@ def selective_activation_remat_pass(
     loss). Regions that do not depend on recomputable forward nodes are
     skipped. Only one region may require remat; if multiple do, we error.
     """
+    _normalize_soft_tags_for_remat(gm)
+
     if not has_recomputable_ops(gm):
         return gm
 
@@ -152,28 +158,25 @@ def selective_activation_remat_pass(
     # ao.reload -> ao.wait_tensor). Used to redirect a recompute dup that
     # consumes an offloaded fwd to read from the bwd-region GPU value.
     offloaded_fwd_to_bwd_wait: dict[fx.Node, fx.Node] = {}
-    for node in gm.graph.find_nodes(
-        op="call_function", target=torch.ops.ao.offload.default
-    ):
+    import torch._functorch._activation_offloading.offload_ops as _offload_ops  # noqa: F401
+
+    ao_offload = torch.ops.ao.offload.default
+    ao_wait = torch.ops.ao.wait_tensor.default
+    ao_reload = torch.ops.ao.reload.default
+
+    for node in gm.graph.find_nodes(op="call_function", target=ao_offload):
         offloaded_fwd = node.args[0]
-        fwd_wait = next(
-            (u for u in node.users if u.target is torch.ops.ao.wait_tensor.default),
-            None,
-        )
+        fwd_wait = next((u for u in node.users if u.target is ao_wait), None)
         if fwd_wait is None:
             continue
         reload_op = next(
-            (u for u in fwd_wait.users if u.target is torch.ops.ao.reload.default),
+            (u for u in fwd_wait.users if u.target is ao_reload),
             None,
         )
         if reload_op is None:
             continue
         bwd_wait = next(
-            (
-                u
-                for u in reload_op.users
-                if u.target is torch.ops.ao.wait_tensor.default
-            ),
+            (u for u in reload_op.users if u.target is ao_wait),
             None,
         )
         if bwd_wait is None:
@@ -322,6 +325,7 @@ def selective_activation_remat_pass(
 
     # raise_getitems pass for better memory (like default_partition)
     gm = raise_getitems(gm)
+    _refresh_fake_tensor_meta(gm)
 
     gm.recompile()
     return gm
