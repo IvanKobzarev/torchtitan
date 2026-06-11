@@ -817,13 +817,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             "lr": lr,
         }
 
-        from tests.utils import hash_model
+        if os.environ.get("GT_WEIGHT_HASH"):
+            from tests.utils import hash_model
 
-        weight_hashes = [hash_model(m) for m in self.model_parts]
-        if weight_hashes[0]:
-            logger.info(
-                f"[step {self.step}] weight_hash: {'|'.join(weight_hashes)}"
-            )
+            weight_hashes = [hash_model(m) for m in self.model_parts]
+            if weight_hashes[0]:
+                logger.info(
+                    f"[step {self.step}] weight_hash: {'|'.join(weight_hashes)}"
+                )
 
         self.metrics_processor.log(
             self.step,
