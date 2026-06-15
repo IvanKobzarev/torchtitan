@@ -37,6 +37,56 @@ def _privatize_custom_meta(node: fx.Node) -> None:
         node.meta["custom"] = dict(custom)
 
 
+def _repropagate_fake_tensors(
+    recomputed_nodes: dict[fx.Node, fx.Node],
+    fake_mode: torch._subclasses.fake_tensor.FakeTensorMode | None,
+) -> None:
+    """Give recompute duplicates fresh FakeTensor metadata.
+
+    ``fx.Graph.node_copy`` shallow-copies ``meta``, so a recompute duplicate
+    initially shares ``meta["val"]`` with the original forward node. Memory-aware
+    scheduling keys allocations by FakeTensor storage identity; sharing that
+    identity makes the original and recomputed allocation look like one storage.
+    Re-executing the duplicate nodes under the trace fake mode gives them
+    independent fake storages while preserving symbolic shape bindings.
+    """
+    if fake_mode is None:
+        return
+
+    from torch._dispatch.python import enable_python_dispatcher
+    from torch.fx.experimental.symbolic_shapes import (
+        compute_unbacked_bindings,
+        rebind_unbacked,
+    )
+
+    def get_val(x: object) -> object:
+        if isinstance(x, fx.Node):
+            return x.meta.get("val")
+        return x
+
+    shape_env = fake_mode.shape_env
+    must_process: set[fx.Node] = set(recomputed_nodes.values())
+
+    for dup in recomputed_nodes.values():
+        if dup not in must_process:
+            continue
+        if dup.op != "call_function" or "val" not in dup.meta:
+            continue
+
+        fake_args = torch.fx.map_arg(dup.args, get_val)
+        fake_kwargs = torch.fx.map_arg(dup.kwargs, get_val)
+        with fake_mode, enable_python_dispatcher():
+            result = dup.target(*fake_args, **fake_kwargs)
+
+        rebind_unbacked(shape_env, dup, result)
+        dup.meta["val"] = result
+        if symbol_to_path := compute_unbacked_bindings(shape_env, result):
+            dup.meta["unbacked_bindings"] = symbol_to_path
+
+        for user in dup.users:
+            must_process.add(user)
+
+
 def _collect_backward_regions(
     gm: fx.GraphModule,
 ) -> list[tuple[int, int, bool]]:
@@ -104,6 +154,12 @@ def selective_activation_remat_pass(
             "in recompute regions. Please move RNG operations outside "
             "of recompute regions, or use joint graph mode (where partitioner handles RNG)."
         )
+
+    from torch._dynamo.utils import detect_fake_mode
+
+    fake_mode = detect_fake_mode(
+        tuple(node.meta.get("val") for node in gm.graph.find_nodes(op="placeholder"))
+    )
 
     regions = _collect_backward_regions(gm)
     if not regions:
@@ -343,6 +399,8 @@ def selective_activation_remat_pass(
         log.debug(
             "Recomputing %s before backward node %s", fwd_node.name, bwd_target.name
         )
+
+    _repropagate_fake_tensors(recomputed_nodes, fake_mode)
 
     # Redirect every direct backward consumer of a recomputed forward node
     # to read from the dup. Backward consumers of offloaded forward nodes

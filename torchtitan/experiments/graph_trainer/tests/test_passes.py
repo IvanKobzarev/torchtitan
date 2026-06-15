@@ -633,6 +633,38 @@ class TestApplySACPass(TestCase):
         dup.meta["custom"]["cudagraph_partition"] = "cudagraph_9"
         self.assertNotIn("cudagraph_partition", fwd_node.meta["custom"])
 
+    def test_remat_dup_gets_independent_fake_tensor_meta(self):
+        from torch._subclasses.fake_tensor import FakeTensorMode
+
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        fwd = graph.call_function(torch.ops.aten.add.Tensor, args=(x, x))
+        fwd_use = graph.call_function(torch.ops.aten.relu.default, args=(fwd,))
+        bwd = graph.call_function(torch.ops.aten.mul.Tensor, args=(fwd, 2))
+        graph.output((fwd_use, bwd))
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+        with FakeTensorMode():
+            x.meta["val"] = torch.empty(4)
+            fwd.meta["val"] = torch.ops.aten.add.Tensor(
+                x.meta["val"], x.meta["val"]
+            )
+            fwd_use.meta["val"] = torch.ops.aten.relu.default(fwd.meta["val"])
+            bwd.meta["val"] = torch.ops.aten.mul.Tensor(fwd.meta["val"], 2)
+
+        fwd.meta["recompute"] = CheckpointPolicy.PREFER_RECOMPUTE
+        bwd.meta["autograd_backward"] = True
+
+        gm = selective_activation_remat_pass(gm)
+
+        fwd_node = next(n for n in gm.graph.nodes if n.name == "add_tensor")
+        dup = next(n for n in gm.graph.nodes if n.name == "add_tensor_recomputed")
+        self.assertIsNot(dup.meta["val"], fwd_node.meta["val"])
+        self.assertNotEqual(
+            dup.meta["val"].untyped_storage()._cdata,
+            fwd_node.meta["val"].untyped_storage()._cdata,
+        )
+
 
 class TestFullMemoryPolicy(TestCase):
     """Unit tests for the full recompute memory policy."""
