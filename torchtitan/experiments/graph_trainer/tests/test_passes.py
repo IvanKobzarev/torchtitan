@@ -4,8 +4,10 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import functools
 import operator
 import sys
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -45,7 +47,10 @@ from torchtitan.experiments.graph_trainer.memory_policy import (
     _make_full_memory_policy,
     tag_sac_policy,
 )
-from torchtitan.experiments.graph_trainer.passes import selective_activation_remat_pass
+from torchtitan.experiments.graph_trainer.passes import (
+    compile_time_passes,
+    selective_activation_remat_pass,
+)
 from torchtitan.experiments.graph_trainer.remove_noop_passes import (
     canonicalize_graph_pass,
     eliminate_dead_code_pass,
@@ -67,6 +72,47 @@ from torchtitan.experiments.graph_trainer.tests.test_performance_passes import (
 )
 from torchtitan.models.common.nn_modules import Linear
 from torchtitan.protocols.module import Module, ModuleList
+
+
+class TestGraphPassConstruction(TestCase):
+    def test_flex_attention_regional_compile_disables_max_autotune(self):
+        from torchtitan.experiments.graph_trainer.configs import (
+            GraphTrainerCompileConfig,
+        )
+        from torchtitan.experiments.graph_trainer.inductor_passes import (
+            annotate_flex_attention_for_regional_inductor_pass,
+        )
+        from torchtitan.models.common.attention import FlexAttention
+
+        original_configs = dict(FlexAttention.inductor_configs)
+        traced_result = SimpleNamespace(state_fqns=[])
+        config = SimpleNamespace(
+            compile=GraphTrainerCompileConfig(inductor_compilation="regional"),
+            model_spec=SimpleNamespace(model=SimpleNamespace(layers=[object()])),
+            parallelism=SimpleNamespace(enable_async_tensor_parallel=False),
+        )
+
+        graph_passes = compile_time_passes(traced_result, config)
+        flex_passes = [
+            pass_fn
+            for pass_fn in graph_passes
+            if isinstance(pass_fn, functools.partial)
+            and pass_fn.func is annotate_flex_attention_for_regional_inductor_pass
+        ]
+
+        self.assertEqual(len(flex_passes), 1)
+        flex_compile_config = flex_passes[0].keywords["flex_compile_config"]
+        self.assertIsNot(flex_compile_config, FlexAttention.inductor_configs)
+        self.assertFalse(flex_compile_config["max_autotune"])
+        self.assertEqual(
+            flex_compile_config["coordinate_descent_tuning"],
+            original_configs["coordinate_descent_tuning"],
+        )
+        self.assertEqual(
+            flex_compile_config["wrap_inductor_compiled_regions"],
+            FlexAttention.inductor_configs["wrap_inductor_compiled_regions"],
+        )
+        self.assertEqual(FlexAttention.inductor_configs, original_configs)
 
 
 class ToyModel(Module):

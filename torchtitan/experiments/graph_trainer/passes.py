@@ -173,7 +173,10 @@ def compile_time_passes(
         passes.append(
             functools.partial(
                 annotate_flex_attention_for_regional_inductor_pass,
-                flex_compile_config=FlexAttention.inductor_configs,
+                flex_compile_config={
+                    **FlexAttention.inductor_configs,
+                    "max_autotune": False,
+                },
             )
         )
         # Performance passes that may change numerics.
