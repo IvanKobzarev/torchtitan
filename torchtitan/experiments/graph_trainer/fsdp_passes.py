@@ -43,6 +43,7 @@ from torch._inductor.fx_passes.overlap_scheduling import (
 from torch.utils._ordered_set import OrderedSet
 
 from torchtitan.experiments.graph_trainer.common_utils import (
+    _get_layer_id,
     _is_backward_node,
     _MODULE_FQN,
 )
@@ -212,19 +213,60 @@ class FSDPParamOrderBucketer(ManualOverlapPreservingBucketer):
         self,
         *args: Any,
         fsdp_param_module_order: dict[str, int] | None = None,
+        unbucket_final_bwd_layer_all_gather: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
         self.fsdp_param_module_order = fsdp_param_module_order or {}
+        self.unbucket_final_bwd_layer_all_gather = unbucket_final_bwd_layer_all_gather
+        self.final_layer_id = max(
+            (
+                int(parts[1])
+                for fqn in self.fsdp_param_module_order
+                if (parts := fqn.split("."))[0] == "layers"
+                and len(parts) > 1
+                and parts[1].isdigit()
+            ),
+            default=None,
+        )
 
     def _param_order_key(self, node: fx.Node) -> tuple[int, int]:
         module_fqn = node.meta.get("custom", {}).get(_MODULE_FQN)
         param_idx = self.fsdp_param_module_order.get(module_fqn, len(self.node_idx))
         return (param_idx, self.node_idx[node])
 
+    def _mark_all_gather_prefetch_without_bucket(
+        self, coll_nodes: list[fx.Node]
+    ) -> None:
+        for node in coll_nodes:
+            wait = self.collective_info[node].wait_node
+            self.bucketed_node_types[node] = "bucketed_all_gather"
+            self.bucketed_node_types[wait] = "bucketed_all_gather_wait"
+            self.node_to_wait_map[wait] = wait
+
+    def _is_final_backward_layer_all_gather_group(
+        self, coll_nodes: list[fx.Node]
+    ) -> bool:
+        if self.final_layer_id is None or not _is_backward_node(coll_nodes[0]):
+            return False
+        return _get_layer_id(coll_nodes[0]) == self.final_layer_id
+
     def _bucket_group(self, coll_nodes: list[fx.Node]) -> None:
         if self.fsdp_param_module_order:
             coll_nodes = sorted(coll_nodes, key=self._param_order_key)
+        if (
+            self.unbucket_final_bwd_layer_all_gather
+            and is_all_gather(coll_nodes[0])
+            and self._is_final_backward_layer_all_gather_group(coll_nodes)
+        ):
+            # There is no following transformer layer to amortize a merged
+            # all-gather bucket, so preserve prefetching without the bucket temp.
+            logger.info(
+                "Skipped all-gather bucketing for final backward layer "
+                f"{self.final_layer_id} ({len(coll_nodes)} node(s))"
+            )
+            self._mark_all_gather_prefetch_without_bucket(coll_nodes)
+            return
         return super()._bucket_group(coll_nodes)
 
 
@@ -264,6 +306,7 @@ class JointManualOverlapScheduler(ManualOverlapScheduler):
         module_stack_fn: Callable[[fx.Node], list[tuple[str, type[Any]]]],
         bucket_mode: BucketMode | None = None,
         fsdp_param_module_order: dict[str, int] | None = None,
+        unbucket_final_bwd_layer_all_gather: bool = False,
     ) -> None:
         super().__init__(
             gm,
@@ -280,6 +323,7 @@ class JointManualOverlapScheduler(ManualOverlapScheduler):
             scheduled=OrderedSet(self.graph.nodes),
             bucket_mode=effective_bucket_mode,
             fsdp_param_module_order=fsdp_param_module_order,
+            unbucket_final_bwd_layer_all_gather=unbucket_final_bwd_layer_all_gather,
         )
 
     def _manual_bucket_collectives(self) -> None:
@@ -447,6 +491,7 @@ def joint_transformer_block_bucketing_reordering_pass(
     insert_overlap_deps: bool = False,
     bucket_mode: BucketMode | None = None,
     fsdp_param_module_order: dict[str, int] | None = None,
+    unbucket_final_bwd_layer_all_gather: bool = False,
 ) -> torch.fx.GraphModule:
     """Run joint-graph manual bucketing and reordering.
 
@@ -470,6 +515,9 @@ def joint_transformer_block_bucketing_reordering_pass(
             defaults to ``"custom_ops"`` via the parent class.
         fsdp_param_module_order: module order derived from traced parameter
             FQNs, used to pack FSDP buckets like Eager FSDP2.
+        unbucket_final_bwd_layer_all_gather: keep final backward layer
+            all-gathers as individual collectives while still scheduling
+            their prefetches.
     """
 
     def _stack_fn(node: torch.fx.Node) -> list[tuple[str, type]]:
@@ -486,6 +534,7 @@ def joint_transformer_block_bucketing_reordering_pass(
         module_stack_fn=_stack_fn,
         bucket_mode=bucket_mode,
         fsdp_param_module_order=fsdp_param_module_order,
+        unbucket_final_bwd_layer_all_gather=unbucket_final_bwd_layer_all_gather,
     ).run()
     overlapped_gm.recompile()
     return overlapped_gm

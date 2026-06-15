@@ -16,12 +16,14 @@ from torch._guards import tracing
 from torch._inductor.fx_passes.bucketing import (
     is_all_gather_into_tensor as is_all_gather,
 )
+from torch._inductor.fx_passes.overlap_scheduling import CollectiveInfo
 from torch.cuda._graph_annotations import _is_tools_id_unavailable
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch.fx.traceback import preserve_node_meta
 from torch.testing._internal.common_fsdp import FSDPTest
 from torch.testing._internal.common_utils import TestCase
+from torch.utils._ordered_set import OrderedSet
 from torch.utils.checkpoint import checkpoint, CheckpointPolicy
 
 from torchtitan.distributed import ParallelDims
@@ -42,6 +44,7 @@ from torchtitan.experiments.graph_trainer.ep_process_group_pass import (
     isolate_ep_process_group_pass,
 )
 from torchtitan.experiments.graph_trainer.fsdp_passes import (
+    FSDPParamOrderBucketer,
     reassign_collective_pgs_pass,
 )
 from torchtitan.experiments.graph_trainer.graph_utils import export_joint
@@ -794,6 +797,69 @@ class TestApplySACPass(TestCase):
             self.assertIs(inp, boundary)
         for inp in bwd_internal.all_input_nodes:
             self.assertIs(inp, a_dup)
+
+
+class TestFSDPParamOrderBucketer(TestCase):
+    def test_final_backward_layer_allgather_prefetch_without_bucket(self):
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        ag0 = graph.call_function(
+            torch.ops._c10d_functional.all_gather_into_tensor.default,
+            args=(x, 2, "pg"),
+        )
+        wait0 = graph.call_function(
+            torch.ops._c10d_functional.wait_tensor.default,
+            args=(ag0,),
+        )
+        ag1 = graph.call_function(
+            torch.ops._c10d_functional.all_gather_into_tensor.default,
+            args=(x, 2, "pg"),
+        )
+        wait1 = graph.call_function(
+            torch.ops._c10d_functional.wait_tensor.default,
+            args=(ag1,),
+        )
+        graph.output((wait0, wait1))
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+        for node in (ag0, ag1):
+            node.meta["autograd_backward"] = True
+            node.meta["custom"] = {_MODULE_FQN: "layers.2.attention"}
+
+        bucketer = FSDPParamOrderBucketer(
+            graph=gm.graph,
+            collective_info={
+                ag0: CollectiveInfo(ag0, wait0, 1, 0.0, 0.0),
+                ag1: CollectiveInfo(ag1, wait1, 1, 0.0, 0.0),
+            },
+            scheduled=OrderedSet(gm.graph.nodes),
+            bucket_mode="custom_ops",
+            fsdp_param_module_order={
+                "layers.0.attention": 0,
+                "layers.1.attention": 1,
+                "layers.2.attention": 2,
+            },
+            unbucket_final_bwd_layer_all_gather=True,
+        )
+
+        bucketer._bucket_group([ag0, ag1])
+
+        self.assertEqual(
+            sum(1 for node in gm.graph.nodes if is_all_gather(node)),
+            2,
+        )
+        self.assertEqual(bucketer.bucketed_node_types[ag0], "bucketed_all_gather")
+        self.assertEqual(bucketer.bucketed_node_types[ag1], "bucketed_all_gather")
+        self.assertEqual(
+            bucketer.bucketed_node_types[wait0],
+            "bucketed_all_gather_wait",
+        )
+        self.assertEqual(
+            bucketer.bucketed_node_types[wait1],
+            "bucketed_all_gather_wait",
+        )
+        self.assertIs(bucketer.node_to_wait_map[wait0], wait0)
+        self.assertIs(bucketer.node_to_wait_map[wait1], wait1)
 
 
 class TestFullMemoryPolicy(TestCase):
