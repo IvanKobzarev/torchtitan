@@ -122,6 +122,43 @@ class TestGraphPassConstruction(TestCase):
         self.assertEqual(FlexAttention.inductor_configs, original_configs)
 
 
+class TestFullInductorMarking(TestCase):
+    def test_graphmodule_attr_tagged_tensor_attr_not(self):
+        from torchtitan.experiments.graph_trainer.inductor_passes import (
+            _mark_nodes_for_full_inductor,
+        )
+
+        class Score(torch.nn.Module):
+            def forward(self, x):
+                return x
+
+        class Outer(torch.nn.Module):
+            def forward(self, x):
+                return x + 1
+
+        gm = torch.fx.symbolic_trace(Outer())
+        gm.add_submodule("sdpa_score0", torch.fx.symbolic_trace(Score()))
+        gm.register_buffer("_tp_mask", torch.zeros(4))
+
+        graph = gm.graph
+        ph = next(n for n in graph.nodes if n.op == "placeholder")
+        with graph.inserting_after(ph):
+            graph.get_attr("_tp_mask")
+            graph.get_attr("sdpa_score0")
+        gm.recompile()
+
+        _mark_nodes_for_full_inductor(gm)
+
+        def tagged(name):
+            node = next(n for n in graph.nodes if n.name == name)
+            return "compile_with_inductor" in node.meta.get("custom", {})
+
+        self.assertTrue(tagged("sdpa_score0"))
+        self.assertFalse(tagged("_tp_mask"))
+        add = next(n for n in graph.nodes if n.op == "call_function")
+        self.assertIn("compile_with_inductor", add.meta.get("custom", {}))
+
+
 class ToyModel(Module):
     """A small toy model with multiple linear layers and activation
     checkpointing so that the backward graph recomputes the forward

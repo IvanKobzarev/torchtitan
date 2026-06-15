@@ -284,4 +284,15 @@ def precompile_fx_trace_load(
         f"fingerprint={artifact.config_fingerprint}"
     )
 
-    return artifact.to_traced_result()
+    result = artifact.to_traced_result()
+
+    if torch.cuda.is_available():
+        # Pickle restores CUDA tensor attributes on CPU. Move constants back so
+        # compiled CUDA regions receive valid device inputs at training time.
+        from torchtitan.experiments.graph_trainer.inductor_passes import (
+            _migrate_cpu_get_attrs_to_cuda,
+        )
+
+        _migrate_cpu_get_attrs_to_cuda(result.gm)
+
+    return result
