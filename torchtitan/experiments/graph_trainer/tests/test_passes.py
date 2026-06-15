@@ -26,8 +26,12 @@ from torch.utils.checkpoint import checkpoint, CheckpointPolicy
 
 from torchtitan.distributed import ParallelDims
 from torchtitan.experiments.graph_trainer.common_utils import (
+    _AC_REGION,
+    _FORCE_RECOMPUTE_BOUNDARY,
+    _KEEP_ORIGINAL_FOR_BACKWARD,
     _MODULE_FQN,
     annotate_module_fqns,
+    apply_save_layer_inputs_ac,
 )
 from torchtitan.experiments.graph_trainer.cudagraph import (
     insert_kernel_annotations_pass,
@@ -584,6 +588,45 @@ class TestApplySACPass(TestCase):
         self.assertEqual(nodes[0].meta["recompute"], CheckpointPolicy.MUST_SAVE)
         self.assertEqual(nodes[1].meta["recompute"], CheckpointPolicy.PREFER_RECOMPUTE)
 
+    def test_save_layer_inputs_policy_saves_layer_boundaries(self):
+        gm = self._build_gm(
+            [
+                torch.ops.aten.add.Tensor,
+                torch.ops.aten.relu.default,
+                torch.ops.aten.neg.default,
+            ]
+        )
+        nodes = self._get_call_function_nodes(gm)
+        nodes[0].meta["custom"] = {_MODULE_FQN: "layers.0.attention"}
+        nodes[1].meta["custom"] = {_MODULE_FQN: "layers.1.feed_forward"}
+        nodes[2].meta["custom"] = {_MODULE_FQN: "norm"}
+
+        apply_save_layer_inputs_ac(gm)
+
+        self.assertEqual(nodes[0].meta["recompute"], CheckpointPolicy.MUST_SAVE)
+        self.assertEqual(nodes[1].meta["recompute"], CheckpointPolicy.PREFER_RECOMPUTE)
+        self.assertNotIn("recompute", nodes[2].meta)
+
+    def test_save_layer_inputs_eager_compat_marks_boundary_for_replay(self):
+        gm = self._build_gm(
+            [
+                torch.ops.aten.add.Tensor,
+                torch.ops.aten.relu.default,
+            ]
+        )
+        nodes = self._get_call_function_nodes(gm)
+        nodes[0].meta["custom"] = {_MODULE_FQN: "layers.0.attention"}
+        nodes[1].meta["custom"] = {_MODULE_FQN: "layers.1.feed_forward"}
+
+        apply_save_layer_inputs_ac(gm, force_boundary_recompute=True)
+
+        self.assertEqual(nodes[0].meta["recompute"], CheckpointPolicy.MUST_SAVE)
+        self.assertTrue(nodes[0].meta[_FORCE_RECOMPUTE_BOUNDARY])
+        self.assertTrue(nodes[0].meta[_KEEP_ORIGINAL_FOR_BACKWARD])
+        self.assertEqual(nodes[0].meta[_AC_REGION], 0)
+        self.assertEqual(nodes[1].meta["recompute"], CheckpointPolicy.PREFER_RECOMPUTE)
+        self.assertEqual(nodes[1].meta[_AC_REGION], 1)
+
     def test_custom_op_list_to_save(self):
         """A custom op_list_to_save should override the defaults."""
         custom_save = {torch.ops.aten.relu.default}
@@ -710,6 +753,47 @@ class TestApplySACPass(TestCase):
             dup.meta["val"].untyped_storage()._cdata,
             fwd_node.meta["val"].untyped_storage()._cdata,
         )
+
+    def test_forced_saved_boundary_is_recomputed_but_original_consumed(self):
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        y = graph.placeholder("y")
+        a = graph.call_function(torch.ops.aten.add.Tensor, args=(x, y))
+        boundary = graph.call_function(torch.ops.aten.add.Tensor, args=(a, y))
+        fwd_use = graph.call_function(torch.ops.aten.neg.default, args=(boundary,))
+        bwd_saved_boundary = graph.call_function(
+            torch.ops.aten.mul.Tensor, args=(boundary, boundary)
+        )
+        bwd_internal = graph.call_function(torch.ops.aten.mul.Tensor, args=(a, a))
+        graph.output((fwd_use, bwd_saved_boundary, bwd_internal))
+
+        a.meta["recompute"] = CheckpointPolicy.PREFER_RECOMPUTE
+        a.meta[_AC_REGION] = 0
+        boundary.meta["recompute"] = CheckpointPolicy.MUST_SAVE
+        boundary.meta[_AC_REGION] = 0
+        boundary.meta[_FORCE_RECOMPUTE_BOUNDARY] = True
+        boundary.meta[_KEEP_ORIGINAL_FOR_BACKWARD] = True
+        fwd_use.meta["recompute"] = CheckpointPolicy.PREFER_RECOMPUTE
+        fwd_use.meta[_AC_REGION] = 1
+        bwd_saved_boundary.meta["autograd_backward"] = True
+        bwd_internal.meta["autograd_backward"] = True
+
+        a_name = a.name
+        boundary_name = boundary.name
+        gm = selective_activation_remat_pass(
+            torch.fx.GraphModule(torch.nn.Module(), graph)
+        )
+
+        nodes_by_name = {node.name: node for node in gm.graph.nodes}
+        a_dup = nodes_by_name[a_name + "_recomputed"]
+        boundary_dup = nodes_by_name[boundary_name + "_recomputed"]
+
+        self.assertIn(a_dup, boundary_dup.all_input_nodes)
+        self.assertEqual(len(boundary_dup.users), 0)
+        for inp in bwd_saved_boundary.all_input_nodes:
+            self.assertIs(inp, boundary)
+        for inp in bwd_internal.all_input_nodes:
+            self.assertIs(inp, a_dup)
 
 
 class TestFullMemoryPolicy(TestCase):

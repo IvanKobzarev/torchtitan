@@ -65,26 +65,97 @@ def build_decoder_config_for_backend(
 
 _MODULE_FQN = "module_fqn"
 _NOT_IN_LAYERS = -1
+_AC_REGION = "gt_ac_region"
+_FORCE_RECOMPUTE_BOUNDARY = "gt_ac_force_recompute_boundary"
+_KEEP_ORIGINAL_FOR_BACKWARD = "gt_ac_keep_original_for_backward"
 
 
 def _is_backward_node(node: torch.fx.Node) -> bool:
     return node.meta.get("autograd_backward", False)
 
 
-def _get_layer_id(node: torch.fx.Node) -> int:
+def _get_layer_id(node: torch.fx.Node, layer_prefix: str = "layers") -> int:
     """Extract the layer index from the node's module_fqn metadata.
 
-    Nodes under ``layers.<N>`` return ``N``.
+    Nodes under ``<layer_prefix>.<N>`` return ``N``.
     All other nodes (tok_embeddings, norm, output) return ``_NOT_IN_LAYERS``.
     """
     fqn = node.meta.get("custom", {}).get(_MODULE_FQN, "")
     parts = fqn.split(".")
-    if parts[0] == "layers" and len(parts) >= 2:
+    if len(parts) >= 2 and parts[0] == layer_prefix:
         try:
             return int(parts[1])
         except ValueError:
             pass
     return _NOT_IN_LAYERS
+
+
+def apply_save_layer_inputs_ac(
+    gm: torch.fx.GraphModule,
+    *,
+    layer_prefix: str = "layers",
+    force_boundary_recompute: bool = False,
+) -> torch.fx.GraphModule:
+    """Save transformer layer inputs and recompute each layer interior."""
+    from torch.utils.checkpoint import CheckpointPolicy
+
+    def _is_recomputable(n: torch.fx.Node) -> bool:
+        return n.meta.get("recompute") in (
+            CheckpointPolicy.PREFER_RECOMPUTE,
+            CheckpointPolicy.MUST_RECOMPUTE,
+        )
+
+    def _is_rng(n: torch.fx.Node) -> bool:
+        return torch.Tag.nondeterministic_seeded in getattr(n.target, "tags", set())
+
+    num_recompute = 0
+    for node in gm.graph.nodes:
+        if node.op != "call_function" or _is_backward_node(node):
+            continue
+        layer_id = _get_layer_id(node, layer_prefix)
+        if layer_id == _NOT_IN_LAYERS:
+            continue
+        if force_boundary_recompute:
+            node.meta[_AC_REGION] = layer_id
+        if _is_rng(node):
+            node.meta["recompute"] = CheckpointPolicy.MUST_SAVE
+            continue
+        node.meta["recompute"] = CheckpointPolicy.PREFER_RECOMPUTE
+        num_recompute += 1
+
+    if num_recompute == 0:
+        logger.warning(
+            "apply_save_layer_inputs_ac: no nodes under '%s.<N>'; "
+            "did annotate_module_fqns run before tracing?",
+            layer_prefix,
+        )
+        return gm
+
+    num_save = 0
+    for node in gm.graph.nodes:
+        if _is_backward_node(node) or not _is_recomputable(node):
+            continue
+        layer_id = _get_layer_id(node, layer_prefix)
+        for user in node.users:
+            if (
+                not _is_backward_node(user)
+                and _is_recomputable(user)
+                and _get_layer_id(user, layer_prefix) > layer_id
+            ):
+                node.meta["recompute"] = CheckpointPolicy.MUST_SAVE
+                if force_boundary_recompute:
+                    node.meta[_FORCE_RECOMPUTE_BOUNDARY] = True
+                    node.meta[_KEEP_ORIGINAL_FOR_BACKWARD] = True
+                num_save += 1
+                break
+
+    logger.info(
+        "apply_save_layer_inputs_ac: %d MUST_SAVE layer boundaries, "
+        "%d PREFER_RECOMPUTE layer-interior nodes",
+        num_save,
+        num_recompute - num_save,
+    )
+    return gm
 
 
 def annotate_module_fqns(model: nn.Module) -> None:

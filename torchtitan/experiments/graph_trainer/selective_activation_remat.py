@@ -18,7 +18,12 @@ from torch._functorch.partitioners import (
     must_recompute,
 )
 
-from torchtitan.experiments.graph_trainer.common_utils import _is_backward_node
+from torchtitan.experiments.graph_trainer.common_utils import (
+    _AC_REGION,
+    _FORCE_RECOMPUTE_BOUNDARY,
+    _is_backward_node,
+    _KEEP_ORIGINAL_FOR_BACKWARD,
+)
 
 
 log = logging.getLogger(__name__)
@@ -188,9 +193,20 @@ def selective_activation_remat_pass(
     order = {n: i for i, n in enumerate(all_nodes)}
 
     # Map each must_recompute fwd node to the bwd node its dup will be
-    # inserted in front of. The earliest bwd consumer (in graph order)
-    # wins via ``setdefault`` below.
+    # inserted in front of. The earliest bwd consumer in graph order wins.
     remat_targets: dict[fx.Node, fx.Node] = {}
+    region_targets: dict[int, fx.Node] = {}
+
+    def set_remat_target(fwd_node: fx.Node, bwd_node: fx.Node) -> None:
+        target = remat_targets.get(fwd_node)
+        if target is None or order[bwd_node] < order[target]:
+            remat_targets[fwd_node] = bwd_node
+
+        region = fwd_node.meta.get(_AC_REGION)
+        if isinstance(region, int):
+            region_target = region_targets.get(region)
+            if region_target is None or order[bwd_node] < order[region_target]:
+                region_targets[region] = bwd_node
 
     def collect_fw_nodes_to_recompute_for(bwd_node: fx.Node) -> None:
         seen: set[fx.Node] = set()
@@ -199,7 +215,7 @@ def selective_activation_remat_pass(
             if n in seen or not must_recompute(n):
                 return
             seen.add(n)
-            remat_targets.setdefault(n, bwd_node)
+            set_remat_target(n, bwd_node)
             for inp in n.all_input_nodes:
                 _gather(inp)
 
@@ -209,6 +225,32 @@ def selective_activation_remat_pass(
 
     for bwd_node in bwd_nodes:
         collect_fw_nodes_to_recompute_for(bwd_node)
+
+    def collect_forced_boundary(boundary_node: fx.Node) -> None:
+        region = boundary_node.meta.get(_AC_REGION)
+        if not isinstance(region, int) or region not in region_targets:
+            return
+
+        target = region_targets[region]
+        seen: set[fx.Node] = set()
+
+        def _gather(n: fx.Node) -> None:
+            if n in seen or _is_backward_node(n):
+                return
+            if n.meta.get(_AC_REGION) != region:
+                return
+            if n is not boundary_node and not must_recompute(n):
+                return
+            seen.add(n)
+            set_remat_target(n, target)
+            for inp in n.all_input_nodes:
+                _gather(inp)
+
+        _gather(boundary_node)
+
+    for node in all_nodes[:bwd_start]:
+        if node.meta.get(_FORCE_RECOMPUTE_BOUNDARY):
+            collect_forced_boundary(node)
 
     # Map original forward must_recompute node -> its recomputed duplicate.
     recomputed_nodes: dict[fx.Node, fx.Node] = {}
@@ -333,7 +375,7 @@ def selective_activation_remat_pass(
         reload chain happens separately in the dup-creation loop."""
         if not isinstance(x, fx.Node):
             return x
-        if x in recomputed_nodes:
+        if x in recomputed_nodes and not x.meta.get(_KEEP_ORIGINAL_FOR_BACKWARD):
             return recomputed_nodes[x]
         bwd_wait = offloaded_fwd_to_bwd_wait.get(x)
         if bwd_wait is not None:
