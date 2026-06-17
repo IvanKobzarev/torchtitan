@@ -131,8 +131,7 @@ class TestHelionRoPEOverride(unittest.TestCase):
             OverrideConfig(imports=["torchtitan.overrides.helion_rope"]), root
         )
         self.assertEqual(len(replacements), 2)
-        # cos/sin node is swapped to the fused implementation; complex node is
-        # swapped to the explicit fallback so DSv3 imports are not silent no-ops.
+        # Both concrete RoPE formats are swapped to fused implementations.
         self.assertIsInstance(root.cos_rope, HelionRoPE.Config)
         self.assertIsInstance(root.complex_rope, HelionComplexRoPE.Config)
 
@@ -299,6 +298,122 @@ class TestHelionRoPEKernel(unittest.TestCase):
 
         xq, xk, positions = self._inputs()
         torch.library.opcheck(_helion_rope_fwd, (xq, xk, self.helion.cache, positions))
+
+
+@unittest.skipUnless(_HELION_GPU, "requires helion + CUDA")
+class TestHelionComplexRoPEKernel(unittest.TestCase):
+    """Fused-kernel numerics vs the PyTorch ComplexRoPE path."""
+
+    def setUp(self):
+        torch.manual_seed(43)
+        self.device = torch.device("cuda")
+        self.dim = 64
+        self.seqlen = 64
+        self.complex_rope = ComplexRoPE.Config(
+            dim=self.dim,
+            max_seq_len=self.seqlen,
+            scaling="yarn",
+            rope_factor=40.0,
+        ).build()
+        self.helion = HelionComplexRoPE.Config(
+            dim=self.dim,
+            max_seq_len=self.seqlen,
+            scaling="yarn",
+            rope_factor=40.0,
+        ).build()
+        self.complex_rope.to(self.device)
+        self.helion.to(self.device)
+
+    def _inputs(self, *, batch=2, n_heads=8, n_kv_heads=1, requires_grad=False):
+        xq = torch.randn(
+            batch,
+            self.seqlen,
+            n_heads,
+            self.dim,
+            device=self.device,
+            dtype=torch.bfloat16,
+            requires_grad=requires_grad,
+        )
+        xk = torch.randn(
+            batch,
+            self.seqlen,
+            n_kv_heads,
+            self.dim,
+            device=self.device,
+            dtype=torch.bfloat16,
+            requires_grad=requires_grad,
+        )
+        positions = (
+            torch.arange(self.seqlen, device=self.device, dtype=torch.int32)
+            .unsqueeze(0)
+            .expand(batch, -1)
+            .contiguous()
+        )
+        return xq, xk, positions
+
+    def test_forward_matches_complex(self):
+        xq, xk, positions = self._inputs()
+        ref_q, ref_k = self.complex_rope(xq, xk, positions)
+        out_q, out_k = self.helion(xq, xk, positions)
+        self.assertEqual(out_q.shape, ref_q.shape)
+        self.assertEqual(out_q.dtype, ref_q.dtype)
+        torch.testing.assert_close(out_q, ref_q, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(out_k, ref_k, rtol=2e-2, atol=2e-2)
+
+    def test_forward_matches_with_implicit_positions(self):
+        xq, xk, _ = self._inputs()
+        ref_q, ref_k = self.complex_rope(xq, xk, None)
+        out_q, out_k = self.helion(xq, xk, None)
+        torch.testing.assert_close(out_q, ref_q, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(out_k, ref_k, rtol=2e-2, atol=2e-2)
+
+    def test_backward_matches_complex(self):
+        xq, xk, positions = self._inputs(requires_grad=True)
+        xq_ref = xq.detach().clone().requires_grad_(True)
+        xk_ref = xk.detach().clone().requires_grad_(True)
+
+        self.helion(xq, xk, positions)[0].sum().backward()
+        self.complex_rope(xq_ref, xk_ref, positions)[0].sum().backward()
+
+        torch.testing.assert_close(xq.grad, xq_ref.grad, rtol=2e-2, atol=2e-2)
+        self.assertIsNotNone(xk.grad)
+
+        xq2, xk2, positions2 = self._inputs(requires_grad=True)
+        xk2_ref = xk2.detach().clone().requires_grad_(True)
+        xq2_ref = xq2.detach().clone().requires_grad_(True)
+        self.helion(xq2, xk2, positions2)[1].sum().backward()
+        self.complex_rope(xq2_ref, xk2_ref, positions2)[1].sum().backward()
+        torch.testing.assert_close(xk2.grad, xk2_ref.grad, rtol=2e-2, atol=2e-2)
+
+    def test_eligible_rejects_unsupported_inputs(self):
+        from torchtitan.overrides.helion_rope import _eligible_complex
+
+        d = self.device
+        xq = torch.randn(2, self.seqlen, 8, self.dim, device=d, dtype=torch.bfloat16)
+        xk = torch.randn(2, self.seqlen, 1, self.dim, device=d, dtype=torch.bfloat16)
+        cache_real = torch.view_as_real(self.helion.cache)
+        pos = (
+            torch.arange(self.seqlen, device=d, dtype=torch.int32)
+            .unsqueeze(0)
+            .expand(2, -1)
+            .contiguous()
+        )
+        wrong_width = torch.randn(self.seqlen, self.dim // 2 - 1, 2, device=d)
+
+        self.assertTrue(_eligible_complex(xq, xk, cache_real, pos))
+        self.assertFalse(_eligible_complex(xq, xk, cache_real.cpu(), pos))
+        self.assertFalse(_eligible_complex(xq, xk, cache_real, pos.cpu()))
+        self.assertFalse(_eligible_complex(xq, xk, cache_real, pos.float()))
+        self.assertFalse(_eligible_complex(xq, xk, wrong_width, pos))
+        self.assertFalse(_eligible_complex(xq, xk, cache_real[..., 0], pos))
+        self.assertFalse(_eligible_complex(xq, xk, cache_real, pos[:1]))
+
+    def test_custom_op_opcheck(self):
+        from torchtitan.overrides.helion_rope import _helion_complex_rope_fwd
+
+        xq, xk, positions = self._inputs()
+        cache_real = torch.view_as_real(self.helion.cache)
+        torch.library.opcheck(_helion_complex_rope_fwd, (xq, xk, cache_real, positions))
 
 
 if __name__ == "__main__":

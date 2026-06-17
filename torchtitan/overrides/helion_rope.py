@@ -7,35 +7,32 @@
 """
 Override: rotary embeddings with Helion-backed cos/sin support.
 
-This swaps :class:`CosSinRoPE` for a version that fuses the cos/sin gather and
-the rotate-half rotation into a single Helion kernel (forward and backward),
-without touching core. It also claims :class:`ComplexRoPE` configs with an
-explicit fallback module so override imports used with models such as DeepSeek
-V3 are visible in logs instead of silently producing no replacements.
+This swaps :class:`CosSinRoPE` and :class:`ComplexRoPE` for versions that fuse
+the RoPE cache gather and rotation into a single Helion kernel (forward and
+backward), without touching core.
 
     torchtitan_train ... --override.imports torchtitan.overrides.helion_rope
 
 Scope and fallbacks (the kernel is opt-in and never changes default behavior):
 
-* **Plain cos/sin fused kernel.** The fused kernel targets exactly
+* **Plain cos/sin fused kernel.** This fused kernel targets exactly
   ``CosSinRoPE.Config``. Subclasses with different cache contracts (e.g. Qwen3.5
   ``MRoPE``) are untouched.
-* **Complex RoPE explicit fallback.** ``ComplexRoPE.Config`` is replaced with a
-  module that preserves the stock PyTorch complex-adjacent-pair math and warns
-  once. This avoids silently ignoring the override on DeepSeek V3 while keeping
-  numerics unchanged until a dedicated complex Helion kernel exists.
+* **Complex RoPE fused kernel.** This fused kernel targets exactly
+  ``ComplexRoPE.Config`` and performs the same adjacent-pair real math as the
+  stock complex implementation, using a real view of the complex cache.
 * ``helion`` is an optional dependency. If it is not installed, or
-  the inputs are unsupported (any tensor on CPU or split across devices, a cache
-  that isn't a 2D ``(max_seq, 2 * head_dim)`` table, non-integer or oddly shaped
-  position ids, non-contiguous tensors), the module transparently falls back to
-  the PyTorch ``CosSinRoPE`` path. Position ids are bounds-checked exactly as the
+  the inputs are unsupported (any tensor on CPU or split across devices, an
+  unexpected cache shape for the concrete RoPE format, non-integer or oddly
+  shaped position ids, non-contiguous tensors), the module transparently falls
+  back to the PyTorch path. Position ids are bounds-checked exactly as the
   PyTorch path does, so out-of-range ids fail cleanly rather than as an illegal
   kernel access.
 * **CUDA only.** For now, the configs are tuned for NVIDIA H100, although this
   supports configs tuned for AMD, etc. Helion is a hardware agnostic DSL.
 
-The kernel matches ``CosSinRoPE`` numerically (both upcast to fp32 and use the
-rotate-half convention), so it is interoperable with stock checkpoints.
+The kernels match the stock RoPE numerics closely (both upcast to fp32 for the
+rotation), so they are interoperable with stock checkpoints.
 """
 
 from __future__ import annotations
@@ -215,6 +212,109 @@ if _HAS_HELION:
 
         return grad_xq, grad_xk
 
+    @helion.kernel(config=_DEFAULT_CONFIG, static_shapes=True)
+    def _rope_complex_fwd(
+        xq: torch.Tensor,
+        xk: torch.Tensor,
+        rope_cache_real: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Fuses ComplexRoPE's ``view_as_complex(x) * cache`` using real-valued
+        # adjacent pairs. ``rope_cache_real`` is ``view_as_real(cache)`` with shape
+        # ``(max_seq, head_dim // 2, 2)``.
+        _, seqlen, n_heads, head_dim = xq.size()
+        _, _, n_kv_heads, _ = xk.size()
+        head_dim = hl.specialize(head_dim)
+        half_head_dim = head_dim // 2
+
+        xq_out = torch.empty_like(xq)
+        xk_out = torch.empty_like(xk)
+
+        for tile_b, tile_s in hl.tile([xq.size(0), seqlen]):
+            position = positions[tile_b, tile_s]
+            rope_tile = rope_cache_real[position, :, :].to(torch.float32)
+            cos, sin = hl.split(rope_tile)
+            cos = cos[:, :, None, :]
+            sin = sin[:, :, None, :]
+
+            for tile_h in hl.tile(n_heads):
+                xq_tile = xq[tile_b, tile_s, tile_h, :].to(torch.float32)
+                xq_re, xq_im = hl.split(
+                    xq_tile.reshape([tile_b, tile_s, tile_h, half_head_dim, 2])
+                )
+                xq_out_re = xq_re * cos - xq_im * sin
+                xq_out_im = xq_im * cos + xq_re * sin
+                xq_out[tile_b, tile_s, tile_h, :] = (
+                    hl.join(xq_out_re, xq_out_im)
+                    .reshape([tile_b, tile_s, tile_h, head_dim])
+                    .to(xq.dtype)
+                )
+
+            for tile_h in hl.tile(n_kv_heads):
+                xk_tile = xk[tile_b, tile_s, tile_h, :].to(torch.float32)
+                xk_re, xk_im = hl.split(
+                    xk_tile.reshape([tile_b, tile_s, tile_h, half_head_dim, 2])
+                )
+                xk_out_re = xk_re * cos - xk_im * sin
+                xk_out_im = xk_im * cos + xk_re * sin
+                xk_out[tile_b, tile_s, tile_h, :] = (
+                    hl.join(xk_out_re, xk_out_im)
+                    .reshape([tile_b, tile_s, tile_h, head_dim])
+                    .to(xk.dtype)
+                )
+
+        return xq_out, xk_out
+
+    @helion.kernel(config=_DEFAULT_CONFIG, static_shapes=True)
+    def _rope_complex_bwd(
+        grad_xq_out: torch.Tensor,
+        grad_xk_out: torch.Tensor,
+        rope_cache_real: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        _, seqlen, n_heads, head_dim = grad_xq_out.size()
+        _, _, n_kv_heads, _ = grad_xk_out.size()
+        head_dim = hl.specialize(head_dim)
+        half_head_dim = head_dim // 2
+
+        grad_xq = torch.empty_like(grad_xq_out)
+        grad_xk = torch.empty_like(grad_xk_out)
+
+        for tile_b, tile_s in hl.tile([grad_xq_out.size(0), seqlen]):
+            position = positions[tile_b, tile_s]
+            rope_tile = rope_cache_real[position, :, :].to(torch.float32)
+            cos, sin = hl.split(rope_tile)
+            cos = cos[:, :, None, :]
+            sin = sin[:, :, None, :]
+
+            for tile_h in hl.tile(n_heads):
+                grad_tile = grad_xq_out[tile_b, tile_s, tile_h, :].to(torch.float32)
+                grad_re, grad_im = hl.split(
+                    grad_tile.reshape([tile_b, tile_s, tile_h, half_head_dim, 2])
+                )
+                grad_xq_re = grad_re * cos + grad_im * sin
+                grad_xq_im = grad_im * cos - grad_re * sin
+                grad_xq[tile_b, tile_s, tile_h, :] = (
+                    hl.join(grad_xq_re, grad_xq_im)
+                    .reshape([tile_b, tile_s, tile_h, head_dim])
+                    .to(grad_xq.dtype)
+                )
+
+            for tile_h in hl.tile(n_kv_heads):
+                grad_tile = grad_xk_out[tile_b, tile_s, tile_h, :].to(torch.float32)
+                grad_re, grad_im = hl.split(
+                    grad_tile.reshape([tile_b, tile_s, tile_h, half_head_dim, 2])
+                )
+                grad_xk_re = grad_re * cos + grad_im * sin
+                grad_xk_im = grad_im * cos - grad_re * sin
+                grad_xk[tile_b, tile_s, tile_h, :] = (
+                    hl.join(grad_xk_re, grad_xk_im)
+                    .reshape([tile_b, tile_s, tile_h, head_dim])
+                    .to(grad_xk.dtype)
+                )
+
+        return grad_xq, grad_xk
+
     def _fwd_config(query: torch.Tensor) -> helion.Config:
         # Pick a forward config by token count (batch * seq_len), the dominant
         # work size for this bandwidth-bound kernel. The final bucket is a
@@ -341,6 +441,96 @@ if _HAS_HELION:
 
     _helion_rope_fwd.register_autograd(_fwd_backward, setup_context=_fwd_setup_context)
 
+    @torch.library.custom_op(
+        "torchtitan::helion_complex_rope_fwd",
+        mutates_args=(),
+        device_types="cuda",
+    )
+    def _helion_complex_rope_fwd(
+        xq: torch.Tensor,
+        xk: torch.Tensor,
+        rope_cache_real: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return _run_tuned(
+            _rope_complex_fwd,
+            _fwd_config(xq),
+            xq,
+            xk,
+            rope_cache_real,
+            positions,
+        )
+
+    @_helion_complex_rope_fwd.register_fake
+    def _helion_complex_rope_fwd_fake(
+        xq: torch.Tensor,
+        xk: torch.Tensor,
+        rope_cache_real: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return torch.empty_like(xq), torch.empty_like(xk)
+
+    @torch.library.custom_op(
+        "torchtitan::helion_complex_rope_bwd",
+        mutates_args=(),
+        device_types="cuda",
+    )
+    def _helion_complex_rope_bwd(
+        grad_xq_out: torch.Tensor,
+        grad_xk_out: torch.Tensor,
+        rope_cache_real: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        grad_xq_out = grad_xq_out.contiguous()
+        grad_xk_out = grad_xk_out.contiguous()
+        return _run_tuned(
+            _rope_complex_bwd,
+            _bwd_config(grad_xq_out),
+            grad_xq_out,
+            grad_xk_out,
+            rope_cache_real,
+            positions,
+        )
+
+    @_helion_complex_rope_bwd.register_fake
+    def _helion_complex_rope_bwd_fake(
+        grad_xq_out: torch.Tensor,
+        grad_xk_out: torch.Tensor,
+        rope_cache_real: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return torch.empty_like(grad_xq_out), torch.empty_like(grad_xk_out)
+
+    def _complex_fwd_setup_context(ctx, inputs, output) -> None:
+        xq, xk, rope_cache_real, positions = inputs
+        ctx.save_for_backward(rope_cache_real, positions)
+        ctx.xq_shape = xq.shape
+        ctx.xk_shape = xk.shape
+
+    def _complex_fwd_backward(ctx, grad_xq_out, grad_xk_out):
+        rope_cache_real, positions = ctx.saved_tensors
+        if grad_xq_out is None:
+            grad_xq_out = torch.zeros(
+                ctx.xq_shape, device=grad_xk_out.device, dtype=grad_xk_out.dtype
+            )
+        if grad_xk_out is None:
+            grad_xk_out = torch.zeros(
+                ctx.xk_shape, device=grad_xq_out.device, dtype=grad_xq_out.dtype
+            )
+        grad_xq, grad_xk = _helion_complex_rope_bwd(
+            grad_xq_out, grad_xk_out, rope_cache_real, positions
+        )
+        if not ctx.needs_input_grad[0]:
+            grad_xq = None
+        if not ctx.needs_input_grad[1]:
+            grad_xk = None
+        return grad_xq, grad_xk, None, None
+
+    _helion_complex_rope_fwd.register_autograd(
+        _complex_fwd_backward,
+        setup_context=_complex_fwd_setup_context,
+    )
+
 
 def _to_local(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.to_local() if isinstance(tensor, DTensor) else tensor
@@ -405,6 +595,36 @@ def _eligible(
     )
 
 
+def _eligible_complex(
+    xq: torch.Tensor,
+    xk: torch.Tensor,
+    rope_cache_real: torch.Tensor,
+    positions: torch.Tensor,
+) -> bool:
+    return (
+        xq.is_cuda
+        and xk.is_cuda
+        and rope_cache_real.is_cuda
+        and positions.is_cuda
+        and xq.device == xk.device == rope_cache_real.device == positions.device
+        and xq.ndim == 4
+        and xk.ndim == 4
+        and rope_cache_real.ndim == 3
+        and rope_cache_real.shape[-1] == 2
+        and rope_cache_real.shape[-2] * 2 == xq.shape[-1]
+        and positions.ndim == 2
+        and positions.dtype in (torch.int32, torch.int64)
+        and tuple(positions.shape) == tuple(xq.shape[:2])
+        and tuple(xk.shape[:2]) == tuple(xq.shape[:2])
+        and xq.is_contiguous()
+        and xk.is_contiguous()
+        and rope_cache_real.is_contiguous()
+        and positions.is_contiguous()
+        and xq.shape[-1] == xk.shape[-1]
+        and xq.shape[-1] % 2 == 0
+    )
+
+
 if _HAS_HELION:
 
     def _apply_helion_rope(
@@ -442,6 +662,38 @@ if _HAS_HELION:
         xq_out, xk_out = _helion_rope_fwd(xq, xk, cache, pos)
         return _from_local(xq_out, query), _from_local(xk_out, key)
 
+    def _apply_helion_complex_rope(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        rope_cache: torch.Tensor,
+        positions: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        xq = _to_local(query)
+        xk = _to_local(key)
+        cache = _to_local(rope_cache)
+        pos = _resolve_positions(positions, xq)
+        if not torch.is_complex(cache):
+            warn_once(
+                logger,
+                "HelionComplexRoPE: cache is not complex; falling back to the "
+                "PyTorch ComplexRoPE path.",
+            )
+            return None
+        cache_real = torch.view_as_real(cache)
+        if not _eligible_complex(xq, xk, cache_real, pos):
+            warn_once(
+                logger,
+                "HelionComplexRoPE: inputs unsupported by the fused kernel "
+                "(need contiguous CUDA q/k/cache/positions, a complex 2D cache "
+                "of width head_dim / 2, and integer (batch, seq_len) position "
+                "ids); falling back to the PyTorch ComplexRoPE path.",
+            )
+            return None
+
+        _maybe_check_max_pos(pos, max_valid_pos=cache_real.shape[0] - 1)
+        xq_out, xk_out = _helion_complex_rope_fwd(xq, xk, cache_real, pos)
+        return _from_local(xq_out, query), _from_local(xk_out, key)
+
 else:
 
     def _apply_helion_rope(
@@ -454,6 +706,20 @@ else:
             logger,
             "HelionRoPE override is active but `helion` is not installed; "
             "falling back to the PyTorch cos/sin RoPE. Install helion to use "
+            "the fused kernel.",
+        )
+        return None
+
+    def _apply_helion_complex_rope(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        rope_cache: torch.Tensor,
+        positions: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        warn_once(
+            logger,
+            "HelionComplexRoPE override is active but `helion` is not installed; "
+            "falling back to the PyTorch ComplexRoPE path. Install helion to use "
             "the fused kernel.",
         )
         return None
@@ -495,7 +761,7 @@ def helion_rope(cfg: CosSinRoPE.Config) -> HelionRoPE.Config:
 
 
 class HelionComplexRoPE(ComplexRoPE):
-    """Complex RoPE override that keeps stock math until a fused kernel exists."""
+    """Complex RoPE that applies adjacent-pair rotation with a Helion kernel."""
 
     @dataclass(kw_only=True, slots=True)
     class Config(ComplexRoPE.Config):
@@ -507,20 +773,17 @@ class HelionComplexRoPE(ComplexRoPE):
         key: torch.Tensor,
         positions: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        warn_once(
-            logger,
-            "HelionComplexRoPE override is active, but a fused Helion kernel for "
-            "complex RoPE is not implemented; falling back to the PyTorch "
-            "ComplexRoPE path.",
-        )
-        return super().forward(query, key, positions)
+        out = _apply_helion_complex_rope(query, key, self.cache, positions)
+        if out is None:
+            return super().forward(query, key, positions)
+        return out
 
 
 @override(
     "helion_complex_rope",
     target=ComplexRoPE.Config,
     exact=True,
-    description="Explicit Helion override fallback for complex rotary embedding.",
+    description="Fused Helion complex rotary embedding (CUDA).",
 )
 def helion_complex_rope(cfg: ComplexRoPE.Config) -> HelionComplexRoPE.Config:
     return derive(cfg, HelionComplexRoPE.Config)
