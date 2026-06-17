@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import dataclasses
+import hashlib
 import json
 import os
 import time
@@ -749,6 +750,103 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         # The returned loss here is local SUM loss / global_valid_tokens
         return loss
 
+    def _dump_weight_hash_diagnostics(self) -> None:
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+            return
+
+        out_dir = os.path.join(self.config.dump_folder, "weight_hash_diagnostics")
+        os.makedirs(out_dir, exist_ok=True)
+
+        for part_idx, model in enumerate(self.model_parts):
+            value_hash = hashlib.sha256()
+            named_hash = hashlib.sha256()
+            multiset_hashes: list[str] = []
+            entries: list[dict[str, Any]] = []
+
+            def add_tensor(name: str, tensor: torch.Tensor, kind: str) -> None:
+                name, local_tensor, raw_bytes = self._weight_hash_tensor(name, tensor)
+                tensor_hash = hashlib.sha256(raw_bytes).hexdigest()
+                value_hash.update(raw_bytes)
+                named_hash.update(name.encode("utf-8"))
+                named_hash.update(raw_bytes)
+                multiset_hashes.append(tensor_hash)
+                entries.append(
+                    {
+                        "kind": kind,
+                        "name": name,
+                        "shape": list(local_tensor.shape),
+                        "dtype": str(local_tensor.dtype),
+                        "hash": tensor_hash,
+                    }
+                )
+
+            with torch.no_grad():
+                for name, param in model.named_parameters():
+                    add_tensor(name, param, "parameter")
+                for name, buffer in model.named_buffers():
+                    add_tensor(name, buffer, "buffer")
+
+            name_order_hash = hashlib.sha256(
+                "\n".join(entry["name"] for entry in entries).encode("utf-8")
+            ).hexdigest()
+            multiset_hash = hashlib.sha256(
+                "\n".join(sorted(multiset_hashes)).encode("utf-8")
+            ).hexdigest()
+            payload = {
+                "step": self.step,
+                "part": part_idx,
+                "num_tensors": len(entries),
+                "named_hash": named_hash.hexdigest(),
+                "value_hash": value_hash.hexdigest(),
+                "value_multiset_hash": multiset_hash,
+                "name_order_hash": name_order_hash,
+                "entries": entries,
+            }
+
+            run_name = "_".join(
+                (
+                    os.environ.get("MODULE", "module"),
+                    os.environ.get("CONFIG", "config"),
+                )
+            )
+            run_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in run_name)
+            out_path = os.path.join(
+                out_dir, f"{run_name}_rank0_step{self.step}_part{part_idx}.json"
+            )
+            with open(out_path, "w") as f:
+                json.dump(payload, f, indent=2)
+            logger.info(
+                f"[step {self.step}] weight_hash_diagnostics: part={part_idx} "
+                f"path={out_path} value_hash={payload['value_hash']} "
+                f"value_multiset_hash={payload['value_multiset_hash']} "
+                f"name_order_hash={payload['name_order_hash']}"
+            )
+
+    @staticmethod
+    def _weight_hash_tensor(
+        name: str, tensor: torch.Tensor
+    ) -> tuple[str, torch.Tensor, bytes]:
+        name = name.replace("._checkpoint_wrapped_module", "")
+        if isinstance(tensor, DTensor):
+            local_tensor = tensor.to_local().detach().cpu().contiguous()
+        else:
+            local_tensor = tensor.detach().cpu().contiguous()
+        raw_bytes = local_tensor.reshape(-1).view(torch.uint8).numpy().tobytes()
+        return name, local_tensor, raw_bytes
+
+    def _hash_model_part(self, model: BaseModel) -> str:
+        h = hashlib.sha256()
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                name, _, raw_bytes = self._weight_hash_tensor(name, param)
+                h.update(name.encode("utf-8"))
+                h.update(raw_bytes)
+            for name, buffer in model.named_buffers():
+                name, _, raw_bytes = self._weight_hash_tensor(name, buffer)
+                h.update(name.encode("utf-8"))
+                h.update(raw_bytes)
+        return h.hexdigest()
+
     def train_step(
         self, data_iterator: Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]
     ):
@@ -807,6 +905,22 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             self.checkpointer.maybe_wait_for_staging()
             self.optimizers.step()
             self.lr_schedulers.step()
+
+        if os.environ.get("GT_WEIGHT_HASH", "").lower() not in ("", "0", "false"):
+            if (
+                not torch.distributed.is_initialized()
+                or torch.distributed.get_rank() == 0
+            ):
+                weight_hashes = [self._hash_model_part(m) for m in self.model_parts]
+                logger.info(
+                    f"[step {self.step}] weight_hash: {'|'.join(weight_hashes)}"
+                )
+            if os.environ.get("GT_WEIGHT_HASH_DIAGNOSTICS", "").lower() not in (
+                "",
+                "0",
+                "false",
+            ):
+                self._dump_weight_hash_diagnostics()
 
         # Reduce the data collected over gradient accumulation steps.
         loss = torch.sum(torch.stack(accumulated_losses))
