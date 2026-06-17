@@ -46,7 +46,14 @@ class GraphTrainerCompileConfig(CompileConfig):
     debug_graph_passes: bool = False
     """Log timing, op-count diffs, and before/after graphs for each pass to tlparse."""
 
-    memory_policy: Literal["default", "full", "eager", "sac_and_offload"] = "default"
+    memory_policy: Literal[
+        "default",
+        "full",
+        "eager",
+        "save_layer_inputs",
+        "save_layer_inputs_eager_compat",
+        "sac_and_offload",
+    ] = "default"
     """
     Memory optimization policy for activation management (SAC, offload).
         default: SAC — save all compute-intensive ops and FSDP all_gathers.
@@ -54,6 +61,10 @@ class GraphTrainerCompileConfig(CompileConfig):
             eager's full AC (checkpoint_wrapper with no context_fn).
         eager: SAC alternating mm ops between save/recompute, matching the
             eager AC policy in torchtitan.distributed.activation_checkpoint.
+        save_layer_inputs: save each transformer layer's input and recompute
+            the layer interior.
+        save_layer_inputs_eager_compat: save the same boundaries, but also
+            replay saved boundary nodes to match Eager full AC recompute counts.
         sac_and_offload: SAC + CPU offload — apply default SAC first,
             then offload surviving MUST_SAVE activations to CPU within
             the cpu_offload_budget_gb budget.

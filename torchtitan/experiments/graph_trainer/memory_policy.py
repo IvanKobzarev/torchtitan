@@ -29,6 +29,7 @@ from torchtitan.experiments.graph_trainer.common_utils import (
     _is_backward_node,
     _MODULE_FQN,
     _NOT_IN_LAYERS,
+    apply_save_layer_inputs_ac,
 )
 from torchtitan.experiments.graph_trainer.cpu_offload import (
     tag_all_offloadable_activations,
@@ -294,6 +295,30 @@ def _eager_memory_policy_pass(
     return gm
 
 
+@register_memory_policy("save_layer_inputs")
+def _save_layer_inputs_memory_policy_pass(
+    gm: torch.fx.GraphModule,
+    *,
+    config: "GraphTrainer.Config",
+) -> torch.fx.GraphModule:
+    """Save each transformer layer's input and recompute its interior."""
+    apply_save_layer_inputs_ac(gm, layer_prefix="layers")
+    return gm
+
+
+@register_memory_policy("save_layer_inputs_eager_compat")
+def _save_layer_inputs_eager_compat_memory_policy_pass(
+    gm: torch.fx.GraphModule,
+    *,
+    config: "GraphTrainer.Config",
+) -> torch.fx.GraphModule:
+    """Save layer inputs but also replay saved boundaries for Eager parity."""
+    apply_save_layer_inputs_ac(
+        gm, layer_prefix="layers", force_boundary_recompute=True
+    )
+    return gm
+
+
 @register_memory_policy("sac_and_offload")
 def _sac_and_offload_memory_policy_pass(
     gm: torch.fx.GraphModule,
@@ -321,6 +346,8 @@ def tag_with_memory_policy_pass(
         default: SAC with all compute-intensive ops saved.
         full: full recompute — only layer outputs are saved.
         eager: SAC alternating mm ops between save/recompute.
+        save_layer_inputs: save transformer-block inputs and recompute interiors.
+        save_layer_inputs_eager_compat: save and replay boundaries for Eager parity.
         sac_and_offload: SAC + CPU offload within budget.
 
     Other memory policies combining SAC and CPU offload can be added
