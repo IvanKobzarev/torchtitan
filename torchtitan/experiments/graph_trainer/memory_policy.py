@@ -238,7 +238,13 @@ def _save_layer_inputs_memory_policy_pass(
 
     Tag-based equivalent of full per-layer activation checkpointing.
     """
-    apply_save_layer_inputs_ac(gm, layer_prefix="layers")
+    apply_save_layer_inputs_ac(
+        gm,
+        layer_prefix="layers",
+        save_final_layer_output=getattr(
+            config.compile, "ac_save_final_layer_output", True
+        ),
+    )
     return gm
 
 

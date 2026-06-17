@@ -20,6 +20,15 @@ import torch
 from torchtitan.tools.logging import logger
 
 
+def eliminate_dead_code_pass(
+    gm: torch.fx.GraphModule, example_inputs=None
+) -> torch.fx.GraphModule:
+    if gm.graph.eliminate_dead_code():
+        gm.graph.lint()
+        gm.recompile()
+    return gm
+
+
 def remove_detach_pass(
     gm: torch.fx.GraphModule, example_inputs=None
 ) -> torch.fx.GraphModule:

@@ -1441,6 +1441,24 @@ class TestMinCutACPeakModel(TestCase):
         self.assertEqual(layer_out.meta["recompute"], CheckpointPolicy.MUST_SAVE)
         self.assertNotIn("recompute", final_norm.meta)
 
+    def test_save_layer_inputs_can_recompute_final_layer_output_boundary(self):
+        graph = fx.Graph()
+        x = graph.placeholder("x")
+        layer_out = graph.call_function(torch.ops.aten.sin.default, args=(x,))
+        final_norm = graph.call_function(torch.ops.aten.relu.default, args=(layer_out,))
+        bwd = graph.call_function(torch.ops.aten.neg.default, args=(layer_out,))
+        graph.output((final_norm, bwd))
+        gm = fx.GraphModule(torch.nn.Module(), graph)
+
+        layer_out.meta["custom"] = {_MODULE_FQN: "layers.0"}
+        final_norm.meta["custom"] = {_MODULE_FQN: "norm"}
+        bwd.meta["autograd_backward"] = True
+
+        apply_save_layer_inputs_ac(gm, save_final_layer_output=False)
+
+        self.assertEqual(layer_out.meta["recompute"], CheckpointPolicy.PREFER_RECOMPUTE)
+        self.assertNotIn("recompute", final_norm.meta)
+
     def test_all_scope_processes_min_cut_before_broad_candidates(self):
         gm, example_inputs, b_node, c_node = self._make_all_scope_graph()
         trials = []

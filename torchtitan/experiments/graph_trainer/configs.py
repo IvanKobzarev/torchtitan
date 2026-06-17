@@ -84,6 +84,12 @@ class GraphTrainerCompileConfig(CompileConfig):
             the peak budget. If the requested target is infeasible, min-cut keeps
             the best lower-peak plan found and logs the miss."""
 
+    ac_save_final_layer_output: bool = True
+    """When memory_policy=save_layer_inputs, also save the final transformer
+    layer output boundary. This preserves the eager per-layer checkpointing
+    policy. Disabling it lets the final layer output be recomputed so the graph
+    can avoid holding both the final boundary and post-layer head activation."""
+
     ac_relax_relaxable_must_saves: bool = False
     """Opt-in experiment: before min-cut AC, downgrade eligible MUST_SAVE
     activations to PREFER_SAVE so min-cut can replace rigid saves with a new save

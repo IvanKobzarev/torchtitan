@@ -13,6 +13,8 @@ regional_inductor.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 from torch.fx.passes.regional_inductor import regional_inductor
 
@@ -181,13 +183,17 @@ def annotate_flex_attention_for_regional_inductor_pass(
         node.meta.setdefault("custom", {})[
             "compile_with_inductor"
         ] = flex_compile_annotation
-        for inp in node.all_input_nodes:
+        for inp in list(node.all_input_nodes):
             if inp.op != "get_attr":
                 continue
             submod = getattr(gm, inp.target, None)
             if not isinstance(submod, torch.fx.GraphModule):
                 continue
-            inp.meta.setdefault("custom", {})[
+            with gm.graph.inserting_before(node):
+                cloned_inp = gm.graph.get_attr(inp.target)
+            cloned_inp.meta = dict(inp.meta)
+            node.replace_input_with(inp, cloned_inp)
+            cloned_inp.meta.setdefault("custom", {})[
                 "compile_with_inductor"
             ] = flex_compile_annotation
 
@@ -196,6 +202,8 @@ def annotate_flex_attention_for_regional_inductor_pass(
                 sub_node.meta.setdefault("custom", {})[
                     "compile_with_inductor"
                 ] = mask_compile_annotation
+    gm.graph.eliminate_dead_code()
+    gm.recompile()
     return gm
 
 
@@ -212,8 +220,100 @@ def _migrate_cpu_get_attrs_to_cuda(gm: torch.fx.GraphModule) -> None:
                 _assign_attr(attr.cuda(), module, node.target)
 
 
+@dataclass(frozen=True)
+class ActivationCheckpointingPassConfig:
+    mode: str = "eager"
+    layer_prefix: str = "layers"
+    min_cut_policy: str = "none"
+    max_peak_increase_gb: float | None = None
+    memory_estimator: str = "approximate"
+    save_scope: str = "min_cut"
+    save_final_layer_output: bool = True
+    relax_relaxable_must_saves: bool = False
+    allow_allowed_saves: bool = False
+
+
+def activation_checkpointing_pass(
+    gm: torch.fx.GraphModule,
+    example_inputs: tuple,
+    *,
+    ac_config: ActivationCheckpointingPassConfig = ActivationCheckpointingPassConfig(),
+) -> torch.fx.GraphModule:
+    """Apply tag-based AC and optional min-cut before compilation.
+
+    This is the generic pass used by graph_trainer-adjacent callers that do not
+    have a full ``GraphTrainer.Config`` but still want the same save-layer-inputs,
+    min-cut, and selective-remat implementation.
+    """
+    if ac_config.mode in ("eager", "default", None):
+        if ac_config.min_cut_policy != "none":
+            raise ValueError("min-cut AC requires mode='save_layer_inputs'")
+        return gm
+    if ac_config.mode != "save_layer_inputs":
+        raise ValueError(f"Unknown AC mode: {ac_config.mode!r}")
+    if ac_config.min_cut_policy not in ("none", "min_cut_peak_aware"):
+        raise ValueError(f"Unknown min-cut policy: {ac_config.min_cut_policy!r}")
+
+    from torchtitan.experiments.graph_trainer.common_utils import (
+        apply_save_layer_inputs_ac,
+    )
+    from torchtitan.experiments.graph_trainer.min_cut_ac import (
+        ac_allow_allowed_saves,
+        ac_relax_relaxable_must_saves,
+        min_cut_ac_pass,
+    )
+    from torchtitan.experiments.graph_trainer.selective_activation_remat import (
+        selective_activation_remat_pass,
+    )
+
+    n_before = len(list(gm.graph.nodes))
+    apply_save_layer_inputs_ac(
+        gm,
+        layer_prefix=ac_config.layer_prefix,
+        save_final_layer_output=ac_config.save_final_layer_output,
+    )
+
+    if ac_config.min_cut_policy == "min_cut_peak_aware":
+        min_cut_ac_pass(
+            gm,
+            example_inputs,
+            max_peak_increase_gb=ac_config.max_peak_increase_gb,
+            memory_estimator=ac_config.memory_estimator,
+            save_scope=ac_config.save_scope,
+            relax_relaxable_must_saves=ac_config.relax_relaxable_must_saves,
+            allow_allowed_saves=ac_config.allow_allowed_saves,
+        )
+    else:
+        if ac_config.relax_relaxable_must_saves:
+            ac_relax_relaxable_must_saves(gm, example_inputs)
+        if ac_config.allow_allowed_saves:
+            ac_allow_allowed_saves(gm, example_inputs)
+
+    gm = selective_activation_remat_pass(gm, example_inputs)
+    logger.info(
+        "activation_checkpointing_pass: mode=%s min_cut_policy=%s "
+        "max_peak_increase_gb=%s memory_estimator=%s save_scope=%s "
+        "save_final_layer_output=%s relax_relaxable_must_saves=%s "
+        "allow_allowed_saves=%s nodes=%d->%d",
+        ac_config.mode,
+        ac_config.min_cut_policy,
+        ac_config.max_peak_increase_gb,
+        ac_config.memory_estimator,
+        ac_config.save_scope,
+        ac_config.save_final_layer_output,
+        ac_config.relax_relaxable_must_saves,
+        ac_config.allow_allowed_saves,
+        n_before,
+        len(list(gm.graph.nodes)),
+    )
+    return gm
+
+
 def full_inductor_compilation_pass(
-    gm: torch.fx.GraphModule, example_inputs: tuple
+    gm: torch.fx.GraphModule,
+    example_inputs: tuple,
+    *,
+    ac_config: ActivationCheckpointingPassConfig | None = None,
 ) -> torch.fx.GraphModule:
     """Apply full Inductor compilation by tagging every node and delegating
     to :func:`regional_inductor_pass`.
@@ -238,6 +338,9 @@ def full_inductor_compilation_pass(
     import torch._inductor.config as ic
 
     from torchtitan.experiments.graph_trainer.cudagraph import is_cudagraph_compatible
+
+    if ac_config is not None:
+        gm = activation_checkpointing_pass(gm, example_inputs, ac_config=ac_config)
 
     pre_collapse_cudagraph_compatible = is_cudagraph_compatible(gm)
 

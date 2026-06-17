@@ -34,6 +34,9 @@ from torchtitan.experiments.graph_trainer.ep_process_group_pass import (
 )
 from torchtitan.experiments.graph_trainer.fsdp_passes import overlap_fsdp_ag_rs_pass
 from torchtitan.experiments.graph_trainer.graph_utils import export_joint
+from torchtitan.experiments.graph_trainer.inductor_passes import (
+    annotate_flex_attention_for_regional_inductor_pass,
+)
 from torchtitan.experiments.graph_trainer.make_fx_tracer import minimal_fx_tracer
 from torchtitan.experiments.graph_trainer.memory_policy import (
     _make_default_memory_policy,
@@ -83,6 +86,74 @@ class ToyModel(Module):
                 use_reentrant=False,
             )
         return x
+
+
+def _empty_graph_module():
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    graph.output(x)
+    return torch.fx.GraphModule(torch.nn.Module(), graph)
+
+
+class TestAnnotateFlexAttentionForRegionalInductorPass(TestCase):
+    def test_clones_graphmodule_get_attrs_per_flex_hop(self):
+        root = torch.nn.Module()
+        root.score_mod = _empty_graph_module()
+        root.mask_mod = _empty_graph_module()
+
+        graph = torch.fx.Graph()
+        query = graph.placeholder("query")
+        key = graph.placeholder("key")
+        value = graph.placeholder("value")
+        score_mod = graph.get_attr("score_mod")
+        mask_mod = graph.get_attr("mask_mod")
+        hop0 = graph.call_function(
+            torch.ops.higher_order.flex_attention,
+            args=(query, key, value, score_mod, mask_mod),
+        )
+        hop1 = graph.call_function(
+            torch.ops.higher_order.flex_attention,
+            args=(query, key, value, score_mod, mask_mod),
+        )
+        graph.output((hop0, hop1))
+        gm = torch.fx.GraphModule(root, graph)
+
+        annotate_flex_attention_for_regional_inductor_pass(
+            gm,
+            flex_compile_config={},
+        )
+
+        flex_nodes = [
+            node
+            for node in gm.graph.nodes
+            if node.target == torch.ops.higher_order.flex_attention
+        ]
+        self.assertEqual(len(flex_nodes), 2)
+
+        module_get_attrs = [
+            node
+            for node in gm.graph.nodes
+            if node.op == "get_attr"
+            and isinstance(getattr(gm, node.target), torch.fx.GraphModule)
+        ]
+        self.assertEqual(len(module_get_attrs), 4)
+
+        seen_module_inputs = set()
+        for node in flex_nodes:
+            inputs = [
+                inp
+                for inp in node.all_input_nodes
+                if inp.op == "get_attr"
+                and isinstance(getattr(gm, inp.target), torch.fx.GraphModule)
+            ]
+            self.assertEqual(len(inputs), 2)
+            for inp in inputs:
+                self.assertNotIn(inp, seen_module_inputs)
+                seen_module_inputs.add(inp)
+                self.assertIn(
+                    "compile_with_inductor",
+                    inp.meta.get("custom", {}),
+                )
 
 
 class TestOverlapFsdpAgRsPass(FSDPTest):

@@ -59,14 +59,19 @@ def _get_layer_id(node: torch.fx.Node, layer_prefix: str = "layers") -> int:
 
 
 def apply_save_layer_inputs_ac(
-    gm: torch.fx.GraphModule, *, layer_prefix: str = "layers"
+    gm: torch.fx.GraphModule,
+    *,
+    layer_prefix: str = "layers",
+    save_final_layer_output: bool = True,
 ) -> torch.fx.GraphModule:
     """Tag the joint graph with the "save block input" AC policy.
 
     Pass 1: tag every forward node inside a transformer layer PREFER_RECOMPUTE.
-    Pass 2: upgrade to MUST_SAVE any layer node whose output is consumed outside
-    that layer -- that crossing tensor is the next block's input (or the final
-    block output), so saving it avoids recomputing the whole preceding layer.
+    Pass 2: upgrade to MUST_SAVE any layer node whose output is consumed by a
+    later layer -- that crossing tensor is the next block's input, so saving it
+    avoids recomputing the whole preceding layer. The final layer output can
+    optionally stay recomputable to avoid pinning both it and the post-layer
+    head activation at the peak.
     Nodes outside layers (embeddings, final norm, loss head) are left untagged
     and are therefore saved.
 
@@ -127,9 +132,11 @@ def apply_save_layer_inputs_ac(
         if layer_id == _NOT_IN_LAYERS:
             continue
         for user in node.users:
-            if (
-                not _is_backward_node(user)
-                and _get_layer_id(user, layer_prefix) != layer_id
+            if _is_backward_node(user):
+                continue
+            user_layer_id = _get_layer_id(user, layer_prefix)
+            if user_layer_id != layer_id and (
+                save_final_layer_output or user_layer_id != _NOT_IN_LAYERS
             ):
                 node.meta["recompute"] = CheckpointPolicy.MUST_SAVE
                 n_save += 1
