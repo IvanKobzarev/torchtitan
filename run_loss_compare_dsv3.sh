@@ -31,12 +31,18 @@ set -uo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
 
 MODEL_SIZE="${MODEL_SIZE:-16b}"          # 16b | debugmodel | 671b
+if [ "${MODEL_SIZE}" = "16b" ]; then
+    HF_ASSETS_PATH="${HF_ASSETS_PATH:-$HOME/torchtrain_datasets/tree/deepseek-moe-16b}"
+else
+    HF_ASSETS_PATH="${HF_ASSETS_PATH:-}"
+fi
 STEPS="${STEPS:-50}"
 NGPU="${NGPU:-8}"
 DP_SHARD="${DP_SHARD:-8}"
 TP="${TP:-1}"
 EP="${EP:-4}"
 DATASET="${DATASET:-c4_test}"
+OVERRIDE_MODULE="${OVERRIDE_MODULE:-}"
 # CONFIG_SUFFIX selects a config variant on BOTH sides, e.g. "_minimal_async_ep"
 # to compare eager deepseek_v3_16b_minimal_async_ep vs graph_trainer_..._minimal_async_ep.
 CONFIG_SUFFIX="${CONFIG_SUFFIX:-}"
@@ -49,11 +55,28 @@ JOB_DIR="${JOB_DIR:-$HOME/tmp/loss_compare_dsv3_${MODEL_SIZE}${CONFIG_SUFFIX}}"
 # does not spike host RAM and OOM-kill regional_inductor (same reason as
 # run_graph_trainer_dsv3.sh). loss_compare inherits this env into both runs.
 export TORCHINDUCTOR_COMPILE_THREADS="${TORCHINDUCTOR_COMPILE_THREADS:-8}"
+export GT_WEIGHT_HASH="${GT_WEIGHT_HASH:-1}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+export PYTHONHASHSEED="${PYTHONHASHSEED:-42}"
+export CUBLAS_WORKSPACE_CONFIG="${CUBLAS_WORKSPACE_CONFIG:-:4096:8}"
+export NVIDIA_TF32_OVERRIDE="${NVIDIA_TF32_OVERRIDE:-0}"
+export TORCH_ALLOW_TF32_CUBLAS_OVERRIDE="${TORCH_ALLOW_TF32_CUBLAS_OVERRIDE:-0}"
+export NCCL_ALGO="${NCCL_ALGO:-Ring}"
+export NCCL_PROTO="${NCCL_PROTO:-Simple}"
+export NCCL_COLLNET_ENABLE="${NCCL_COLLNET_ENABLE:-0}"
+export NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-0}"
 
 PARALLELISM="--parallelism.data_parallel_shard_degree=${DP_SHARD}"
 PARALLELISM="${PARALLELISM} --parallelism.tensor_parallel_degree=${TP}"
 PARALLELISM="${PARALLELISM} --parallelism.expert_parallel_degree=${EP}"
+PARALLELISM="${PARALLELISM} --parallelism.no-enable_sequence_parallel"
 COMMON="${PARALLELISM} --dataloader.dataset ${DATASET}"
+if [ -n "${HF_ASSETS_PATH}" ]; then
+    COMMON="--hf_assets_path ${HF_ASSETS_PATH} ${COMMON}"
+fi
+if [ -n "${OVERRIDE_MODULE}" ]; then
+    COMMON="${COMMON} --override.imports ${OVERRIDE_MODULE}"
+fi
 
 # No seed checkpoint: with identical parallelism + --debug.seed=42 +
 # --debug.deterministic, the eager and graph_trainer runs initialize to
@@ -61,7 +84,7 @@ COMMON="${PARALLELISM} --dataloader.dataset ${DATASET}"
 # bitwise both with and without a seed checkpoint). This also avoids
 # loss_compare's single-GPU seed creation, which for 16B/671B forces an
 # unsharded CPU init of all params -- impractically slow.
-BASE_OPTS="${COMMON} --compile.no-enable --activation_checkpoint.mode full"
+BASE_OPTS="${COMMON} --compile.no-enable activation-checkpoint:full"
 TEST_OPTS="${COMMON} --compile.mode aot_fx_trace --compile.memory_policy full"
 if [ "$TEST_CUDAGRAPH" != "1" ]; then
     TEST_OPTS="${TEST_OPTS} --compile.disable_passes cudagraph_pass"
@@ -70,6 +93,7 @@ fi
 mkdir -p "${JOB_DIR}"
 LOG="${JOB_DIR}/compare.log"
 SUMMARY_MD="${JOB_DIR}/fullprec_summary.md"
+LOSS_COMPARE_OUTPUT="${JOB_DIR}/loss_compare_outputs"
 
 echo "=============================================================="
 echo " DSv3 numerics verification"
@@ -77,6 +101,14 @@ echo "   model        : deepseek_v3_${MODEL_SIZE}${CONFIG_SUFFIX}  vs  graph_tra
 echo "   test cudagraph: ${TEST_CUDAGRAPH}"
 echo "   parallelism  : dp_shard=${DP_SHARD} tp=${TP} ep=${EP} (NGPU=${NGPU})"
 echo "   steps        : ${STEPS}    dataset: ${DATASET}"
+echo "   hf assets    : ${HF_ASSETS_PATH:-<config default>}"
+echo "   override     : ${OVERRIDE_MODULE:-<none>}"
+echo "   weight hash  : ${GT_WEIGHT_HASH}"
+echo "   cuda devices : ${CUDA_VISIBLE_DEVICES}"
+echo "   python hash  : ${PYTHONHASHSEED}"
+echo "   cublas ws    : ${CUBLAS_WORKSPACE_CONFIG}"
+echo "   tf32 override: NVIDIA=${NVIDIA_TF32_OVERRIDE} TORCH=${TORCH_ALLOW_TF32_CUBLAS_OVERRIDE}"
+echo "   nccl pins    : ALGO=${NCCL_ALGO} PROTO=${NCCL_PROTO} COLLNET=${NCCL_COLLNET_ENABLE} NVLS=${NCCL_NVLS_ENABLE}"
 echo "   job dir      : ${JOB_DIR}"
 echo "   baseline opts: ${BASE_OPTS}"
 echo "   test opts    : ${TEST_OPTS}"
@@ -89,7 +121,8 @@ python scripts/loss_compare.py . . \
   --test-options="${TEST_OPTS}" \
   --assert-equal --steps="${STEPS}" --no-seed-checkpoint \
   --baseline-ngpus="${NGPU}" --test-ngpus="${NGPU}" \
-  --job-dump-folder="${JOB_DIR}" 2>&1 | tee "${LOG}"
+  --job-dump-folder="${JOB_DIR}" \
+  --output-folder="${LOSS_COMPARE_OUTPUT}" 2>&1 | tee "${LOG}"
 COMPARE_EXIT=${PIPESTATUS[0]}
 echo "loss_compare exit code: ${COMPARE_EXIT}"
 
@@ -163,7 +196,10 @@ def avg_after(tag, warmup):
     tt = [v for s, v in t.items() if s > warmup]
     return sum(bb)/len(bb), sum(tt)/len(tt)
 
-warmup = max(10, int(steps) // 5)
+total_steps = int(steps)
+warmup = max(10, total_steps // 5)
+if total_steps <= warmup:
+    warmup = max(0, total_steps - 1)
 mem_res_b, mem_res_t = peak("memory/max_reserved(GiB)")
 mem_act_b, mem_act_t = peak("memory/max_active(GiB)")
 tps_b, tps_t = avg_after("throughput(tps)", warmup)
@@ -195,5 +231,30 @@ if command -v pastry >/dev/null 2>&1; then
     echo "Pastry (run log): $(pastry < "${LOG}" 2>/dev/null)"
 fi
 echo "Markdown summary: ${SUMMARY_MD}"
+if [ -n "${GT_WEIGHT_HASH}" ] && [ "${GT_WEIGHT_HASH}" != "0" ]; then
+    HASH_SUMMARY="${JOB_DIR}/weight_hash_summary.txt"
+    : > "${HASH_SUMMARY}"
+    HASH_CHECK_EXIT=0
+    for scenario in baseline test; do
+        TRAIN_LOG="${LOSS_COMPARE_OUTPUT}/${scenario}_training.log"
+        echo "=== ${scenario} weight hashes ===" | tee -a "${HASH_SUMMARY}"
+        if [ ! -f "${TRAIN_LOG}" ]; then
+            echo "missing log: ${TRAIN_LOG}" | tee -a "${HASH_SUMMARY}"
+            HASH_CHECK_EXIT=1
+            continue
+        fi
+        grep "weight_hash:" "${TRAIN_LOG}" | tee -a "${HASH_SUMMARY}" || true
+        HASH_COUNT=$(grep -c "weight_hash:" "${TRAIN_LOG}" || true)
+        echo "${scenario}: ${HASH_COUNT}/${STEPS} expected per-step weight_hash logs" | tee -a "${HASH_SUMMARY}"
+        if [ "${HASH_COUNT}" -lt "${STEPS}" ]; then
+            HASH_CHECK_EXIT=1
+        fi
+    done
+    echo "Weight hash summary: ${HASH_SUMMARY}"
+    if [ "${HASH_CHECK_EXIT}" -ne 0 ]; then
+        echo "ERROR: missing per-step weight_hash logs"
+        exit "${HASH_CHECK_EXIT}"
+    fi
+fi
 echo "COMPARE_EXIT=${COMPARE_EXIT}"
 exit "${COMPARE_EXIT}"

@@ -62,6 +62,7 @@ Example usages:
 
 import argparse
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -335,6 +336,23 @@ def build_training_command(
     tb_folder: str = "tb",
 ) -> str:
     """Build the final training command with all options."""
+    option_tokens = shlex.split(options)
+    activation_checkpoint_subcommands = {
+        "activation-checkpoint:selective",
+        "activation-checkpoint:full",
+        "activation-checkpoint:memory-budget",
+        "activation-checkpoint:none",
+    }
+    trailing_subcommands = [
+        token for token in option_tokens if token in activation_checkpoint_subcommands
+    ]
+    if trailing_subcommands:
+        option_tokens = [
+            token
+            for token in option_tokens
+            if token not in activation_checkpoint_subcommands
+        ]
+        options = shlex.join(option_tokens)
     base_cmd = build_base_command(module, config, options, job_dump_folder)
     cmd = f"{base_cmd} {FIXED_OPTIONS} --training.steps={steps}"
     cmd += f" --metrics.save_tb_folder={tb_folder}"
@@ -343,6 +361,8 @@ def build_training_command(
             " --checkpoint.enable --checkpoint.export_dtype=bfloat16"
             " --checkpoint.load_only"
         )
+    if trailing_subcommands:
+        cmd += " " + " ".join(trailing_subcommands)
     return cmd
 
 

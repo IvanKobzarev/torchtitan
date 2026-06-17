@@ -118,6 +118,23 @@ tlp ()
 MODE="${MODE:-graph}"
 EP="${EP:-regular}"
 if [ "$EP" = "minimal" ]; then SUFFIX="_minimal_async_ep"; else SUFFIX=""; fi
+NGPU="${NGPU:-8}"
+DP_SHARD="${DP_SHARD:-8}"
+TP="${TP:-1}"
+EP_DEGREE="${EP_DEGREE:-4}"
+DATASET="${DATASET:-c4_test}"
+HF_ASSETS_PATH="${HF_ASSETS_PATH:-$HOME/torchtrain_datasets/tree/deepseek-moe-16b}"
+OVERRIDE_MODULE="${OVERRIDE_MODULE:-}"
+COMPILE_THREADS="${TORCHINDUCTOR_COMPILE_THREADS:-8}"
+
+export GT_WEIGHT_HASH="${GT_WEIGHT_HASH:-0}"
+
+if [ "${ENABLE_NCCL_TOPO_LOG:-1}" = "1" ]; then
+    export NCCL_DEBUG="${NCCL_DEBUG:-INFO}"
+    export NCCL_DEBUG_SUBSYS="${NCCL_DEBUG_SUBSYS:-INIT,GRAPH,NET}"
+    export NCCL_TOPO_DUMP_FILE="${NCCL_TOPO_DUMP_FILE:-$LOG_DIR/nccl_topo_%h_%p.xml}"
+    export NCCL_GRAPH_DUMP_FILE="${NCCL_GRAPH_DUMP_FILE:-$LOG_DIR/nccl_graph_%h_%p.xml}"
+fi
 
 # STEPS    = number of training steps (default 20).
 # PROFILE  = 1 (default) runs under `tlp` with the profiler + memory snapshot and
@@ -148,6 +165,25 @@ if [ "$INDUCTOR" = "full" ]; then INDUCTOR_FLAG="--compile.inductor_compilation 
 # fused working set into the cudagraph static pool, which OOMs at B=16.
 BATCH="${BATCH:-16}"
 
+COMMON_FLAGS="--hf_assets_path $HF_ASSETS_PATH"
+COMMON_FLAGS="$COMMON_FLAGS --parallelism.data_parallel_shard_degree=$DP_SHARD"
+COMMON_FLAGS="$COMMON_FLAGS --parallelism.tensor_parallel_degree=$TP"
+COMMON_FLAGS="$COMMON_FLAGS --parallelism.expert_parallel_degree=$EP_DEGREE"
+COMMON_FLAGS="$COMMON_FLAGS --parallelism.no-enable_sequence_parallel"
+COMMON_FLAGS="$COMMON_FLAGS --training.steps $STEPS"
+COMMON_FLAGS="$COMMON_FLAGS --training.local_batch_size $BATCH"
+COMMON_FLAGS="$COMMON_FLAGS --dataloader.dataset $DATASET"
+COMMON_FLAGS="$COMMON_FLAGS --metrics.enable_tensorboard"
+if [ -n "$OVERRIDE_MODULE" ]; then
+    COMMON_FLAGS="$COMMON_FLAGS --override.imports $OVERRIDE_MODULE"
+fi
+
+echo "Run config: mode=$MODE ep_backend=$EP dp_shard=$DP_SHARD tp=$TP ep_degree=$EP_DEGREE ngpu=$NGPU batch=$BATCH steps=$STEPS profile=$PROFILE"
+echo "HF assets: $HF_ASSETS_PATH"
+echo "Override imports: ${OVERRIDE_MODULE:-<none>}"
+echo "GT_WEIGHT_HASH=$GT_WEIGHT_HASH"
+echo "NCCL topo logging: ${ENABLE_NCCL_TOPO_LOG:-1}"
+
 if [ "$PROFILE" = "1" ]; then
     RUNNER=tlp
     PROFILE_FLAGS="--profiler.enable_profiling --profiler.profile_freq 10 --profiler.enable_memory_snapshot --dump_folder $PROFILE_DIR"
@@ -161,16 +197,11 @@ if [ "$MODE" = "eager" ]; then
 # Eager Trainer reference. No aot_fx_trace graph -> no graph-pass tlparse diffs
 # (tlparse covers only the loss torch.compile); the profiler trace and CUDA
 # memory snapshot are the meaningful artifacts.
-NGPU=8 MODULE=deepseek_v3 CONFIG=deepseek_v3_16b${SUFFIX} TORCHINDUCTOR_COMPILE_THREADS=8 $RUNNER ./run_train.sh \
-    --parallelism.data_parallel_shard_degree=8 \
-    --parallelism.tensor_parallel_degree=1 \
-    --parallelism.expert_parallel_degree=4 \
-    --training.steps $STEPS \
-    --training.local_batch_size $BATCH \
-    --dataloader.dataset c4_test \
-    --activation_checkpoint.mode full \
+NGPU=$NGPU MODULE=deepseek_v3 CONFIG=deepseek_v3_16b${SUFFIX} TORCHINDUCTOR_COMPILE_THREADS=$COMPILE_THREADS $RUNNER ./run_train.sh \
+    $COMMON_FLAGS \
     $PROFILE_FLAGS \
-    --debug.print-config
+    --debug.print-config \
+    activation-checkpoint:full
 else
 # --- DeepSeek-v3 16B graph_trainer (lm_head chunked-loss fix, PR #3636) ---
 # CUDAGRAPH = auto (default: ON for EP=minimal which is cudagraphable, OFF for
@@ -184,14 +215,9 @@ case "$CUDAGRAPH" in
     off)  CUDAGRAPH_FLAG="--compile.disable_passes cudagraph_pass" ;;
     auto) if [ "$EP" = "minimal" ]; then CUDAGRAPH_FLAG=""; else CUDAGRAPH_FLAG="--compile.disable_passes cudagraph_pass"; fi ;;
 esac
-NGPU=8 MODULE=graph_trainer.deepseek_v3 CONFIG=graph_trainer_deepseek_v3_16b${SUFFIX} TORCHINDUCTOR_COMPILE_THREADS=8 $RUNNER ./run_train.sh \
+NGPU=$NGPU MODULE=graph_trainer.deepseek_v3 CONFIG=graph_trainer_deepseek_v3_16b${SUFFIX} TORCHINDUCTOR_COMPILE_THREADS=$COMPILE_THREADS $RUNNER ./run_train.sh \
     --compile.mode aot_fx_trace \
-    --parallelism.data_parallel_shard_degree=8 \
-    --parallelism.tensor_parallel_degree=1 \
-    --parallelism.expert_parallel_degree=4 \
-    --training.steps $STEPS \
-    --training.local_batch_size $BATCH \
-    --dataloader.dataset c4_test \
+    $COMMON_FLAGS \
     --compile.debug_graph_passes \
     $CUDAGRAPH_FLAG \
     $INDUCTOR_FLAG \
