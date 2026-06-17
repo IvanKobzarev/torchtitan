@@ -26,7 +26,8 @@ from typing import Any, cast
 import torch
 import torch.distributed as dist
 
-from torchtitan.config import ConfigManager, TORCH_DTYPE_MAP
+from torchtitan.components.loss import ChunkedCELoss
+from torchtitan.config import apply_overrides, ConfigManager, TORCH_DTYPE_MAP
 from torchtitan.distributed import ParallelDims
 from torchtitan.experiments.graph_trainer.common_utils import (
     maybe_register_blockmask_pytree_node,
@@ -114,6 +115,8 @@ def _common_setup(config):
     # and training share a single implementation of build/parallelize/init.
     model_config = model_spec.model
     model_config.update_from_config(config=config)
+    if config.override.imports:
+        apply_overrides(config.override, config)
 
     logger.info(f"Building {model_spec.name} {model_spec.flavor} on meta device")
     with (
@@ -183,6 +186,11 @@ def _precompile_aot_fx_trace(
     from torchtitan.experiments.graph_trainer.trainer import make_fwd_bwd_step
 
     loss_fn = config.loss.build(compile_config=compile_config)
+    if isinstance(loss_fn, ChunkedCELoss):
+        lm_head = model.lm_head
+        assert lm_head is not None, "Model must have lm_head for ChunkedCELoss"
+        loss_fn.set_lm_head(lm_head)
+        model._skip_lm_head = True
 
     fwd_bwd_fn = make_fwd_bwd_step(model, loss_fn)
 
