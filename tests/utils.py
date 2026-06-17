@@ -29,15 +29,18 @@ def _hash_model_impl(
 
     def hash_named_tensor(name: str, obj) -> None:
         if isinstance(obj, torch.Tensor):
+            name = name.replace("._checkpoint_wrapped_module", "")
             if isinstance(obj, DTensor):
-                t = obj.to_local().cpu().contiguous()
+                t = obj.to_local().detach().cpu().contiguous()
             else:
-                t = obj.cpu().contiguous()
+                t = obj.detach().cpu().contiguous()
 
             # NOTE: data.numpy().tobytes() is the fastest way to convert a
             # tensor to a bytestream. See benchmark results at
             # https://github.com/pytorch/pytorch/issues/108565#issuecomment-3067330004
-            raw_bytes = t.numpy().tobytes()
+            # Hash a uint8 view of the underlying tensor bytes so dtypes without
+            # NumPy support, notably bfloat16, are handled the same way.
+            raw_bytes = t.reshape(-1).view(torch.uint8).numpy().tobytes()
             if per_tensor:
                 tensor_hash = hashlib.new(algo)
                 tensor_hash.update(raw_bytes)

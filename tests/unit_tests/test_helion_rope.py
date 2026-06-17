@@ -12,9 +12,14 @@ from torchtitan.config import apply_overrides, Configurable, OverrideConfig
 from torchtitan.config.override import _REGISTRY
 from torchtitan.models.common.rope import ComplexRoPE, CosSinRoPE
 
-# Importing the override module registers the "helion_rope" override and is safe
+# Importing the override module registers the Helion RoPE overrides and is safe
 # even when helion is not installed (the kernel import is optional).
-from torchtitan.overrides.helion_rope import helion_rope, HelionRoPE
+from torchtitan.overrides.helion_rope import (
+    helion_complex_rope,
+    helion_rope,
+    HelionComplexRoPE,
+    HelionRoPE,
+)
 
 try:
     import helion  # noqa: F401
@@ -26,10 +31,13 @@ except ImportError:
 _HAS_CUDA = torch.cuda.is_available()
 _HELION_GPU = _HAS_HELION and _HAS_CUDA
 
-# The override registers at import time. Capture it now so the registry-dependent
+# The overrides register at import time. Capture them now so registry-dependent
 # tests below stay robust if a sibling test (e.g. test_override.py) calls
 # clear_overrides() first; setUp restores it.
-_HELION_OVERRIDE = _REGISTRY.get("helion_rope")
+_HELION_OVERRIDES = {
+    "helion_rope": _REGISTRY.get("helion_rope"),
+    "helion_complex_rope": _REGISTRY.get("helion_complex_rope"),
+}
 
 
 class _RoPEHolder(Configurable):
@@ -75,14 +83,22 @@ class TestHelionRoPEOverride(unittest.TestCase):
     """Registration, factory, and PyTorch-fallback parity (no GPU/helion needed)."""
 
     def setUp(self):
-        # Restore the override if a previously run test cleared the registry.
-        if _HELION_OVERRIDE is not None:
-            _REGISTRY.setdefault("helion_rope", _HELION_OVERRIDE)
+        # Restore the overrides if a previously run test cleared the registry.
+        for name, ov in _HELION_OVERRIDES.items():
+            if ov is not None:
+                _REGISTRY.setdefault(name, ov)
 
     def test_registered_against_cossin(self):
         self.assertIn("helion_rope", _REGISTRY)
         self.assertIs(_REGISTRY["helion_rope"].target_cls, CosSinRoPE.Config)
         self.assertTrue(_REGISTRY["helion_rope"].exact)
+
+    def test_registered_against_complex(self):
+        self.assertIn("helion_complex_rope", _REGISTRY)
+        self.assertIs(
+            _REGISTRY["helion_complex_rope"].target_cls, ComplexRoPE.Config
+        )
+        self.assertTrue(_REGISTRY["helion_complex_rope"].exact)
 
     def test_factory_preserves_fields(self):
         cfg = CosSinRoPE.Config(dim=64, max_seq_len=128, theta=5000.0, scaling="yarn")
@@ -93,15 +109,32 @@ class TestHelionRoPEOverride(unittest.TestCase):
         self.assertEqual(replacement.theta, 5000.0)
         self.assertEqual(replacement.scaling, "yarn")
 
-    def test_override_claims_only_cossin(self):
+    def test_complex_factory_preserves_fields(self):
+        cfg = ComplexRoPE.Config(
+            dim=64,
+            max_seq_len=128,
+            theta=5000.0,
+            scaling="yarn",
+            rope_factor=2.0,
+        )
+        replacement = helion_complex_rope(cfg)
+        self.assertIsInstance(replacement, HelionComplexRoPE.Config)
+        self.assertEqual(replacement.dim, 64)
+        self.assertEqual(replacement.max_seq_len, 128)
+        self.assertEqual(replacement.theta, 5000.0)
+        self.assertEqual(replacement.scaling, "yarn")
+        self.assertEqual(replacement.rope_factor, 2.0)
+
+    def test_override_claims_cossin_and_complex(self):
         root = _RoPEHolder.Config()
         replacements = apply_overrides(
             OverrideConfig(imports=["torchtitan.overrides.helion_rope"]), root
         )
-        self.assertEqual(len(replacements), 1)
-        # cos/sin node is swapped; complex node (Llama 3 / DeepSeek) is untouched.
+        self.assertEqual(len(replacements), 2)
+        # cos/sin node is swapped to the fused implementation; complex node is
+        # swapped to the explicit fallback so DSv3 imports are not silent no-ops.
         self.assertIsInstance(root.cos_rope, HelionRoPE.Config)
-        self.assertIs(type(root.complex_rope), ComplexRoPE.Config)
+        self.assertIsInstance(root.complex_rope, HelionComplexRoPE.Config)
 
     def test_override_does_not_claim_cossin_subclass(self):
         root = _SubclassRoPEHolder.Config()
@@ -125,6 +158,23 @@ class TestHelionRoPEOverride(unittest.TestCase):
         positions = torch.arange(seqlen).unsqueeze(0).expand(2, -1)
 
         ref_q, ref_k = cossin(xq, xk, positions)
+        out_q, out_k = helion_module(xq, xk, positions)
+        torch.testing.assert_close(out_q, ref_q, rtol=0, atol=0)
+        torch.testing.assert_close(out_k, ref_k, rtol=0, atol=0)
+
+    def test_complex_cpu_falls_back_to_complex(self):
+        """Complex override preserves ComplexRoPE numerics bit-for-bit."""
+        torch.manual_seed(0)
+        dim, seqlen = 64, 16
+        complex_rope = ComplexRoPE.Config(dim=dim, max_seq_len=seqlen).build()
+        helion_module = HelionComplexRoPE.Config(dim=dim, max_seq_len=seqlen).build()
+        self.assertIsInstance(helion_module, HelionComplexRoPE)
+
+        xq = torch.randn(2, seqlen, 4, dim, dtype=torch.bfloat16)
+        xk = torch.randn(2, seqlen, 1, dim, dtype=torch.bfloat16)
+        positions = torch.arange(seqlen).unsqueeze(0).expand(2, -1)
+
+        ref_q, ref_k = complex_rope(xq, xk, positions)
         out_q, out_k = helion_module(xq, xk, positions)
         torch.testing.assert_close(out_q, ref_q, rtol=0, atol=0)
         torch.testing.assert_close(out_k, ref_k, rtol=0, atol=0)

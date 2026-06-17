@@ -5,19 +5,25 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-Override: cos/sin rotary embeddings applied with a fused Helion kernel.
+Override: rotary embeddings with Helion-backed cos/sin support.
 
 This swaps :class:`CosSinRoPE` for a version that fuses the cos/sin gather and
 the rotate-half rotation into a single Helion kernel (forward and backward),
-without touching core.
+without touching core. It also claims :class:`ComplexRoPE` configs with an
+explicit fallback module so override imports used with models such as DeepSeek
+V3 are visible in logs instead of silently producing no replacements.
 
     torchtitan_train ... --override.imports torchtitan.overrides.helion_rope
 
 Scope and fallbacks (the kernel is opt-in and never changes default behavior):
 
-* **Plain cos/sin only.** Targets exactly ``CosSinRoPE.Config``; the complex
-  RoPE used by Llama 3 / DeepSeek V3 and subclasses with different cache
-  contracts (e.g. Qwen3.5 ``MRoPE``) are untouched.
+* **Plain cos/sin fused kernel.** The fused kernel targets exactly
+  ``CosSinRoPE.Config``. Subclasses with different cache contracts (e.g. Qwen3.5
+  ``MRoPE``) are untouched.
+* **Complex RoPE explicit fallback.** ``ComplexRoPE.Config`` is replaced with a
+  module that preserves the stock PyTorch complex-adjacent-pair math and warns
+  once. This avoids silently ignoring the override on DeepSeek V3 while keeping
+  numerics unchanged until a dedicated complex Helion kernel exists.
 * ``helion`` is an optional dependency. If it is not installed, or
   the inputs are unsupported (any tensor on CPU or split across devices, a cache
   that isn't a 2D ``(max_seq, 2 * head_dim)`` table, non-integer or oddly shaped
@@ -41,7 +47,7 @@ import torch
 from torch.distributed.tensor import DTensor
 
 from torchtitan.config import derive, override
-from torchtitan.models.common.rope import _maybe_check_max_pos, CosSinRoPE
+from torchtitan.models.common.rope import _maybe_check_max_pos, ComplexRoPE, CosSinRoPE
 from torchtitan.tools.logging import logger, warn_once
 
 if TYPE_CHECKING:
@@ -61,7 +67,7 @@ else:
     except ImportError:
         _HAS_HELION = False
 
-__all__ = ["HelionRoPE"]
+__all__ = ["HelionComplexRoPE", "HelionRoPE"]
 
 
 if _HAS_HELION:
@@ -486,3 +492,35 @@ class HelionRoPE(CosSinRoPE):
 )
 def helion_rope(cfg: CosSinRoPE.Config) -> HelionRoPE.Config:
     return derive(cfg, HelionRoPE.Config)
+
+
+class HelionComplexRoPE(ComplexRoPE):
+    """Complex RoPE override that keeps stock math until a fused kernel exists."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(ComplexRoPE.Config):
+        pass
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        positions: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        warn_once(
+            logger,
+            "HelionComplexRoPE override is active, but a fused Helion kernel for "
+            "complex RoPE is not implemented; falling back to the PyTorch "
+            "ComplexRoPE path.",
+        )
+        return super().forward(query, key, positions)
+
+
+@override(
+    "helion_complex_rope",
+    target=ComplexRoPE.Config,
+    exact=True,
+    description="Explicit Helion override fallback for complex rotary embedding.",
+)
+def helion_complex_rope(cfg: ComplexRoPE.Config) -> HelionComplexRoPE.Config:
+    return derive(cfg, HelionComplexRoPE.Config)
