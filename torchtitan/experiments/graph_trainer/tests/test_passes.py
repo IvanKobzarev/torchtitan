@@ -6,6 +6,7 @@
 
 import operator
 import sys
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -35,6 +36,8 @@ from torchtitan.experiments.graph_trainer.ep_process_group_pass import (
 from torchtitan.experiments.graph_trainer.fsdp_passes import overlap_fsdp_ag_rs_pass
 from torchtitan.experiments.graph_trainer.graph_utils import export_joint
 from torchtitan.experiments.graph_trainer.inductor_passes import (
+    _FullInductorFuseRegionOrderPass,
+    _FullInductorFuseRegionPass,
     annotate_flex_attention_for_regional_inductor_pass,
 )
 from torchtitan.experiments.graph_trainer.make_fx_tracer import minimal_fx_tracer
@@ -154,6 +157,94 @@ class TestAnnotateFlexAttentionForRegionalInductorPass(TestCase):
                     "compile_with_inductor",
                     inp.meta.get("custom", {}),
                 )
+
+
+class TestFullInductorFuseRegionPass(TestCase):
+    def test_txt_unemb_regions_get_unique_chunk_prefixed_names(self):
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        block0 = graph.call_function(torch.ops.aten.sin.default, args=(x,))
+        block1 = graph.call_function(torch.ops.aten.cos.default, args=(block0,))
+        txt0 = graph.call_function(torch.ops.aten.neg.default, args=(block1,))
+        txt1 = graph.call_function(torch.ops.aten.relu.default, args=(txt0,))
+        gap = graph.call_function(torch.ops.aten.tanh.default, args=(txt1,))
+        txt2 = graph.call_function(torch.ops.aten.sigmoid.default, args=(gap,))
+        txt3 = graph.call_function(torch.ops.aten.exp.default, args=(txt2,))
+        graph.output(txt3)
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+        block0.meta["custom"] = {_MODULE_FQN: "blocks.0"}
+        block1.meta["custom"] = {_MODULE_FQN: "blocks.0"}
+        for node in (txt0, txt1, txt2, txt3):
+            node.meta["custom"] = {"full_inductor_fuse_region": "txt_unemb_chunk_0"}
+
+        marked = []
+
+        def capture_mark_fuse_region(graph, nodes, *, fuse_region_id=None):
+            marked.append((tuple(nodes), fuse_region_id))
+
+        with (
+            patch.object(
+                _FullInductorFuseRegionPass, "_is_outer_flex_graph", return_value=True
+            ),
+            patch(
+                "torch._inductor.fx_passes.control_dependencies.mark_fuse_region",
+                side_effect=capture_mark_fuse_region,
+            ),
+        ):
+            _FullInductorFuseRegionPass("blocks_contiguous")(gm.graph)
+
+        self.assertEqual(len(marked), 3)
+        self.assertIsNone(marked[0][1])
+        txt_region_ids = [region_id for _, region_id in marked[1:]]
+        self.assertEqual(len(set(txt_region_ids)), 2)
+        for region_id in txt_region_ids:
+            self.assertRegex(region_id, r"^txt_unemb_chunk_0_island_\d+$")
+
+    def test_order_pass_groups_unique_chunk_prefixed_regions(self):
+        from torch._inductor.fx_passes.control_dependencies import FUSE_REGION
+
+        class FakeSchedulerNode:
+            def __init__(self, name, buffers, reads=(), region=None):
+                self._name = name
+                self._buffers = buffers
+                self.read_writes = SimpleNamespace(
+                    reads=[SimpleNamespace(name=read) for read in reads]
+                )
+                annotations = {} if region is None else {FUSE_REGION: region}
+                self.node = SimpleNamespace(annotations=annotations)
+                self.added_deps = []
+
+            def get_nodes(self):
+                return [self]
+
+            def get_buffer_names(self):
+                return self._buffers
+
+            def get_name(self):
+                return self._name
+
+            def add_fake_dep(self, dep):
+                self.added_deps.append(dep)
+
+        chunk0 = FakeSchedulerNode(
+            "chunk0",
+            ["chunk0_buf"],
+            region="txt_unemb_chunk_0_island_1",
+        )
+        drain0 = FakeSchedulerNode("drain0", ["drain0_buf"], reads=["chunk0_buf"])
+        chunk1 = FakeSchedulerNode(
+            "chunk1",
+            ["chunk1_buf"],
+            region="txt_unemb_chunk_1_island_2",
+        )
+
+        _FullInductorFuseRegionOrderPass()([chunk0, drain0, chunk1])
+
+        self.assertEqual(len(chunk1.added_deps), 1)
+        self.assertEqual(chunk1.added_deps[0].name, "drain0_buf")
+        self.assertEqual(chunk1.added_deps[0].mutating_buf, "chunk1_buf")
+        self.assertTrue(chunk1.added_deps[0].is_fake)
 
 
 class TestOverlapFsdpAgRsPass(FSDPTest):
