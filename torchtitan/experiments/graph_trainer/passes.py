@@ -187,6 +187,12 @@ def compile_time_passes(
                     compile_config, "ac_min_cut_memory_estimator", "approximate"
                 ),
                 save_scope=getattr(compile_config, "ac_min_cut_save_scope", "min_cut"),
+                min_broad_candidate_gb=getattr(
+                    compile_config, "ac_min_cut_min_broad_candidate_gb", None
+                ),
+                max_broad_candidate_gb=getattr(
+                    compile_config, "ac_min_cut_max_broad_candidate_gb", None
+                ),
                 relax_relaxable_must_saves=getattr(
                     compile_config, "ac_relax_relaxable_must_saves", False
                 ),

@@ -66,10 +66,18 @@ def _normalize_soft_tags_for_remat(gm: fx.GraphModule) -> None:
             node.meta["recompute"] = CheckpointPolicy.PREFER_RECOMPUTE
 
 
+def _is_recomputed_node(node: fx.Node) -> bool:
+    return (
+        node.meta.get("ac_recomputed") is True
+        or node.name.endswith("_recomputed")
+        or "_recomputed_r" in node.name
+    )
+
+
 def _refresh_fake_tensor_meta(gm: fx.GraphModule) -> None:
     """Repropagate recomputed-node metadata after remat node_copy.
 
-    ``fx.Graph.node_copy`` shallow-copies ``node.meta``, so each ``*_recomputed``
+    ``fx.Graph.node_copy`` shallow-copies ``node.meta``, so each recomputed
     duplicate starts with the original forward node's ``meta["val"]``. That is
     wrong for memory profiling: compute duplicates need fresh storage, while view
     duplicates should alias their recomputed parent. Re-running each duplicate op
@@ -94,7 +102,7 @@ def _refresh_fake_tensor_meta(gm: fx.GraphModule) -> None:
         return redone[n] if n in redone else n.meta.get("val")
 
     for node in gm.graph.nodes:
-        if not node.name.endswith("_recomputed") or "val" not in node.meta:
+        if not _is_recomputed_node(node) or "val" not in node.meta:
             continue
         args = map_arg(node.args, _in_val)
         kwargs = map_arg(node.kwargs, _in_val)
@@ -144,7 +152,7 @@ def _memory_profile_after_remat(
     recompute_cost = sum(
         runtime_estimator(n)
         for n in remat.graph.nodes
-        if n.op == "call_function" and n.name.endswith("_recomputed")
+        if n.op == "call_function" and _is_recomputed_node(n)
     )
     _restore_recompute_tags(gm, saved)
     return peak, recompute_cost
@@ -184,6 +192,21 @@ def _nodes_with_fresh_cuda_storage(gm: fx.GraphModule) -> set[fx.Node]:
         ):
             fresh_nodes.add(node)
     return fresh_nodes
+
+
+def _cuda_output_storage_nbytes_by_node(gm: fx.GraphModule) -> dict[fx.Node, int]:
+    """Return non-empty CUDA output storage bytes per node, including aliases."""
+    alias = GraphAliasTracker(list(gm.graph.nodes))
+    storage_bytes: dict[fx.Node, int] = {}
+    for node in gm.graph.nodes:
+        nbytes = sum(
+            _storage_nbytes(storage_key)
+            for storage_key in alias.node_to_output_storages[node]
+            if storage_key.device.type != "cpu" and _storage_nbytes(storage_key) > 0
+        )
+        if nbytes > 0:
+            storage_bytes[node] = nbytes
+    return storage_bytes
 
 
 def _is_executable_node(node: fx.Node) -> bool:
@@ -484,7 +507,7 @@ def _candidate_memory_curve_delta(
     saved_bytes = 0
     curve_len = len(memory_curve.curve)
 
-    for storage_key in memory_curve.alias.get_fresh_allocations(node):
+    for storage_key in memory_curve.alias.node_to_output_storages[node]:
         if storage_key.device.type == "cpu":
             continue
         amount = _storage_nbytes(storage_key)

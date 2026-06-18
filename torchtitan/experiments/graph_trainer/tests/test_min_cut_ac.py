@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import operator
 from unittest.mock import patch
 
 import torch
@@ -34,8 +35,10 @@ from torchtitan.experiments.graph_trainer.memory_utils import (
     remat_using_tags_for_fwd_loss_bwd_graph,
 )
 from torchtitan.experiments.graph_trainer.min_cut_ac import (
+    _budgeted_save_candidate_phases,
     _BudgetedSaveSelectionResult,
     _candidate_peak_fits_or_makes_progress,
+    _decompose_log_softmax_for_min_cut,
     _GB,
     _min_cut,
     _optimize_under_peak_budget,
@@ -44,6 +47,7 @@ from torchtitan.experiments.graph_trainer.min_cut_ac import (
     _set_mandatory_must_saves,
     _should_rank_by_peak_progress,
     ac_allow_allowed_saves,
+    ac_allow_unsaveable_recomputes,
     ac_relax_relaxable_must_saves,
     min_cut_ac_pass,
 )
@@ -443,6 +447,99 @@ class TestMinCutACPeakModel(TestCase):
         self.assertIn(candidate, cut)
         self.assertNotIn(view_node, cut)
 
+    def test_multi_output_getitem_can_be_min_cut(self):
+        graph = fx.Graph()
+        x = graph.placeholder("x")
+        saved = graph.call_function(torch.ops.aten.sin.default, args=(x,))
+        norm = graph.call_function(
+            torch.ops.aten.native_layer_norm.default,
+            args=(saved, [4], None, None, 1e-5),
+        )
+        out = graph.call_function(operator.getitem, args=(norm, 0))
+        loss = graph.call_function(torch.ops.aten.sum.default, args=(out,))
+        bwd = graph.call_function(torch.ops.aten.neg.default, args=(out,))
+        graph.output((loss, bwd))
+        gm = fx.GraphModule(torch.nn.Module(), graph)
+
+        with FakeTensorMode() as fake_mode:
+            fake_x = torch.empty(8, 4, device="cuda")
+            FakeTensorProp(gm, mode=fake_mode).propagate_dont_convert_inputs(fake_x)
+
+        saved.meta["recompute"] = CheckpointPolicy.MUST_SAVE
+        norm.meta["recompute"] = CheckpointPolicy.PREFER_RECOMPUTE
+        out.meta["recompute"] = CheckpointPolicy.PREFER_RECOMPUTE
+        bwd.meta["autograd_backward"] = True
+
+        self.assertNotIn(out, _nodes_with_fresh_cuda_storage(gm))
+        self.assertNotIn(norm, _save_candidates(gm))
+        self.assertIn(out, _save_candidates(gm))
+        self.assertEqual(_min_cut(gm), {out})
+
+    def test_detached_multi_output_getitem_can_be_min_cut(self):
+        graph = fx.Graph()
+        x = graph.placeholder("x")
+        saved = graph.call_function(torch.ops.aten.sin.default, args=(x,))
+        norm = graph.call_function(
+            torch.ops.aten.native_layer_norm.default,
+            args=(saved, [4], None, None, 1e-5),
+        )
+        stat = graph.call_function(operator.getitem, args=(norm, 1))
+        detached = graph.call_function(torch.ops.aten.detach.default, args=(stat,))
+        loss = graph.call_function(torch.ops.aten.sum.default, args=(detached,))
+        bwd = graph.call_function(torch.ops.aten.neg.default, args=(detached,))
+        graph.output((loss, bwd))
+        gm = fx.GraphModule(torch.nn.Module(), graph)
+
+        with FakeTensorMode() as fake_mode:
+            fake_x = torch.empty(8, 4, device="cuda")
+            FakeTensorProp(gm, mode=fake_mode).propagate_dont_convert_inputs(fake_x)
+
+        saved.meta["recompute"] = CheckpointPolicy.MUST_SAVE
+        norm.meta["recompute"] = CheckpointPolicy.PREFER_RECOMPUTE
+        stat.meta["recompute"] = CheckpointPolicy.PREFER_RECOMPUTE
+        detached.meta["recompute"] = CheckpointPolicy.PREFER_RECOMPUTE
+        bwd.meta["autograd_backward"] = True
+
+        self.assertNotIn(detached, _nodes_with_fresh_cuda_storage(gm))
+        self.assertIn(detached, _save_candidates(gm))
+        self.assertEqual(_min_cut(gm), {detached})
+
+    def test_pre_decomp_log_softmax_is_not_a_save_candidate(self):
+        graph = fx.Graph()
+        x = graph.placeholder("x")
+        logits = graph.call_function(torch.ops.aten.sin.default, args=(x,))
+        log_softmax = graph.call_function(
+            torch.ops.aten._log_softmax.default, args=(logits, -1, False)
+        )
+        loss = graph.call_function(torch.ops.aten.sum.default, args=(log_softmax,))
+        bwd = graph.call_function(torch.ops.aten.neg.default, args=(log_softmax,))
+        graph.output((loss, bwd))
+        gm = fx.GraphModule(torch.nn.Module(), graph)
+
+        with FakeTensorMode() as fake_mode:
+            fake_x = torch.empty(16, 128, device="cuda")
+            FakeTensorProp(gm, mode=fake_mode).propagate_dont_convert_inputs(fake_x)
+
+        logits.meta["recompute"] = CheckpointPolicy.PREFER_RECOMPUTE
+        log_softmax.meta["recompute"] = CheckpointPolicy.PREFER_RECOMPUTE
+        bwd.meta["autograd_backward"] = True
+
+        self.assertIn(logits, _save_candidates(gm))
+        self.assertNotIn(log_softmax, _save_candidates(gm))
+
+        min_cut_ac_pass(
+            gm,
+            (fake_x,),
+            max_peak_increase_gb=1.0,
+            save_scope="all",
+            memory_estimator="exact",
+            runtime_estimator=lambda n: 100.0 if n is log_softmax else 1.0,
+        )
+
+        self.assertEqual(
+            log_softmax.meta["recompute"], CheckpointPolicy.PREFER_RECOMPUTE
+        )
+
     def test_memory_curve_does_not_allocate_for_view(self):
         gm, _ = self._make_remat_graph_with_view()
         view_node = self._find(gm, torch.ops.aten.t.default, recomputed=False)
@@ -598,7 +695,7 @@ class TestMinCutACPeakModel(TestCase):
         self.assertNotIn(d, candidates)
         self.assertNotIn(c, candidates)
 
-    def test_allow_allowed_saves_marks_soft_pool_without_storage_filter(self):
+    def test_allow_allowed_saves_marks_finite_candidate_pool(self):
         graph = fx.Graph()
         x = graph.placeholder("x")
         a = graph.call_function(torch.ops.aten.sin.default, args=(x,))
@@ -621,7 +718,7 @@ class TestMinCutACPeakModel(TestCase):
         ac_allow_allowed_saves(gm)
 
         self.assertEqual(a.meta["recompute"], CheckpointPolicy.PREFER_SAVE)
-        self.assertEqual(view.meta["recompute"], CheckpointPolicy.PREFER_SAVE)
+        self.assertNotIn("recompute", view.meta)
         self.assertNotIn("recompute", collective.meta)
         self.assertNotIn("recompute", rng.meta)
         self.assertEqual(hard.meta["recompute"], CheckpointPolicy.MUST_RECOMPUTE)
@@ -746,6 +843,26 @@ class TestMinCutACPeakModel(TestCase):
         )
         self.assertLessEqual(final_peak, baseline_peak)
         self.assertLessEqual(final_cost, baseline_cost)
+
+    def test_budgeted_all_scope_can_filter_broad_candidates_by_size(self):
+        gm, _ = self._make_save_candidate_contract_graph()
+        sin_node = self._find(gm, torch.ops.aten.sin.default, recomputed=False)
+        clone_node = self._find(gm, torch.ops.aten.clone.default, recomputed=False)
+        cos_node = self._find(gm, torch.ops.aten.cos.default, recomputed=False)
+        sum_dim_node = self._find(gm, torch.ops.aten.sum.dim_IntList, recomputed=False)
+
+        plan = _budgeted_save_candidate_phases(
+            gm,
+            "all",
+            set(),
+            min_broad_candidate_bytes=1_000_000,
+            max_broad_candidate_bytes=1_100_000,
+        )
+
+        self.assertIn(sin_node, plan.broad)
+        self.assertIn(clone_node, plan.broad)
+        self.assertIn(cos_node, plan.broad)
+        self.assertNotIn(sum_dim_node, plan.broad)
 
     def test_budgeted_min_cut_profiles_candidate_peak(self):
         gm, example_inputs = self._make_interior_cutpoint_graph()
@@ -1132,7 +1249,7 @@ class TestMinCutACPeakModel(TestCase):
 
         self.assertEqual(rng_node.meta["recompute"], CheckpointPolicy.MUST_SAVE)
 
-    def test_budgeted_missed_target_keeps_collective_constraints(self):
+    def test_budgeted_missed_target_can_save_after_collective(self):
         gm, example_inputs, _ = self._make_collective_closure_graph()
         wait_node = self._find(gm, fake_c10d_functional_wait, recomputed=False)
         sin_node = self._find(gm, torch.ops.aten.sin.default, recomputed=False)
@@ -1155,7 +1272,7 @@ class TestMinCutACPeakModel(TestCase):
                 )
 
         self.assertEqual(wait_node.meta["recompute"], CheckpointPolicy.PREFER_RECOMPUTE)
-        self.assertEqual(sin_node.meta["recompute"], CheckpointPolicy.PREFER_RECOMPUTE)
+        self.assertEqual(sin_node.meta["recompute"], CheckpointPolicy.MUST_SAVE)
 
     def test_approx_budgeted_selection_exact_checks_candidate_peak(self):
         gm, example_inputs = self._make_save_candidate_graph()
@@ -1495,7 +1612,7 @@ class TestMinCutACPeakModel(TestCase):
         self.assertGreaterEqual(len(trials), 2)
         self.assertEqual(trials[:2], ["min_cut", "broad"])
 
-    def test_all_scope_skips_broad_only_saves_for_zero_budget(self):
+    def test_all_scope_considers_broad_only_saves_for_zero_budget(self):
         gm, example_inputs, _, c_node = self._make_all_scope_graph()
 
         with (
@@ -1504,7 +1621,8 @@ class TestMinCutACPeakModel(TestCase):
                 return_value=set(),
             ),
             patch(
-                "torchtitan.experiments.graph_trainer.min_cut_ac._peak_after_remat"
+                "torchtitan.experiments.graph_trainer.min_cut_ac._peak_after_remat",
+                return_value=0,
             ) as peak_after_remat,
         ):
             min_cut_ac_pass(
@@ -1516,10 +1634,10 @@ class TestMinCutACPeakModel(TestCase):
                 runtime_estimator=lambda n: 1.0,
             )
 
-        peak_after_remat.assert_not_called()
-        self.assertEqual(c_node.meta["recompute"], CheckpointPolicy.PREFER_RECOMPUTE)
+        peak_after_remat.assert_called()
+        self.assertEqual(c_node.meta["recompute"], CheckpointPolicy.MUST_SAVE)
 
-    def test_all_scope_skips_broad_only_saves_for_negative_budget(self):
+    def test_all_scope_considers_broad_only_saves_for_negative_budget(self):
         gm, example_inputs, _, c_node = self._make_all_scope_graph()
 
         with (
@@ -1528,7 +1646,8 @@ class TestMinCutACPeakModel(TestCase):
                 return_value=set(),
             ),
             patch(
-                "torchtitan.experiments.graph_trainer.min_cut_ac._peak_after_remat"
+                "torchtitan.experiments.graph_trainer.min_cut_ac._peak_after_remat",
+                return_value=0,
             ) as peak_after_remat,
         ):
             min_cut_ac_pass(
@@ -1540,8 +1659,8 @@ class TestMinCutACPeakModel(TestCase):
                 runtime_estimator=lambda n: 1.0,
             )
 
-        peak_after_remat.assert_not_called()
-        self.assertEqual(c_node.meta["recompute"], CheckpointPolicy.PREFER_RECOMPUTE)
+        peak_after_remat.assert_called()
+        self.assertEqual(c_node.meta["recompute"], CheckpointPolicy.MUST_SAVE)
 
     def test_all_scope_allows_broad_only_saves_for_positive_budget(self):
         gm, example_inputs, _, c_node = self._make_all_scope_graph()
@@ -1568,7 +1687,7 @@ class TestMinCutACPeakModel(TestCase):
         peak_after_remat.assert_called()
         self.assertEqual(c_node.meta["recompute"], CheckpointPolicy.MUST_SAVE)
 
-    def test_all_scope_prunes_broad_candidates_on_collective_graph(self):
+    def test_all_scope_allows_saves_that_remove_collective_recompute(self):
         graph = fx.Graph()
         x = graph.placeholder("x")
         collective = graph.call_function(fake_c10d_functional_wait, args=(x,))
@@ -1599,7 +1718,274 @@ class TestMinCutACPeakModel(TestCase):
         )
 
         self.assertEqual(floor_save.meta["recompute"], CheckpointPolicy.MUST_SAVE)
-        self.assertEqual(broad.meta["recompute"], CheckpointPolicy.PREFER_RECOMPUTE)
+        self.assertEqual(
+            collective.meta["recompute"], CheckpointPolicy.PREFER_RECOMPUTE
+        )
+        self.assertEqual(broad.meta["recompute"], CheckpointPolicy.MUST_SAVE)
+
+    def test_allow_allowed_saves_marks_unsaveable_softmax_for_recompute(self):
+        graph = fx.Graph()
+        x = graph.placeholder("x")
+        logits = graph.call_function(torch.ops.aten.clone.default, args=(x,))
+        log_softmax = graph.call_function(
+            torch.ops.aten._log_softmax.default, args=(logits, 1, False)
+        )
+        detach = graph.call_function(torch.ops.aten.detach.default, args=(log_softmax,))
+        loss = graph.call_function(torch.ops.aten.sum.default, args=(log_softmax,))
+        bwd = graph.call_function(torch.ops.aten.neg.default, args=(detach,))
+        graph.output((loss, bwd))
+        gm = fx.GraphModule(torch.nn.Module(), graph)
+
+        with FakeTensorMode() as fake_mode:
+            fake_x = torch.empty(128, 256, device="cuda")
+            FakeTensorProp(gm, mode=fake_mode).propagate_dont_convert_inputs(fake_x)
+
+        bwd.meta["autograd_backward"] = True
+
+        ac_allow_allowed_saves(gm)
+
+        self.assertEqual(logits.meta["recompute"], CheckpointPolicy.MUST_SAVE)
+        self.assertEqual(
+            log_softmax.meta["recompute"], CheckpointPolicy.PREFER_RECOMPUTE
+        )
+        self.assertEqual(detach.meta["recompute"], CheckpointPolicy.PREFER_RECOMPUTE)
+        self.assertNotIn(log_softmax, _save_candidates(gm))
+        self.assertNotIn(detach, _save_candidates(gm))
+
+        gm = selective_activation_remat_pass(gm, (fake_x,))
+        self.assertTrue(
+            any(
+                node.target == torch.ops.aten._log_softmax.default
+                and node.meta.get("ac_recomputed") is True
+                for node in gm.graph.nodes
+            )
+        )
+        self.assertTrue(
+            any(
+                node.target == torch.ops.aten.detach.default
+                and node.meta.get("ac_recomputed") is True
+                for node in gm.graph.nodes
+            )
+        )
+        self.assertFalse(
+            any(
+                node.target == torch.ops.aten.clone.default
+                and node.meta.get("ac_recomputed") is True
+                for node in gm.graph.nodes
+            )
+        )
+
+    def test_allow_unsaveable_recomputes_keeps_save_pool_unchanged(self):
+        graph = fx.Graph()
+        x = graph.placeholder("x")
+        logits = graph.call_function(torch.ops.aten.clone.default, args=(x,))
+        log_softmax = graph.call_function(
+            torch.ops.aten._log_softmax.default, args=(logits, 1, False)
+        )
+        detach = graph.call_function(torch.ops.aten.detach.default, args=(log_softmax,))
+        loss = graph.call_function(torch.ops.aten.sum.default, args=(log_softmax,))
+        bwd = graph.call_function(torch.ops.aten.neg.default, args=(detach,))
+        graph.output((loss, bwd))
+        gm = fx.GraphModule(torch.nn.Module(), graph)
+
+        with FakeTensorMode() as fake_mode:
+            fake_x = torch.empty(128, 512, device="cuda")
+            FakeTensorProp(gm, mode=fake_mode).propagate_dont_convert_inputs(fake_x)
+
+        bwd.meta["autograd_backward"] = True
+        ac_allow_unsaveable_recomputes(gm)
+
+        self.assertEqual(logits.meta["recompute"], CheckpointPolicy.MUST_SAVE)
+        self.assertEqual(
+            log_softmax.meta["recompute"], CheckpointPolicy.PREFER_RECOMPUTE
+        )
+        self.assertEqual(detach.meta["recompute"], CheckpointPolicy.PREFER_RECOMPUTE)
+        self.assertNotIn(loss, _save_candidates(gm))
+        self.assertIsNone(loss.meta.get("recompute"))
+
+    def test_min_cut_decomposes_log_softmax_to_compact_stats(self):
+        graph = fx.Graph()
+        x = graph.placeholder("x")
+        logits = graph.call_function(torch.ops.aten.clone.default, args=(x,))
+        logits_fp32 = graph.call_function(
+            torch.ops.aten._to_copy.default,
+            args=(logits,),
+            kwargs={"dtype": torch.float32},
+        )
+        log_softmax = graph.call_function(
+            torch.ops.aten._log_softmax.default, args=(logits_fp32, 1, False)
+        )
+        log_softmax.meta["custom"] = {"full_inductor_fuse_region": "txt_unemb_chunk_0"}
+        detach = graph.call_function(torch.ops.aten.detach.default, args=(log_softmax,))
+        loss = graph.call_function(torch.ops.aten.sum.default, args=(log_softmax,))
+        bwd = graph.call_function(torch.ops.aten.neg.default, args=(detach,))
+        graph.output((loss, bwd))
+        gm = fx.GraphModule(torch.nn.Module(), graph)
+
+        with FakeTensorMode() as fake_mode:
+            fake_x = torch.empty(64, 512, device="cuda", dtype=torch.bfloat16)
+            FakeTensorProp(gm, mode=fake_mode).propagate_dont_convert_inputs(fake_x)
+
+        bwd.meta["autograd_backward"] = True
+        self.assertEqual(_decompose_log_softmax_for_min_cut(gm), 1)
+
+        self.assertFalse(
+            any(
+                node.target == torch.ops.aten._log_softmax.default
+                for node in gm.graph.nodes
+            )
+        )
+        amax = next(
+            node
+            for node in gm.graph.nodes
+            if node.target == torch.ops.aten.amax.default
+        )
+        log = next(
+            node for node in gm.graph.nodes if node.target == torch.ops.aten.log.default
+        )
+        result = detach.args[0]
+        self.assertIsInstance(result, fx.Node)
+        self.assertEqual(logits.meta["recompute"], CheckpointPolicy.MUST_SAVE)
+        self.assertEqual(logits_fp32.meta["recompute"], CheckpointPolicy.MUST_RECOMPUTE)
+        self.assertEqual(amax.meta["recompute"], CheckpointPolicy.MUST_SAVE)
+        self.assertEqual(log.meta["recompute"], CheckpointPolicy.MUST_SAVE)
+        self.assertEqual(result.meta["recompute"], CheckpointPolicy.MUST_RECOMPUTE)
+        self.assertEqual(detach.meta["recompute"], CheckpointPolicy.MUST_RECOMPUTE)
+        self.assertEqual(amax.meta["val"].shape, torch.Size([64, 1]))
+        self.assertEqual(log.meta["val"].shape, torch.Size([64, 1]))
+        self.assertEqual(result.meta["val"].shape, torch.Size([64, 512]))
+        self.assertEqual(
+            amax.meta["custom"]["full_inductor_fuse_region"], "txt_unemb_chunk_0"
+        )
+
+    def test_log_softmax_anchor_walks_pointwise_chain_to_matmul(self):
+        graph = fx.Graph()
+        x = graph.placeholder("x")
+        w = graph.placeholder("w")
+        scale = graph.placeholder("scale")
+        bias = graph.placeholder("bias")
+        mm = graph.call_function(torch.ops.aten.mm.default, args=(x, w))
+        scaled = graph.call_function(torch.ops.aten.mul.Tensor, args=(mm, scale))
+        logits = graph.call_function(torch.ops.aten.add.Tensor, args=(scaled, bias))
+        logits_fp32 = graph.call_function(
+            torch.ops.aten._to_copy.default,
+            args=(logits,),
+            kwargs={"dtype": torch.float32},
+        )
+        log_softmax = graph.call_function(
+            torch.ops.aten._log_softmax.default, args=(logits_fp32, 1, False)
+        )
+        detach = graph.call_function(torch.ops.aten.detach.default, args=(log_softmax,))
+        loss = graph.call_function(torch.ops.aten.sum.default, args=(log_softmax,))
+        bwd = graph.call_function(torch.ops.aten.neg.default, args=(detach,))
+        graph.output((loss, bwd))
+        gm = fx.GraphModule(torch.nn.Module(), graph)
+
+        with FakeTensorMode() as fake_mode:
+            fake_x = torch.empty(16, 64, device="cuda", dtype=torch.bfloat16)
+            fake_w = torch.empty(64, 128, device="cuda", dtype=torch.bfloat16)
+            fake_scale = torch.empty(128, device="cuda", dtype=torch.bfloat16)
+            fake_bias = torch.empty(128, device="cuda", dtype=torch.bfloat16)
+            FakeTensorProp(gm, mode=fake_mode).propagate_dont_convert_inputs(
+                fake_x, fake_w, fake_scale, fake_bias
+            )
+
+        bwd.meta["autograd_backward"] = True
+        self.assertEqual(_decompose_log_softmax_for_min_cut(gm), 1)
+
+        self.assertEqual(mm.meta["recompute"], CheckpointPolicy.MUST_SAVE)
+        self.assertEqual(scaled.meta["recompute"], CheckpointPolicy.MUST_RECOMPUTE)
+        self.assertEqual(logits.meta["recompute"], CheckpointPolicy.MUST_RECOMPUTE)
+        self.assertEqual(logits_fp32.meta["recompute"], CheckpointPolicy.MUST_RECOMPUTE)
+        amax = next(
+            node
+            for node in gm.graph.nodes
+            if node.target == torch.ops.aten.amax.default
+        )
+        log = next(
+            node for node in gm.graph.nodes if node.target == torch.ops.aten.log.default
+        )
+        self.assertEqual(amax.meta["recompute"], CheckpointPolicy.MUST_SAVE)
+        self.assertEqual(log.meta["recompute"], CheckpointPolicy.MUST_SAVE)
+
+    def test_allow_unsaveable_recomputes_marks_softmax_input_chain(self):
+        graph = fx.Graph()
+        x = graph.placeholder("x")
+        logits = graph.call_function(torch.ops.aten.clone.default, args=(x,))
+        logits_fp32 = graph.call_function(
+            torch.ops.aten._to_copy.default,
+            args=(logits,),
+            kwargs={"dtype": torch.float32},
+        )
+        logits_view = graph.call_function(
+            torch.ops.aten.view.default, args=(logits_fp32, [64, 512])
+        )
+        log_softmax = graph.call_function(
+            torch.ops.aten._log_softmax.default, args=(logits_view, 1, False)
+        )
+        detach = graph.call_function(torch.ops.aten.detach.default, args=(log_softmax,))
+        loss = graph.call_function(torch.ops.aten.sum.default, args=(log_softmax,))
+        bwd = graph.call_function(torch.ops.aten.neg.default, args=(detach,))
+        graph.output((loss, bwd))
+        gm = fx.GraphModule(torch.nn.Module(), graph)
+
+        with FakeTensorMode() as fake_mode:
+            fake_x = torch.empty(128, 256, device="cuda", dtype=torch.bfloat16)
+            FakeTensorProp(gm, mode=fake_mode).propagate_dont_convert_inputs(fake_x)
+
+        bwd.meta["autograd_backward"] = True
+        ac_allow_unsaveable_recomputes(gm)
+
+        self.assertEqual(logits.meta["recompute"], CheckpointPolicy.MUST_SAVE)
+        self.assertEqual(logits_fp32.meta["recompute"], CheckpointPolicy.MUST_RECOMPUTE)
+        self.assertEqual(logits_view.meta["recompute"], CheckpointPolicy.MUST_RECOMPUTE)
+        self.assertEqual(
+            log_softmax.meta["recompute"], CheckpointPolicy.PREFER_RECOMPUTE
+        )
+        self.assertEqual(detach.meta["recompute"], CheckpointPolicy.PREFER_RECOMPUTE)
+
+        with patch(
+            "torchtitan.experiments.graph_trainer.min_cut_ac._log_payload"
+        ) as log_payload:
+            self.assertEqual(_min_cut(gm), set())
+
+        self.assertFalse(
+            any(
+                call.args[0] == "unbounded_cut"
+                for call in log_payload.mock_calls
+                if call.args
+            )
+        )
+
+        gm = selective_activation_remat_pass(gm, (fake_x,))
+        self.assertTrue(
+            any(
+                node.target == torch.ops.aten._to_copy.default
+                and node.meta.get("ac_recomputed") is True
+                for node in gm.graph.nodes
+            )
+        )
+        self.assertTrue(
+            any(
+                node.target == torch.ops.aten.view.default
+                and node.meta.get("ac_recomputed") is True
+                for node in gm.graph.nodes
+            )
+        )
+        self.assertTrue(
+            any(
+                node.target == torch.ops.aten._log_softmax.default
+                and node.meta.get("ac_recomputed") is True
+                for node in gm.graph.nodes
+            )
+        )
+        self.assertFalse(
+            any(
+                node.target == torch.ops.aten.clone.default
+                and node.meta.get("ac_recomputed") is True
+                for node in gm.graph.nodes
+            )
+        )
 
     def test_recomputable_rng_is_forced_saved_before_remat(self):
         gm, example_inputs, rng_node = self._make_rng_graph(
@@ -1653,6 +2039,7 @@ class TestMinCutACPeakModel(TestCase):
             gm,
             example_inputs,
             max_peak_increase_gb=1.0,
+            save_scope="all",
             memory_estimator="exact",
             runtime_estimator=lambda n: 1.0,
         )
@@ -1660,8 +2047,8 @@ class TestMinCutACPeakModel(TestCase):
         self.assertEqual(collective.meta["recompute"], CheckpointPolicy.MUST_SAVE)
         self.assertEqual(sin_node.meta["recompute"], CheckpointPolicy.MUST_SAVE)
 
-    def test_recomputed_collective_is_only_hard_for_min_cut_planning(self):
-        gm, example_inputs, sin_node = self._make_collective_closure_graph()
+    def test_recomputed_collective_is_not_a_save_candidate(self):
+        gm, example_inputs, _ = self._make_collective_closure_graph()
         collective = next(
             n for n in gm.graph.nodes if n.target is fake_c10d_functional_wait
         )
@@ -1677,7 +2064,7 @@ class TestMinCutACPeakModel(TestCase):
         self.assertEqual(
             collective.meta["recompute"], CheckpointPolicy.PREFER_RECOMPUTE
         )
-        self.assertEqual(sin_node.meta["recompute"], CheckpointPolicy.PREFER_RECOMPUTE)
+        self.assertNotIn(collective, _save_candidates(gm))
 
     def test_peak_budget_rejects_negative_absolute_target(self):
         gm, example_inputs = self._make_interior_cutpoint_graph()

@@ -84,6 +84,13 @@ class GraphTrainerCompileConfig(CompileConfig):
             the peak budget. If the requested target is infeasible, min-cut keeps
             the best lower-peak plan found and logs the miss."""
 
+    ac_min_cut_min_broad_candidate_gb: float | None = None
+    ac_min_cut_max_broad_candidate_gb: float | None = None
+    """Optional size window for non-frontier candidates when
+    ac_min_cut_save_scope="all". The min-cut frontier is never capped. This is a
+    debugging and tuning knob for broad candidate pools with very large
+    activations."""
+
     ac_save_final_layer_output: bool = True
     """When memory_policy=save_layer_inputs, also save the final transformer
     layer output boundary. This preserves the eager per-layer checkpointing
