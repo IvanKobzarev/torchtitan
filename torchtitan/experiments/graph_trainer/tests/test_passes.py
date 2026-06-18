@@ -6,6 +6,7 @@
 
 import operator
 import sys
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -34,9 +35,18 @@ from torchtitan.experiments.graph_trainer.ep_process_group_pass import (
 )
 from torchtitan.experiments.graph_trainer.fsdp_passes import overlap_fsdp_ag_rs_pass
 from torchtitan.experiments.graph_trainer.graph_utils import export_joint
+from torchtitan.experiments.graph_trainer.inductor_passes import (
+    _clone_full_inductor_graph_module_inputs,
+    _FullInductorFuseRegionOrderPass,
+    _FullInductorFuseRegionPass,
+    annotate_flex_attention_for_regional_inductor_pass,
+    FULL_INDUCTOR_FUSE_REGION_PHASE,
+    FULL_INDUCTOR_GRAPH_MODULE_INPUT,
+)
 from torchtitan.experiments.graph_trainer.make_fx_tracer import minimal_fx_tracer
 from torchtitan.experiments.graph_trainer.memory_policy import (
     _make_default_memory_policy,
+    _make_eager_memory_policy,
     tag_sac_policy,
 )
 from torchtitan.experiments.graph_trainer.passes import (
@@ -82,6 +92,784 @@ class ToyModel(Module):
                 use_reentrant=False,
             )
         return x
+
+
+def _empty_graph_module():
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    graph.output(x)
+    return torch.fx.GraphModule(torch.nn.Module(), graph)
+
+
+class TestAnnotateFlexAttentionForRegionalInductorPass(TestCase):
+    def test_clones_graphmodule_get_attrs_per_flex_hop(self):
+        root = torch.nn.Module()
+        root.score_mod = _empty_graph_module()
+        root.mask_mod = _empty_graph_module()
+
+        graph = torch.fx.Graph()
+        query = graph.placeholder("query")
+        key = graph.placeholder("key")
+        value = graph.placeholder("value")
+        score_mod = graph.get_attr("score_mod")
+        mask_mod = graph.get_attr("mask_mod")
+        hop0 = graph.call_function(
+            torch.ops.higher_order.flex_attention,
+            args=(query, key, value, score_mod, mask_mod),
+        )
+        hop1 = graph.call_function(
+            torch.ops.higher_order.flex_attention,
+            args=(query, key, value, score_mod, mask_mod),
+        )
+        graph.output((hop0, hop1))
+        gm = torch.fx.GraphModule(root, graph)
+
+        annotate_flex_attention_for_regional_inductor_pass(
+            gm,
+            flex_compile_config={},
+        )
+
+        flex_nodes = [
+            node
+            for node in gm.graph.nodes
+            if node.target == torch.ops.higher_order.flex_attention
+        ]
+        self.assertEqual(len(flex_nodes), 2)
+
+        module_get_attrs = [
+            node
+            for node in gm.graph.nodes
+            if node.op == "get_attr"
+            and isinstance(getattr(gm, node.target), torch.fx.GraphModule)
+        ]
+        self.assertEqual(len(module_get_attrs), 4)
+
+        seen_module_inputs = set()
+        for node in flex_nodes:
+            inputs = [
+                inp
+                for inp in node.all_input_nodes
+                if inp.op == "get_attr"
+                and isinstance(getattr(gm, inp.target), torch.fx.GraphModule)
+            ]
+            self.assertEqual(len(inputs), 2)
+            for inp in inputs:
+                self.assertNotIn(inp, seen_module_inputs)
+                seen_module_inputs.add(inp)
+                self.assertIn(
+                    "compile_with_inductor",
+                    inp.meta.get("custom", {}),
+                )
+
+
+class TestFullInductorFuseRegionPass(TestCase):
+    def test_custom_regions_get_unique_island_names(self):
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        block0 = graph.call_function(torch.ops.aten.sin.default, args=(x,))
+        block1 = graph.call_function(torch.ops.aten.cos.default, args=(block0,))
+        txt0 = graph.call_function(torch.ops.aten.neg.default, args=(block1,))
+        txt1 = graph.call_function(torch.ops.aten.relu.default, args=(txt0,))
+        gap = graph.call_function(torch.ops.aten.tanh.default, args=(txt1,))
+        txt2 = graph.call_function(torch.ops.aten.sigmoid.default, args=(gap,))
+        txt3 = graph.call_function(torch.ops.aten.exp.default, args=(txt2,))
+        graph.output(txt3)
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+        block0.meta["custom"] = {"full_inductor_fuse_region": "block.0"}
+        block1.meta["custom"] = {"full_inductor_fuse_region": "block.0"}
+        for node in (txt0, txt1, txt2, txt3):
+            node.meta["custom"] = {"full_inductor_fuse_region": "txt_unemb_chunk_0"}
+
+        _FullInductorFuseRegionPass("blocks_contiguous")(gm.graph)
+
+        from torch._inductor.fx_passes.control_dependencies import (
+            control_deps,
+            FUSE_REGION,
+        )
+
+        regions = [
+            node.name
+            for node in gm.graph.nodes
+            if node.op == "call_function"
+            and node.target is control_deps
+            and node.kwargs.get(FUSE_REGION) is True
+        ]
+        txt_regions = [
+            region
+            for region in regions
+            if region.startswith("txt_unemb_chunk_0_fwd_island_")
+        ]
+        self.assertEqual(len(regions), 3)
+        self.assertIn("block_0_island_0", regions)
+        self.assertEqual(len(txt_regions), 2)
+        self.assertEqual(len(set(txt_regions)), 2)
+
+    def test_block_regions_use_explicit_metadata(self):
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        block0 = graph.call_function(torch.ops.aten.sin.default, args=(x,))
+        block1 = graph.call_function(torch.ops.aten.cos.default, args=(block0,))
+        graph.output(block1)
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+        block0.meta["custom"] = {"full_inductor_fuse_region": "blocks.0"}
+        block1.meta["custom"] = {"full_inductor_fuse_region": "blocks.0"}
+
+        _FullInductorFuseRegionPass("blocks_contiguous")(gm.graph)
+
+        from torch._inductor.fx_passes.control_dependencies import (
+            control_deps,
+            FUSE_REGION,
+        )
+
+        regions = [
+            node
+            for node in gm.graph.nodes
+            if node.op == "call_function"
+            and node.target is control_deps
+            and node.kwargs.get(FUSE_REGION) is True
+        ]
+        self.assertEqual([node.name for node in regions], ["blocks_0_island_0"])
+
+    def test_module_fqns_do_not_define_fuse_regions(self):
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        block0 = graph.call_function(torch.ops.aten.sin.default, args=(x,))
+        block1 = graph.call_function(torch.ops.aten.cos.default, args=(block0,))
+        graph.output(block1)
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+        block0.meta["custom"] = {_MODULE_FQN: "blocks.0"}
+        block1.meta["custom"] = {_MODULE_FQN: "blocks.0"}
+
+        _FullInductorFuseRegionPass("blocks_contiguous")(gm.graph)
+
+        from torch._inductor.fx_passes.control_dependencies import (
+            control_deps,
+            FUSE_REGION,
+        )
+
+        regions = [
+            node
+            for node in gm.graph.nodes
+            if node.op == "call_function"
+            and node.target is control_deps
+            and node.kwargs.get(FUSE_REGION) is True
+        ]
+        self.assertEqual(regions, [])
+
+    def test_strategy_can_filter_regions(self):
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        block0 = graph.call_function(torch.ops.aten.sin.default, args=(x,))
+        block1 = graph.call_function(torch.ops.aten.cos.default, args=(block0,))
+        block2 = graph.call_function(torch.ops.aten.neg.default, args=(block1,))
+        block3 = graph.call_function(torch.ops.aten.relu.default, args=(block2,))
+        graph.output(block3)
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+        block0.meta["custom"] = {"full_inductor_fuse_region": "blocks.0"}
+        block1.meta["custom"] = {"full_inductor_fuse_region": "blocks.0"}
+        block2.meta["custom"] = {"full_inductor_fuse_region": "blocks.1"}
+        block3.meta["custom"] = {"full_inductor_fuse_region": "blocks.1"}
+
+        _FullInductorFuseRegionPass("blocks_contiguous,exclude=blocks.0")(gm.graph)
+
+        from torch._inductor.fx_passes.control_dependencies import (
+            control_deps,
+            FUSE_REGION,
+        )
+
+        regions = [
+            node.name
+            for node in gm.graph.nodes
+            if node.op == "call_function"
+            and node.target is control_deps
+            and node.kwargs.get(FUSE_REGION) is True
+        ]
+        self.assertEqual(regions, ["blocks_1_island_0"])
+
+    def test_txt_regions_use_explicit_metadata(self):
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        txt0 = graph.call_function(torch.ops.aten.sin.default, args=(x,))
+        txt1 = graph.call_function(torch.ops.aten.cos.default, args=(txt0,))
+        graph.output(txt1)
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+        txt0.meta["custom"] = {"full_inductor_fuse_region": "txt_unemb_chunk_0"}
+        txt1.meta["custom"] = {"full_inductor_fuse_region": "txt_unemb_chunk_0"}
+
+        _FullInductorFuseRegionPass("blocks_contiguous")(gm.graph)
+
+        from torch._inductor.fx_passes.control_dependencies import (
+            control_deps,
+            FUSE_REGION,
+        )
+
+        regions = [
+            node.name
+            for node in gm.graph.nodes
+            if node.op == "call_function"
+            and node.target is control_deps
+            and node.kwargs.get(FUSE_REGION) is True
+        ]
+        self.assertEqual(regions, ["txt_unemb_chunk_0_fwd_island_0"])
+
+    def test_single_node_regions_are_marked(self):
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        txt0 = graph.call_function(torch.ops.aten.sin.default, args=(x,))
+        graph.output(txt0)
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+        txt0.meta["custom"] = {"full_inductor_fuse_region": "txt_unemb_chunk_0"}
+
+        _FullInductorFuseRegionPass("blocks_contiguous")(gm.graph)
+
+        from torch._inductor.fx_passes.control_dependencies import (
+            control_deps,
+            FUSE_REGION,
+        )
+
+        regions = [
+            node.name
+            for node in gm.graph.nodes
+            if node.op == "call_function"
+            and node.target is control_deps
+            and node.kwargs.get(FUSE_REGION) is True
+        ]
+        self.assertEqual(regions, ["txt_unemb_chunk_0_fwd_island_0"])
+
+    def test_regions_survive_in_compile_with_inductor_metadata(self):
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        txt0 = graph.call_function(torch.ops.aten.sin.default, args=(x,))
+        txt1 = graph.call_function(torch.ops.aten.cos.default, args=(txt0,))
+        graph.output(txt1)
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+        for node in (txt0, txt1):
+            node.meta["custom"] = {
+                "compile_with_inductor": {
+                    "full_inductor_fuse_region": "txt_unemb_chunk_0"
+                }
+            }
+
+        _FullInductorFuseRegionPass("blocks_contiguous")(gm.graph)
+
+        from torch._inductor.fx_passes.control_dependencies import (
+            control_deps,
+            FUSE_REGION,
+        )
+
+        regions = [
+            node.name
+            for node in gm.graph.nodes
+            if node.op == "call_function"
+            and node.target is control_deps
+            and node.kwargs.get(FUSE_REGION) is True
+        ]
+        self.assertEqual(regions, ["txt_unemb_chunk_0_fwd_island_0"])
+
+    def test_txt_regions_derive_phase_from_autograd_backward(self):
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        txt_fwd0 = graph.call_function(torch.ops.aten.sin.default, args=(x,))
+        txt_fwd1 = graph.call_function(torch.ops.aten.cos.default, args=(txt_fwd0,))
+        gap = graph.call_function(torch.ops.aten.neg.default, args=(txt_fwd1,))
+        txt_bwd0 = graph.call_function(torch.ops.aten.tanh.default, args=(gap,))
+        txt_bwd1 = graph.call_function(torch.ops.aten.sigmoid.default, args=(txt_bwd0,))
+        graph.output(txt_bwd1)
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+        for node in (txt_fwd0, txt_fwd1, txt_bwd0, txt_bwd1):
+            node.meta["custom"] = {"full_inductor_fuse_region": "txt_unemb_chunk_0"}
+        txt_bwd0.meta["autograd_backward"] = True
+        txt_bwd1.meta["autograd_backward"] = True
+
+        _FullInductorFuseRegionPass("blocks_contiguous")(gm.graph)
+
+        from torch._inductor.fx_passes.control_dependencies import (
+            control_deps,
+            FUSE_REGION,
+        )
+
+        regions = [
+            node.name
+            for node in gm.graph.nodes
+            if node.op == "call_function"
+            and node.target is control_deps
+            and node.kwargs.get(FUSE_REGION) is True
+        ]
+        self.assertEqual(
+            regions,
+            ["txt_unemb_chunk_0_fwd_island_0", "txt_unemb_chunk_0_bwd_island_1"],
+        )
+
+    def test_include_unregioned_requires_txt_unemb_outer_graph(self):
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        unregioned = graph.call_function(torch.ops.aten.sin.default, args=(x,))
+        graph.output(unregioned)
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+        x.meta["val"] = torch.empty(2)
+        unregioned.meta["val"] = torch.empty(2)
+
+        _FullInductorFuseRegionPass("blocks_contiguous,include_unregioned")(gm.graph)
+
+        from torch._inductor.fx_passes.control_dependencies import (
+            control_deps,
+            FUSE_REGION,
+        )
+
+        regions = [
+            node
+            for node in gm.graph.nodes
+            if node.op == "call_function"
+            and node.target is control_deps
+            and node.kwargs.get(FUSE_REGION) is True
+        ]
+        self.assertEqual(regions, [])
+
+    def test_include_unregioned_marks_fwd_and_bwd_tensor_islands(self):
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        fwd0 = graph.call_function(torch.ops.aten.sin.default, args=(x,))
+        fwd1 = graph.call_function(torch.ops.aten.cos.default, args=(fwd0,))
+        txt = graph.call_function(torch.ops.aten.neg.default, args=(fwd1,))
+        bwd0 = graph.call_function(torch.ops.aten.tanh.default, args=(txt,))
+        bwd1 = graph.call_function(torch.ops.aten.sigmoid.default, args=(bwd0,))
+        graph.output(bwd1)
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+        for node in (x, fwd0, fwd1, txt, bwd0, bwd1):
+            node.meta["val"] = torch.empty(2)
+        txt.meta["val"] = torch.empty(2, 200_003)
+        txt.meta["custom"] = {"full_inductor_fuse_region": "txt_unemb_chunk_0"}
+        bwd0.meta["autograd_backward"] = True
+        bwd1.meta["autograd_backward"] = True
+
+        _FullInductorFuseRegionPass("blocks_contiguous,include_unregioned")(gm.graph)
+
+        from torch._inductor.fx_passes.control_dependencies import (
+            control_deps,
+            FUSE_REGION,
+        )
+
+        regions = [
+            node.name
+            for node in gm.graph.nodes
+            if node.op == "call_function"
+            and node.target is control_deps
+            and node.kwargs.get(FUSE_REGION) is True
+        ]
+        self.assertEqual(
+            regions,
+            [
+                "unregioned_fwd_island_0",
+                "txt_unemb_chunk_0_fwd_island_1",
+                "unregioned_bwd_island_2",
+            ],
+        )
+
+    def test_include_unregioned_skips_scalar_assertions(self):
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        sym = graph.call_function(torch.ops.aten.sym_size.int, args=(x, 0))
+        ge = graph.call_function(operator.ge, args=(sym, 1))
+        assertion = graph.call_function(
+            torch.ops.aten._assert_scalar.default, args=(ge, "bad")
+        )
+        txt = graph.call_function(torch.ops.aten.sin.default, args=(x,))
+        graph.output((assertion, txt))
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+        x.meta["val"] = torch.empty(2)
+        sym.meta["val"] = 2
+        ge.meta["val"] = True
+        txt.meta["val"] = torch.empty(2)
+        txt.meta["custom"] = {"full_inductor_fuse_region": "txt_unemb_chunk_0"}
+
+        _FullInductorFuseRegionPass("blocks_contiguous,include_unregioned")(gm.graph)
+
+        from torch._inductor.fx_passes.control_dependencies import (
+            control_deps,
+            FUSE_REGION,
+        )
+
+        regions = [
+            node.name
+            for node in gm.graph.nodes
+            if node.op == "call_function"
+            and node.target is control_deps
+            and node.kwargs.get(FUSE_REGION) is True
+        ]
+        self.assertEqual(regions, ["txt_unemb_chunk_0_fwd_island_0"])
+
+    def test_include_unregioned_skips_small_vocab_txt_unemb_graph(self):
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        fwd = graph.call_function(torch.ops.aten.sin.default, args=(x,))
+        txt = graph.call_function(torch.ops.aten.cos.default, args=(fwd,))
+        graph.output(txt)
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+        x.meta["val"] = torch.empty(32768, 1024)
+        fwd.meta["val"] = torch.empty(32768, 1024)
+        txt.meta["val"] = torch.empty(32768, 256)
+        txt.meta["custom"] = {"full_inductor_fuse_region": "txt_unemb_chunk_0"}
+
+        _FullInductorFuseRegionPass("blocks_contiguous,include_unregioned")(gm.graph)
+
+        from torch._inductor.fx_passes.control_dependencies import (
+            control_deps,
+            FUSE_REGION,
+        )
+
+        regions = [
+            node.name
+            for node in gm.graph.nodes
+            if node.op == "call_function"
+            and node.target is control_deps
+            and node.kwargs.get(FUSE_REGION) is True
+        ]
+        self.assertEqual(regions, ["txt_unemb_chunk_0_fwd_island_0"])
+
+    def test_order_pass_groups_unique_chunk_prefixed_regions(self):
+        from torch._inductor.fx_passes.control_dependencies import FUSE_REGION
+
+        class FakeSchedulerNode:
+            def __init__(
+                self,
+                name,
+                buffers,
+                reads=(),
+                region=None,
+                phase=None,
+                custom_region=None,
+                autograd_backward=False,
+                val=None,
+            ):
+                self._name = name
+                self._buffers = buffers
+                self.read_writes = SimpleNamespace(
+                    reads=[SimpleNamespace(name=read) for read in reads]
+                )
+                annotations = {} if region is None else {FUSE_REGION: region}
+                origins = []
+                val = torch.empty(2, 200_003) if val is None else val
+                if (
+                    phase is not None
+                    or custom_region is not None
+                    or autograd_backward
+                    or val is not None
+                ):
+                    custom = {}
+                    if phase is not None:
+                        custom[FULL_INDUCTOR_FUSE_REGION_PHASE] = phase
+                    if custom_region is not None:
+                        custom["full_inductor_fuse_region"] = custom_region
+                    meta = {"custom": custom, "val": val}
+                    if autograd_backward:
+                        meta["autograd_backward"] = True
+                    origins.append(SimpleNamespace(meta=meta))
+                self.node = SimpleNamespace(
+                    annotations=annotations,
+                    get_origins=lambda: origins,
+                )
+                self.added_deps = []
+
+            def get_nodes(self):
+                return [self]
+
+            def get_buffer_names(self):
+                return self._buffers
+
+            def get_name(self):
+                return self._name
+
+            def add_fake_dep(self, dep):
+                self.added_deps.append(dep)
+
+        chunk0 = FakeSchedulerNode(
+            "chunk0",
+            ["chunk0_buf"],
+            region="txt_unemb_chunk_0_island_1",
+        )
+        drain0 = FakeSchedulerNode("drain0", ["drain0_buf"], reads=["chunk0_buf"])
+        chunk1 = FakeSchedulerNode(
+            "chunk1",
+            ["chunk1_buf"],
+            region="txt_unemb_chunk_1_island_2",
+        )
+
+        _FullInductorFuseRegionOrderPass()([chunk0, drain0, chunk1])
+
+        self.assertEqual(len(chunk1.added_deps), 1)
+        self.assertEqual(chunk1.added_deps[0].name, "drain0_buf")
+        self.assertEqual(chunk1.added_deps[0].mutating_buf, "chunk1_buf")
+        self.assertTrue(chunk1.added_deps[0].is_fake)
+
+        fwd = FakeSchedulerNode(
+            "fwd",
+            ["fwd_buf"],
+            region="txt_unemb_chunk_2_island_3",
+            phase="fwd",
+        )
+        bwd = FakeSchedulerNode(
+            "bwd",
+            ["bwd_buf"],
+            region="txt_unemb_chunk_2_island_4",
+            phase="bwd",
+        )
+
+        _FullInductorFuseRegionOrderPass()([fwd, bwd])
+
+        self.assertEqual(len(bwd.added_deps), 1)
+        self.assertEqual(bwd.added_deps[0].name, "fwd_buf")
+        self.assertEqual(bwd.added_deps[0].mutating_buf, "bwd_buf")
+        self.assertTrue(bwd.added_deps[0].is_fake)
+
+        internal = FakeSchedulerNode(
+            "internal",
+            ["internal_buf"],
+            reads=["fwd_buf"],
+            region="txt_unemb_chunk_2_island_5",
+            phase="bwd",
+        )
+        next_chunk = FakeSchedulerNode(
+            "next_chunk",
+            ["next_chunk_buf"],
+            region="txt_unemb_chunk_3_island_6",
+        )
+
+        _FullInductorFuseRegionOrderPass()([fwd, internal, next_chunk])
+
+        self.assertEqual(len(next_chunk.added_deps), 1)
+        self.assertEqual(next_chunk.added_deps[0].name, "internal_buf")
+        self.assertEqual(next_chunk.added_deps[0].mutating_buf, "next_chunk_buf")
+        self.assertTrue(next_chunk.added_deps[0].is_fake)
+
+        origin_chunk0 = FakeSchedulerNode(
+            "origin_chunk0",
+            ["origin_chunk0_buf"],
+            custom_region="txt_unemb_chunk_0",
+        )
+        origin_drain0 = FakeSchedulerNode(
+            "origin_drain0",
+            ["origin_drain0_buf"],
+            reads=["origin_chunk0_buf"],
+        )
+        origin_chunk1 = FakeSchedulerNode(
+            "origin_chunk1",
+            ["origin_chunk1_buf"],
+            custom_region="txt_unemb_chunk_1",
+        )
+
+        _FullInductorFuseRegionOrderPass()(
+            [origin_chunk0, origin_drain0, origin_chunk1]
+        )
+
+        self.assertEqual(len(origin_chunk1.added_deps), 1)
+        self.assertEqual(origin_chunk1.added_deps[0].name, "origin_drain0_buf")
+        self.assertEqual(origin_chunk1.added_deps[0].mutating_buf, "origin_chunk1_buf")
+        self.assertTrue(origin_chunk1.added_deps[0].is_fake)
+
+        excluded_origin_chunk0 = FakeSchedulerNode(
+            "excluded_origin_chunk0",
+            ["excluded_origin_chunk0_buf"],
+            custom_region="txt_unemb_chunk_0",
+        )
+        excluded_origin_drain0 = FakeSchedulerNode(
+            "excluded_origin_drain0",
+            ["excluded_origin_drain0_buf"],
+            reads=["excluded_origin_chunk0_buf"],
+        )
+        excluded_origin_chunk1 = FakeSchedulerNode(
+            "excluded_origin_chunk1",
+            ["excluded_origin_chunk1_buf"],
+            custom_region="txt_unemb_chunk_1",
+        )
+
+        _FullInductorFuseRegionOrderPass(
+            "blocks_contiguous,include_unregioned,exclude_prefix=txt_unemb_chunk_"
+        )([excluded_origin_chunk0, excluded_origin_drain0, excluded_origin_chunk1])
+
+        self.assertEqual(excluded_origin_chunk1.added_deps, [])
+
+        _FullInductorFuseRegionOrderPass(
+            "blocks_contiguous,include_unregioned,"
+            "exclude_prefix=txt_unemb_chunk_,order_excluded_regions"
+        )([excluded_origin_chunk0, excluded_origin_drain0, excluded_origin_chunk1])
+
+        self.assertEqual(len(excluded_origin_chunk1.added_deps), 1)
+        self.assertEqual(
+            excluded_origin_chunk1.added_deps[0].name,
+            "excluded_origin_drain0_buf",
+        )
+        excluded_origin_chunk1.added_deps.clear()
+
+        disabled_origin_chunk0 = FakeSchedulerNode(
+            "disabled_origin_chunk0",
+            ["disabled_origin_chunk0_buf"],
+            custom_region="txt_unemb_chunk_0",
+        )
+        disabled_origin_drain0 = FakeSchedulerNode(
+            "disabled_origin_drain0",
+            ["disabled_origin_drain0_buf"],
+            reads=["disabled_origin_chunk0_buf"],
+        )
+        disabled_origin_chunk1 = FakeSchedulerNode(
+            "disabled_origin_chunk1",
+            ["disabled_origin_chunk1_buf"],
+            custom_region="txt_unemb_chunk_1",
+        )
+
+        _FullInductorFuseRegionOrderPass("blocks_contiguous,disable")(
+            [disabled_origin_chunk0, disabled_origin_drain0, disabled_origin_chunk1]
+        )
+
+        self.assertEqual(disabled_origin_chunk1.added_deps, [])
+
+        cycle_chunk0 = FakeSchedulerNode(
+            "cycle_chunk0",
+            ["cycle_chunk0_buf"],
+            reads=["cycle_chunk1_buf"],
+            region="txt_unemb_chunk_0_island_1",
+        )
+        cycle_chunk1 = FakeSchedulerNode(
+            "cycle_chunk1",
+            ["cycle_chunk1_buf"],
+            region="txt_unemb_chunk_1_island_2",
+        )
+
+        _FullInductorFuseRegionOrderPass()([cycle_chunk0, cycle_chunk1])
+
+        self.assertEqual(cycle_chunk1.added_deps, [])
+
+        small_chunk0 = FakeSchedulerNode(
+            "small_chunk0",
+            ["small_chunk0_buf"],
+            region="txt_unemb_chunk_0_island_1",
+            val=torch.empty(4096, 259),
+        )
+        small_drain0 = FakeSchedulerNode(
+            "small_drain0",
+            ["small_drain0_buf"],
+            reads=["small_chunk0_buf"],
+            val=torch.empty(4096, 259),
+        )
+        small_chunk1 = FakeSchedulerNode(
+            "small_chunk1",
+            ["small_chunk1_buf"],
+            region="txt_unemb_chunk_1_island_2",
+            val=torch.empty(4096, 259),
+        )
+
+        _FullInductorFuseRegionOrderPass()([small_chunk0, small_drain0, small_chunk1])
+
+        self.assertEqual(small_chunk1.added_deps, [])
+
+    def test_prepare_softmax_online_inherits_txt_region(self):
+        from torch._inductor import inductor_prims
+        from torch._inductor.fx_passes.control_dependencies import (
+            control_deps,
+            FUSE_REGION,
+        )
+
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        txt = graph.call_function(torch.ops.aten.sin.default, args=(x,))
+        prepare = graph.call_function(
+            inductor_prims.prepare_softmax_online, args=(txt, -1)
+        )
+        graph.output(prepare)
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+        x.meta["val"] = torch.empty(2, 200_003)
+        txt.meta["val"] = torch.empty(2, 200_003)
+        txt.meta["custom"] = {"full_inductor_fuse_region": "txt_unemb_chunk_0"}
+        prepare.meta["val"] = (torch.empty(2), torch.empty(2))
+
+        _FullInductorFuseRegionPass("blocks_contiguous,include_unregioned")(gm.graph)
+
+        regions = [
+            node.name
+            for node in gm.graph.nodes
+            if node.op == "call_function"
+            and node.target is control_deps
+            and node.kwargs.get(FUSE_REGION) is True
+        ]
+        self.assertEqual(regions, ["txt_unemb_chunk_0_fwd_island_0"])
+
+    def test_prepare_softmax_online_respects_txt_region_exclude_prefix(self):
+        from torch._inductor import inductor_prims
+        from torch._inductor.fx_passes.control_dependencies import (
+            control_deps,
+            FUSE_REGION,
+        )
+
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        txt = graph.call_function(torch.ops.aten.sin.default, args=(x,))
+        prepare = graph.call_function(
+            inductor_prims.prepare_softmax_online, args=(txt, -1)
+        )
+        graph.output(prepare)
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+        x.meta["val"] = torch.empty(2, 200_003)
+        txt.meta["val"] = torch.empty(2, 200_003)
+        txt.meta["custom"] = {"full_inductor_fuse_region": "txt_unemb_chunk_0"}
+        prepare.meta["val"] = (torch.empty(2), torch.empty(2))
+
+        _FullInductorFuseRegionPass(
+            "blocks_contiguous,include_unregioned,exclude_prefix=txt_unemb_chunk_"
+        )(gm.graph)
+
+        regions = [
+            node
+            for node in gm.graph.nodes
+            if node.op == "call_function"
+            and node.target is control_deps
+            and node.kwargs.get(FUSE_REGION) is True
+        ]
+        self.assertEqual(regions, [])
+
+    def test_clone_full_inductor_graph_module_inputs_per_user(self):
+        def use_subgraph(subgraph, x):
+            return subgraph(x)
+
+        root = torch.nn.Module()
+        root.subgraph = torch.fx.symbolic_trace(lambda x: x + 1)
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        subgraph = graph.get_attr("subgraph")
+        use0 = graph.call_function(use_subgraph, args=(subgraph, x))
+        use1 = graph.call_function(use_subgraph, args=(subgraph, x))
+        graph.output((use0, use1))
+        gm = torch.fx.GraphModule(root, graph)
+
+        use0.meta["custom"] = {"full_inductor_compile_region": "region0"}
+
+        _clone_full_inductor_graph_module_inputs(gm)
+
+        get_attrs = [node for node in gm.graph.nodes if node.op == "get_attr"]
+        self.assertEqual(len(get_attrs), 2)
+        self.assertEqual([len(node.users) for node in get_attrs], [1, 1])
+        for node in get_attrs:
+            custom = node.meta.get("custom")
+            self.assertIsInstance(custom, dict)
+            self.assertTrue(custom[FULL_INDUCTOR_GRAPH_MODULE_INPUT])
+
+        regions = [
+            node.meta["custom"].get("full_inductor_compile_region")
+            for node in get_attrs
+        ]
+        self.assertEqual(regions.count("region0"), 1)
 
 
 class TestOverlapFsdpAgRsPass(FSDPTest):
@@ -501,6 +1289,27 @@ class TestApplySACPass(TestCase):
         self.assertEqual(nodes[0].meta["recompute"], CheckpointPolicy.MUST_SAVE)
         self.assertEqual(nodes[1].meta["recompute"], CheckpointPolicy.PREFER_RECOMPUTE)
 
+    def test_eager_policy_keeps_saved_ops_hard(self):
+        """Eager policy mirrors eager SAC; relaxation is a separate min-cut pass."""
+        custom_save = {torch.ops.aten.add.Tensor, torch.ops.aten.relu.default}
+        gm = self._build_gm(
+            [
+                torch.ops.aten.add.Tensor,
+                torch.ops.aten.relu.default,
+                torch.ops.aten.mul.Tensor,
+            ]
+        )
+        nodes = self._get_call_function_nodes(gm)
+        nodes[0].meta["custom"] = {_MODULE_FQN: "layers.0.feed_forward"}
+        nodes[1].meta["custom"] = {_MODULE_FQN: "layers.0.feed_forward"}
+        nodes[2].meta["custom"] = {_MODULE_FQN: "layers.1.attention"}
+
+        tag_sac_policy(gm, policy_fn=_make_eager_memory_policy(custom_save))
+
+        self.assertEqual(nodes[0].meta["recompute"], CheckpointPolicy.MUST_SAVE)
+        self.assertEqual(nodes[1].meta["recompute"], CheckpointPolicy.MUST_SAVE)
+        self.assertEqual(nodes[2].meta["recompute"], CheckpointPolicy.PREFER_RECOMPUTE)
+
     def test_custom_op_list_to_save(self):
         """A custom op_list_to_save should override the defaults."""
         custom_save = {torch.ops.aten.relu.default}
@@ -555,6 +1364,11 @@ class TestApplySACPass(TestCase):
         graph.output(bwd)
         gm = torch.fx.GraphModule(torch.nn.Module(), graph)
 
+        fake_mode = torch._subclasses.FakeTensorMode()
+        with fake_mode:
+            x.meta["val"] = torch.randn(2, 2)
+            fwd.meta["val"] = x.meta["val"] + x.meta["val"]
+            bwd.meta["val"] = fwd.meta["val"] * 2
         fwd.meta["recompute"] = CheckpointPolicy.PREFER_RECOMPUTE
         bwd.meta["autograd_backward"] = True
 
@@ -1614,6 +2428,12 @@ class TestAsyncTensorParallelPass(FSDPTest):
 class TestSelectiveActivationRematPass(TestCase):
     """Unit tests for ``selective_activation_remat_pass``."""
 
+    def _add_fake_tensor_meta(self, *nodes):
+        fake_mode = torch._subclasses.FakeTensorMode()
+        with fake_mode:
+            for node in nodes:
+                node.meta["val"] = torch.randn(2, 2)
+
     def test_topological_insertion_order(self):
         """
         When multiple independent ``must_recompute`` deps share a downstream
@@ -1648,6 +2468,7 @@ class TestSelectiveActivationRematPass(TestCase):
         for n in (a, b, c, d, e):
             n.meta["recompute"] = CheckpointPolicy.MUST_RECOMPUTE
         bwd.meta["autograd_backward"] = True
+        self._add_fake_tensor_meta(inp1, inp2, inp3, a, b, d, c, e, bwd)
 
         original_names_in_order = [n.name for n in (a, b, d, c, e)]
         e_name = e.name
@@ -1696,6 +2517,7 @@ class TestSelectiveActivationRematPass(TestCase):
         graph.output((fwd_use, bwd))
         a.meta["recompute"] = CheckpointPolicy.MUST_RECOMPUTE
         bwd.meta["autograd_backward"] = True
+        self._add_fake_tensor_meta(inp, a, fwd_use, bwd)
 
         a_name = a.name
 
@@ -1718,6 +2540,47 @@ class TestSelectiveActivationRematPass(TestCase):
         )
         for inp_node in fwd_use_node.all_input_nodes:
             self.assertEqual(inp_node.name, a_name)
+
+    def test_shared_forward_dep_recomputed_per_backward_region(self):
+        """A forward recompute dep can be used by disjoint backward islands.
+
+        Each backward island needs its own duplicate so recompute values stay
+        local to that island and graph node names remain unique.
+        """
+        from torchtitan.experiments.graph_trainer.selective_activation_remat import (
+            selective_activation_remat_pass,
+        )
+
+        graph = torch.fx.Graph()
+        inp = graph.placeholder("inp")
+        a = graph.call_function(torch.ops.aten.clone.default, args=(inp,))
+        bwd0 = graph.call_function(torch.ops.aten.add.Tensor, args=(a, a))
+        separator = graph.call_function(torch.ops.aten.neg.default, args=(inp,))
+        bwd1 = graph.call_function(torch.ops.aten.mul.Tensor, args=(a, a))
+        graph.output((bwd0, separator, bwd1))
+
+        a.meta["recompute"] = CheckpointPolicy.MUST_RECOMPUTE
+        bwd0.meta["autograd_backward"] = True
+        bwd1.meta["autograd_backward"] = True
+        self._add_fake_tensor_meta(inp, a, bwd0, separator, bwd1)
+
+        a_name = a.name
+
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+        result = selective_activation_remat_pass(gm)
+
+        nodes = list(result.graph.nodes)
+        recomputed = [n for n in nodes if n.meta.get("ac_recomputed") is True]
+        self.assertEqual(
+            [n.name for n in recomputed],
+            [f"{a_name}_recomputed_r0", f"{a_name}_recomputed_r1"],
+        )
+
+        for inp_node in bwd0.all_input_nodes:
+            self.assertEqual(inp_node.name, f"{a_name}_recomputed_r0")
+        for inp_node in bwd1.all_input_nodes:
+            self.assertEqual(inp_node.name, f"{a_name}_recomputed_r1")
+        self.assertNotIn(a_name, [n.name for n in nodes])
 
     def test_offload_reload_chain_hoisted(self):
         """Mirrors the graph the CPU-offload pass produces: a forward
@@ -1776,6 +2639,18 @@ class TestSelectiveActivationRematPass(TestCase):
         reload_op.meta["autograd_backward"] = True
         bwd_wait.meta["autograd_backward"] = True
         bwd_other.meta["autograd_backward"] = True
+        self._add_fake_tensor_meta(
+            inp1,
+            inp2,
+            f,
+            offload_op,
+            fwd_wait,
+            n,
+            bwd_use,
+            reload_op,
+            bwd_wait,
+            bwd_other,
+        )
 
         gm = torch.fx.GraphModule(torch.nn.Module(), graph)
         result = selective_activation_remat_pass(gm)
@@ -1873,6 +2748,19 @@ class TestSelectiveActivationRematPass(TestCase):
         bwd_wait.meta["autograd_backward"] = True
         middle_bwd.meta["autograd_backward"] = True
         bwd_use.meta["autograd_backward"] = True
+        self._add_fake_tensor_meta(
+            inp1,
+            inp2,
+            f,
+            offload_op,
+            fwd_wait,
+            n,
+            early_bwd,
+            reload_op,
+            bwd_wait,
+            middle_bwd,
+            bwd_use,
+        )
 
         gm = torch.fx.GraphModule(torch.nn.Module(), graph)
         result = selective_activation_remat_pass(gm)

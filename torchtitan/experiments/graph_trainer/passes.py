@@ -53,6 +53,11 @@ from torchtitan.experiments.graph_trainer.make_fx_tracer import TracedResult
 from torchtitan.experiments.graph_trainer.memory_policy import (
     tag_with_memory_policy_pass,
 )
+from torchtitan.experiments.graph_trainer.min_cut_ac import (
+    ac_allow_allowed_saves,
+    ac_relax_relaxable_must_saves,
+    min_cut_ac_pass,
+)
 from torchtitan.experiments.graph_trainer.remove_noop_passes import (
     remove_detach_pass,
     remove_identity_slice_pass,
@@ -148,6 +153,7 @@ def compile_time_passes(
     )
     from torchtitan.models.common.attention import FlexAttention
 
+    compile_config = config.compile
     n_layers = len(config.model_spec.model.layers)
     passes: list[Callable] = [
         remove_detach_pass,
@@ -158,18 +164,60 @@ def compile_time_passes(
             tag_with_memory_policy_pass,
             config=config,
         ),
+    ]
+    min_cut_enabled = getattr(compile_config, "ac_min_cut_enabled", False)
+    if (
+        getattr(compile_config, "ac_relax_relaxable_must_saves", False)
+        and not min_cut_enabled
+    ):
+        passes.append(ac_relax_relaxable_must_saves)
+    if getattr(compile_config, "ac_allow_allowed_saves", False) and not min_cut_enabled:
+        passes.append(ac_allow_allowed_saves)
+    # Min-cut AC only decides recompute tags. It runs before
+    # CPU offload so offload sees the final MUST_SAVE set, and
+    # selective_activation_remat (below) materializes.
+    if min_cut_enabled:
+        passes.append(
+            functools.partial(
+                min_cut_ac_pass,
+                max_peak_increase_gb=getattr(
+                    compile_config, "ac_min_cut_max_peak_increase_gb", None
+                ),
+                memory_estimator=getattr(
+                    compile_config, "ac_min_cut_memory_estimator", "approximate"
+                ),
+                save_scope=getattr(compile_config, "ac_min_cut_save_scope", "min_cut"),
+                min_broad_candidate_gb=getattr(
+                    compile_config, "ac_min_cut_min_broad_candidate_gb", None
+                ),
+                max_broad_candidate_gb=getattr(
+                    compile_config, "ac_min_cut_max_broad_candidate_gb", None
+                ),
+                relax_relaxable_must_saves=getattr(
+                    compile_config, "ac_relax_relaxable_must_saves", False
+                ),
+                allow_allowed_saves=getattr(
+                    compile_config, "ac_allow_allowed_saves", False
+                ),
+            )
+        )
+    passes.append(
         functools.partial(
             apply_cpu_offload_pass,
             prefetch_lookahead=config.compile.cpu_offload_prefetch_n_layers,
             defer_n_layers=config.compile.cpu_offload_defer_n_layers,
-        ),
-        selective_activation_remat_pass,
+        )
+    )
+    # Materialize the recompute tags. This is offload-aware, so it stays correct
+    # for every memory policy and min-cut mode (including sac_and_offload).
+    passes.append(selective_activation_remat_pass)
+    passes.append(
         functools.partial(
             joint_transformer_block_bucketing_reordering_pass,
             module_bucket_plans=get_default_transformer_block_buckets(n_layers),
             enable_fsdp_ag_rs_overlap=config.compile.enable_fsdp_ag_rs_overlap,
-        ),
-    ]
+        )
+    )
     if config.parallelism.enable_async_tensor_parallel:
         passes.append(async_tensor_parallel_pass)
 

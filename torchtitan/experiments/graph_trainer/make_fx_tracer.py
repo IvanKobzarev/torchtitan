@@ -652,10 +652,18 @@ def run_traced(
             )
         all_args = list(state_flat) + list(user_inputs_flat)
         flat_inputs, _ = _unwrap_subclasses(all_args)
+        model_state.clear()
+        optim_state.clear()
+        state_tree.clear()
+        state_flat.clear()
+        user_inputs_flat.clear()
+        all_args.clear()
 
         with torch.no_grad():
             if interpreter_cls is not None:
-                flat_outputs = interpreter_cls(traced_result.gm).run(*flat_inputs)
+                flat_outputs = interpreter_cls(traced_result.gm).boxed_run(flat_inputs)
+            elif getattr(traced_result.gm, "_boxed_call", False):
+                flat_outputs = traced_result.gm(flat_inputs)
             else:
                 flat_outputs = traced_result.gm(*flat_inputs)
         wrapped = _wrap_subclasses(
