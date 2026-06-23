@@ -929,6 +929,16 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         if not self.metrics_processor.should_log(self.step):
             return
 
+        if self.metrics_processor.config.perf_metrics_only:
+            self.metrics_processor.log_perf_only(
+                self.step,
+                extra_metrics={
+                    "n_tokens_seen": self.ntokens_seen,
+                    **lr_metrics,
+                },
+            )
+            return
+
         with sl.log_trace_span("collect_dist_metrics"):
 
             sl.log_trace_scalar({"global_valid_tokens": int(global_valid_tokens)})

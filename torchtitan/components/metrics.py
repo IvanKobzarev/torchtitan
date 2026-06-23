@@ -279,6 +279,12 @@ class MetricsProcessor(Configurable):
         log_freq: int = 10
         """How often to log train metrics, in iterations. Set <= 0 to disable."""
 
+        perf_metrics_only: bool = False
+        """
+        Whether to log only performance metrics. This skips loss and grad-norm
+        metrics so the trainer does not need device-to-host scalar syncs.
+        """
+
         enable_tensorboard: bool = False
         """Whether to log metrics to TensorBoard"""
 
@@ -471,49 +477,14 @@ class MetricsProcessor(Configurable):
             extra_metrics: Optional additional metrics to log
 
         """
-        assert self.num_flops_per_token > 0, "num_flops_per_token must be set"
-
-        time_delta = time.perf_counter() - self.time_last_log
-
-        # tokens per second per device, abbreviated as tps
-        tps = self.ntokens_since_last_log / (
-            time_delta * self.parallel_dims.non_data_parallel_size
-        )
-        # model FLOPS utilization
-        # For its definition and calculation, please refer to the PaLM paper:
-        # https://arxiv.org/abs/2204.02311
-        # MFU is based on BF16 peak FLOPS which is misleading when quantization
-        # (FP8/MX) is active, so we skip it in that case.
-        tflops = self.num_flops_per_token * tps / 1e12
-        if self.has_quantization:
-            mfu = None
-        else:
-            mfu = 100 * self.num_flops_per_token * tps / self.gpu_peak_flops
-
-        time_end_to_end = time_delta / self.config.log_freq
-        time_data_loading = sum(self.data_loading_times) / len(self.data_loading_times)
-        time_data_loading_pct = 100 * sum(self.data_loading_times) / time_delta
-
-        device_mem_stats = self.device_memory_monitor.get_peak_stats()
+        metrics, device_mem_stats, tps, tflops, mfu = self._build_perf_metrics()
 
         metrics = {
             "loss_metrics/global_avg_loss": global_avg_loss,
             "loss_metrics/global_max_loss": global_max_loss,
             "grad_norm": grad_norm,
-            "throughput(tps)": tps,
-            "tflops": tflops,
-            "time_metrics/end_to_end(s)": time_end_to_end,
-            "time_metrics/data_loading(s)": time_data_loading,
-            "time_metrics/data_loading(%)": time_data_loading_pct,
-            "memory/max_active(GiB)": device_mem_stats.max_active_gib,
-            "memory/max_active(%)": device_mem_stats.max_active_pct,
-            "memory/max_reserved(GiB)": device_mem_stats.max_reserved_gib,
-            "memory/max_reserved(%)": device_mem_stats.max_reserved_pct,
-            "memory/num_alloc_retries": device_mem_stats.num_alloc_retries,
-            "memory/num_ooms": device_mem_stats.num_ooms,
+            **metrics,
         }
-        if mfu is not None:
-            metrics["mfu(%)"] = mfu
 
         if extra_metrics:
             metrics.update(extra_metrics)
@@ -537,6 +508,86 @@ class MetricsProcessor(Configurable):
         self.data_loading_times.clear()
         self.time_last_log = time.perf_counter()
         self.device_memory_monitor.reset_peak_stats()
+
+    def log_perf_only(
+        self,
+        step: int,
+        extra_metrics: dict[str, Any] | None = None,
+    ):
+        """Log throughput, MFU, timing, and memory without loss/grad scalars."""
+        metrics, device_mem_stats, tps, tflops, mfu = self._build_perf_metrics()
+
+        if extra_metrics:
+            metrics.update(extra_metrics)
+
+        self.logger.log(metrics, step)
+
+        color = self.color
+        mfu_str = f"{mfu:.2f}%" if mfu is not None else "N/A"
+        logger.info(
+            f"{color.red}step: {step:2}  "
+            f"{color.turquoise}memory: {device_mem_stats.max_reserved_gib:5.2f}GiB"
+            f"({device_mem_stats.max_reserved_pct:.2f}%)  "
+            f"{color.blue}tps: {round(tps):,}  "
+            f"{color.cyan}tflops: {tflops:,.2f}  "
+            f"{color.magenta}mfu: {mfu_str}{color.reset}"
+        )
+
+        self.ntokens_since_last_log = 0
+        self.data_loading_times.clear()
+        self.time_last_log = time.perf_counter()
+        self.device_memory_monitor.reset_peak_stats()
+
+    def _build_perf_metrics(
+        self,
+    ) -> tuple[dict[str, Any], DeviceMemStats, float, float, float | None]:
+        assert self.num_flops_per_token > 0, "num_flops_per_token must be set"
+
+        time_delta = time.perf_counter() - self.time_last_log
+
+        # tokens per second per device, abbreviated as tps
+        tps = self.ntokens_since_last_log / (
+            time_delta * self.parallel_dims.non_data_parallel_size
+        )
+        # model FLOPS utilization
+        # For its definition and calculation, please refer to the PaLM paper:
+        # https://arxiv.org/abs/2204.02311
+        # MFU is based on BF16 peak FLOPS which is misleading when quantization
+        # (FP8/MX) is active, so we skip it in that case.
+        tflops = self.num_flops_per_token * tps / 1e12
+        if self.has_quantization:
+            mfu = None
+        else:
+            mfu = 100 * self.num_flops_per_token * tps / self.gpu_peak_flops
+
+        time_end_to_end = time_delta / self.config.log_freq
+        data_loading_total = sum(self.data_loading_times)
+        time_data_loading = (
+            data_loading_total / len(self.data_loading_times)
+            if self.data_loading_times
+            else 0.0
+        )
+        time_data_loading_pct = 100 * data_loading_total / time_delta
+
+        device_mem_stats = self.device_memory_monitor.get_peak_stats()
+
+        metrics = {
+            "throughput(tps)": tps,
+            "tflops": tflops,
+            "time_metrics/end_to_end(s)": time_end_to_end,
+            "time_metrics/data_loading(s)": time_data_loading,
+            "time_metrics/data_loading(%)": time_data_loading_pct,
+            "memory/max_active(GiB)": device_mem_stats.max_active_gib,
+            "memory/max_active(%)": device_mem_stats.max_active_pct,
+            "memory/max_reserved(GiB)": device_mem_stats.max_reserved_gib,
+            "memory/max_reserved(%)": device_mem_stats.max_reserved_pct,
+            "memory/num_alloc_retries": device_mem_stats.num_alloc_retries,
+            "memory/num_ooms": device_mem_stats.num_ooms,
+        }
+        if mfu is not None:
+            metrics["mfu(%)"] = mfu
+
+        return metrics, device_mem_stats, tps, tflops, mfu
 
     def log_validation(
         self, loss: float, step: int, extra_metrics: dict[str, Any] | None = None
