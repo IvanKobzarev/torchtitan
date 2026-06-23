@@ -7,7 +7,9 @@
 import unittest
 
 import torch
+import torch.nn.functional as F
 
+from torchtitan.distributed.minimal_async_ep import active_swiglu_op
 from torchtitan.distributed.minimal_async_ep.kernels import (
     copy_full_counts_to_peers_kernel,
     copy_rows_to_peers_kernel,
@@ -31,6 +33,56 @@ def assert_equal(actual: torch.Tensor, expected: torch.Tensor) -> None:
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestMinimalAsyncEPKernels(unittest.TestCase):
+    def test_active_swiglu_matches_reference_for_active_rows(self):
+        rows = 17
+        cols = 13
+        counts = torch.tensor([3, 2, 4, 2], device="cuda", dtype=torch.int32)
+        active_rows = torch.cumsum(counts, dim=0, dtype=torch.int32)[-1:]
+        active = int(active_rows.cpu().item())
+
+        torch.manual_seed(0)
+        gate = torch.randn(rows, cols, device="cuda", dtype=torch.bfloat16)
+        up = torch.randn(rows, cols, device="cuda", dtype=torch.bfloat16)
+        gate.requires_grad_(True)
+        up.requires_grad_(True)
+
+        out = active_swiglu_op(gate, up, active_rows)
+        expected = F.silu(gate[:active]) * up[:active]
+        torch.testing.assert_close(
+            out[:active].float(),
+            expected.float(),
+            rtol=2e-2,
+            atol=2e-2,
+        )
+
+        grad_out = torch.randn(active, cols, device="cuda", dtype=torch.bfloat16)
+        grad_gate, grad_up = torch.autograd.grad(out[:active], (gate, up), grad_out)
+
+        gate_ref = gate.detach().clone().requires_grad_(True)
+        up_ref = up.detach().clone().requires_grad_(True)
+        ref = F.silu(gate_ref[:active]) * up_ref[:active]
+        ref_gate, ref_up = torch.autograd.grad(ref, (gate_ref, up_ref), grad_out)
+        torch.testing.assert_close(
+            grad_gate[:active].float(),
+            ref_gate[:active].float(),
+            rtol=2e-2,
+            atol=2e-2,
+        )
+        torch.testing.assert_close(
+            grad_up[:active].float(),
+            ref_up[:active].float(),
+            rtol=2e-2,
+            atol=2e-2,
+        )
+
+    def test_active_swiglu_rejects_invalid_active_rows(self):
+        gate = torch.randn(4, 4, device="cuda", dtype=torch.bfloat16)
+        up = torch.randn(4, 4, device="cuda", dtype=torch.bfloat16)
+        active_rows = torch.tensor([2], device="cuda", dtype=torch.int64)
+
+        with self.assertRaisesRegex(ValueError, "single int32"):
+            active_swiglu_op(gate, up, active_rows)
+
     def test_topk_index_kernels_match_reference(self):
         flat_indices = torch.tensor([2, 0, 3, 1], device="cuda", dtype=torch.int64)
         slot_to_row = invert_flat_indices_kernel(flat_indices, num_rows=4)
@@ -120,13 +172,31 @@ class TestMinimalAsyncEPKernels(unittest.TestCase):
             torch.tensor([0, 1, 5, 9], device="cuda", dtype=torch.int64),
         )
 
-        segment_lens = torch.tensor([2, 1, 0, 1], device="cuda", dtype=torch.int64)
-        output_starts = segment_lens.cumsum(0) - segment_lens
-        source_input_starts = torch.tensor(
+        segment_lens_storage = torch.tensor(
+            [2, 99, 1, 99, 0, 99, 1, 99],
+            device="cuda",
+            dtype=torch.int64,
+        )
+        segment_lens = segment_lens_storage[::2]
+        output_starts_values = segment_lens.cumsum(0) - segment_lens
+        output_starts_storage = torch.empty(8, device="cuda", dtype=torch.int64)
+        output_starts_storage[::2] = output_starts_values
+        output_starts = output_starts_storage[::2]
+        source_input_starts_storage = torch.zeros(
+            2,
+            8,
+            device="cuda",
+            dtype=torch.int64,
+        )
+        source_input_starts_storage[:, ::2] = torch.tensor(
             [[0, 0, 4, 6], [0, 0, 8, 10]],
             device="cuda",
             dtype=torch.int64,
         )
+        source_input_starts = source_input_starts_storage[:, ::2]
+        self.assertFalse(segment_lens.is_contiguous())
+        self.assertFalse(output_starts.is_contiguous())
+        self.assertFalse(source_input_starts.is_contiguous())
         combine_ranks, combine_rows, num_valid_rows = fill_combine_metadata_kernel(
             segment_lens,
             output_starts,
