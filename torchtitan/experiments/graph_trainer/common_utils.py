@@ -237,7 +237,8 @@ def get_default_transformer_block_buckets(
     return [
         "tok_embeddings",
         *[f"layers.{i}" for i in range(n_layers)],
-        ["norm", "lm_head"],
+        # Chunked loss moves the lm_head weight use under module_fqn "loss".
+        ["norm", "lm_head", "loss"],
     ]
 
 

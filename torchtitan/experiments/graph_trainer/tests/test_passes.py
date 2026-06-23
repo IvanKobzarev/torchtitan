@@ -26,6 +26,7 @@ from torchtitan.distributed import ParallelDims
 from torchtitan.experiments.graph_trainer.common_utils import (
     _MODULE_FQN,
     annotate_module_fqns,
+    get_default_transformer_block_buckets,
 )
 from torchtitan.experiments.graph_trainer.cudagraph import (
     insert_kernel_annotations_pass,
@@ -67,6 +68,19 @@ from torchtitan.experiments.graph_trainer.tests.test_performance_passes import (
 )
 from torchtitan.models.common.nn_modules import Linear
 from torchtitan.protocols.module import Module, ModuleList
+
+
+class TestDefaultTransformerBlockBuckets(TestCase):
+    def test_final_bucket_covers_graph_trainer_loss_lm_head(self):
+        self.assertEqual(
+            get_default_transformer_block_buckets(2),
+            [
+                "tok_embeddings",
+                "layers.0",
+                "layers.1",
+                ["norm", "lm_head", "loss"],
+            ],
+        )
 
 
 class ToyModel(Module):
