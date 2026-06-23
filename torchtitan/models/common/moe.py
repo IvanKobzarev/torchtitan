@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from dataclasses import dataclass
+import os
 from typing import Literal
 
 import torch
@@ -58,6 +59,11 @@ class GroupedExperts(Module):
         self._use_active_swiglu = isinstance(
             self.token_dispatcher,
             MinimalAsyncEPTokenDispatcher,
+        ) and os.environ.get("TT_MOE_DISABLE_ACTIVE_SWIGLU", "").lower() in (
+            "",
+            "0",
+            "false",
+            "no",
         )
 
     def _experts_forward(
