@@ -4,6 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import json
+import os
 import re
 from collections import defaultdict
 from collections.abc import Callable, Iterator
@@ -412,14 +414,18 @@ def register_moe_load_balancing_hook(
         model_parts: list[nn.Module],
         parallel_dims: ParallelDims,
     ):
+        nonlocal moe_lb_diag_step
+        moe_lb_diag_step += 1
         loss_mesh = parallel_dims.get_optional_mesh("loss")
         # TODO: Currently this sync is blocking (thus exposed) and happens on the
         # default compute stream. Need to assess if this is OK performance-wise.
         tokens_per_expert_E_list = []
+        moe_layer_names = []
+        moe_recompute_adjusted = []
         for model_part in model_parts:
             layers = model_part.get_submodule("layers")
             assert isinstance(layers, nn.ModuleDict)
-            for transformer_block in layers.values():
+            for layer_name, transformer_block in layers.items():
                 if not transformer_block.moe_enabled:
                     continue
                 # pyrefly: ignore [missing-attribute]
@@ -427,6 +433,7 @@ def register_moe_load_balancing_hook(
                     return
                 # pyrefly: ignore [missing-attribute]
                 tokens_per_expert_E = transformer_block.moe.tokens_per_expert_E
+                recompute_adjusted = _is_recomputation_enabled(transformer_block)
                 if _is_recomputation_enabled(transformer_block):
                     # TODO: This is a hack, we assume with full AC, the tokens_per_expert_E is counted twice.
                     # This does not affect to expert choice, but affects the experts usage metrics.
@@ -434,6 +441,8 @@ def register_moe_load_balancing_hook(
                     # TODO: new API to help determine if AC is enabled https://github.com/pytorch/pytorch/pull/160888
                     tokens_per_expert_E = tokens_per_expert_E // 2
                 tokens_per_expert_E_list.append(tokens_per_expert_E)
+                moe_layer_names.append(layer_name)
+                moe_recompute_adjusted.append(recompute_adjusted)
 
         tokens_per_expert_E_by_layer = torch.vstack(tokens_per_expert_E_list)
 
@@ -478,6 +487,41 @@ def register_moe_load_balancing_hook(
                     run_check=False,
                 )
 
+        if (
+            os.environ.get("GT_MOE_LB_DIAGNOSTICS", "").lower()
+            not in ("", "0", "false")
+            and (
+                not torch.distributed.is_initialized()
+                or torch.distributed.get_rank() == 0
+            )
+        ):
+            if isinstance(
+                tokens_per_expert_E_by_layer, torch.distributed.tensor.DTensor
+            ):
+                local_counts = tokens_per_expert_E_by_layer.to_local()
+            else:
+                local_counts = tokens_per_expert_E_by_layer
+            local_counts = local_counts.detach().cpu()
+            for layer_idx, layer_name in enumerate(moe_layer_names):
+                counts = local_counts[layer_idx].to(torch.float32)
+                signs = torch.sign(counts.mean() - counts)
+                logger.info(
+                    "moe_lb_diagnostics: %s",
+                    json.dumps(
+                        {
+                            "step": moe_lb_diag_step,
+                            "layer": layer_name,
+                            "recompute_adjusted": moe_recompute_adjusted[layer_idx],
+                            "mean": float(counts.mean()),
+                            "min": float(counts.min()),
+                            "max": float(counts.max()),
+                            "counts": [float(x) for x in counts.tolist()],
+                            "signs": [float(x) for x in signs.tolist()],
+                        },
+                        separators=(",", ":"),
+                    ),
+                )
+
         moe_layer_idx = 0
         with torch.no_grad():
             for model_part in model_parts:
@@ -507,6 +551,7 @@ def register_moe_load_balancing_hook(
                     # pyrefly: ignore [missing-attribute]
                     moe.tokens_per_expert_E.zero_()
 
+    moe_lb_diag_step = 0
     if _should_register_moe_balancing_hook(model_parts):
         optimizers.register_step_pre_hook(
             lambda *args, **kwargs: _update_expert_bias(
