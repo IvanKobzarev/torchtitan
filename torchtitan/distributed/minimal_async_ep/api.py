@@ -21,6 +21,7 @@ Shape symbols used by the API entrypoints:
     ``EP``: expert-parallel group size.
 """
 
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -47,6 +48,8 @@ _HIDDEN_RECV_BUFFER_COUNT = 2
 
 _HIDDEN_READY_CHANNEL = 0
 _COUNTS_READY_CHANNEL = 0
+_DEBUG_ENV = "TT_MINIMAL_ASYNC_EP_DEBUG"
+_DEBUG_VERBOSE_ENV = "TT_MINIMAL_ASYNC_EP_DEBUG_VERBOSE"
 
 
 @dataclass
@@ -67,6 +70,187 @@ class _MinimalAsyncEPBufferState:
 
 
 _buffer_state: _MinimalAsyncEPBufferState | None = None
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "0").lower() not in ("", "0", "false", "no")
+
+
+def _debug_enabled() -> bool:
+    return _env_flag(_DEBUG_ENV)
+
+
+def _debug_verbose() -> bool:
+    return _env_flag(_DEBUG_VERBOSE_ENV)
+
+
+def _debug_rank() -> int:
+    return -1 if _buffer_state is None else _buffer_state.group.rank()
+
+
+def _debug_sync(stage: str, tensor: torch.Tensor) -> None:
+    if not _debug_enabled():
+        return
+    try:
+        torch.cuda.synchronize(tensor.device)
+    except RuntimeError as e:
+        raise RuntimeError(
+            "MinimalAsyncEP debug sync failed "
+            f"at {stage} rank={_debug_rank()} device={tensor.device}"
+        ) from e
+
+
+def _debug_item(stage: str, name: str, tensor: torch.Tensor) -> int:
+    try:
+        return int(tensor.item())
+    except RuntimeError as e:
+        raise RuntimeError(
+            "MinimalAsyncEP debug scalar read failed "
+            f"at {stage} for {name} rank={_debug_rank()} device={tensor.device}"
+        ) from e
+
+
+def _debug_check_int_range(
+    stage: str,
+    name: str,
+    values: torch.Tensor,
+    lower: int,
+    upper: int,
+) -> None:
+    if values.numel() == 0:
+        return
+    try:
+        min_value = int(values.min().item())
+        max_value = int(values.max().item())
+        bad_count = int(((values < lower) | (values >= upper)).sum().item())
+    except RuntimeError as e:
+        raise RuntimeError(
+            "MinimalAsyncEP debug range check failed "
+            f"at {stage} for {name} rank={_debug_rank()} device={values.device}"
+        ) from e
+
+    if _debug_verbose() or bad_count:
+        logger.info(
+            "MinimalAsyncEP debug range: rank=%d stage=%s name=%s "
+            "numel=%d min=%d max=%d expected=[%d,%d) bad_count=%d",
+            _debug_rank(),
+            stage,
+            name,
+            values.numel(),
+            min_value,
+            max_value,
+            lower,
+            upper,
+            bad_count,
+        )
+    if bad_count:
+        raise RuntimeError(
+            "MinimalAsyncEP invalid metadata "
+            f"at {stage}: {name} min={min_value} max={max_value} "
+            f"expected=[{lower},{upper}) bad_count={bad_count} "
+            f"rank={_debug_rank()}"
+        )
+
+
+def _debug_check_combine_copy_metadata(
+    x: torch.Tensor,
+    combine_dst_ranks: torch.Tensor,
+    combine_dst_rows: torch.Tensor,
+    combine_num_valid_rows: torch.Tensor,
+    num_routed_rows: int,
+) -> None:
+    if not _debug_enabled():
+        return
+    assert _buffer_state is not None
+    valid_rows = _debug_item(
+        "combine copy metadata",
+        "combine_num_valid_rows",
+        combine_num_valid_rows[0],
+    )
+    receive_capacity = x.shape[0]
+    ep_size = _buffer_state.group.size()
+    if valid_rows < 0 or valid_rows > receive_capacity:
+        raise RuntimeError(
+            "MinimalAsyncEP invalid combine_num_valid_rows: "
+            f"value={valid_rows} expected=[0,{receive_capacity}] "
+            f"rank={_debug_rank()}"
+        )
+    if combine_dst_ranks.numel() < valid_rows or combine_dst_rows.numel() < valid_rows:
+        raise RuntimeError(
+            "MinimalAsyncEP combine metadata shorter than active rows: "
+            f"valid_rows={valid_rows} ranks_numel={combine_dst_ranks.numel()} "
+            f"rows_numel={combine_dst_rows.numel()} rank={_debug_rank()}"
+        )
+
+    if _debug_verbose():
+        logger.info(
+            "MinimalAsyncEP debug combine copy: rank=%d x_shape=%s "
+            "valid_rows=%d receive_capacity=%d num_routed_rows=%d ep_size=%d",
+            _debug_rank(),
+            tuple(x.shape),
+            valid_rows,
+            receive_capacity,
+            num_routed_rows,
+            ep_size,
+        )
+
+    active_ranks = combine_dst_ranks.narrow(0, 0, valid_rows)
+    active_rows = combine_dst_rows.narrow(0, 0, valid_rows)
+    _debug_check_int_range(
+        "combine copy metadata",
+        "combine_dst_ranks",
+        active_ranks,
+        0,
+        ep_size,
+    )
+    _debug_check_int_range(
+        "combine copy metadata",
+        "combine_dst_rows",
+        active_rows,
+        0,
+        num_routed_rows,
+    )
+
+
+def _debug_check_reduce_metadata(
+    routed_output: torch.Tensor,
+    slot_to_row: torch.Tensor,
+    scores: torch.Tensor,
+    num_tokens: int,
+    top_k: int,
+) -> None:
+    if not _debug_enabled():
+        return
+    num_routed_rows = routed_output.shape[0]
+    expected_rows = num_tokens * top_k
+    if num_routed_rows != expected_rows:
+        raise RuntimeError(
+            "MinimalAsyncEP reduce row mismatch: "
+            f"routed_rows={num_routed_rows} expected={expected_rows} "
+            f"rank={_debug_rank()}"
+        )
+    if slot_to_row.numel() != expected_rows or scores.numel() != expected_rows:
+        raise RuntimeError(
+            "MinimalAsyncEP reduce metadata size mismatch: "
+            f"slot_to_row={slot_to_row.numel()} scores={scores.numel()} "
+            f"expected={expected_rows} rank={_debug_rank()}"
+        )
+    if _debug_verbose():
+        logger.info(
+            "MinimalAsyncEP debug reduce: rank=%d routed_output_shape=%s "
+            "num_tokens=%d top_k=%d",
+            _debug_rank(),
+            tuple(routed_output.shape),
+            num_tokens,
+            top_k,
+        )
+    _debug_check_int_range(
+        "reduce metadata",
+        "T_row_to_E_row",
+        slot_to_row,
+        0,
+        num_routed_rows,
+    )
 
 
 def maybe_update_minimal_async_ep_config(model_config: Any, config: Any) -> None:
@@ -728,6 +912,15 @@ def combine_op(
         ``routed_output_ND``: ``(N, D)`` origin-rank E-major routed rows, saved
         for routing-score gradients.
     """
+    _debug_sync("combine_op entry", x)
+    _debug_check_combine_copy_metadata(
+        x,
+        combine_dst_ranks,
+        combine_dst_rows,
+        combine_num_valid_rows,
+        E_row_to_T_row_N.numel(),
+    )
+    _debug_sync("before _combine_to_origin", x)
     routed_output_ND = _combine_to_origin(  # noqa: N806
         x,
         combine_dst_ranks,
@@ -735,6 +928,15 @@ def combine_op(
         combine_num_valid_rows,
         E_row_to_T_row_N.numel(),
     )
+    _debug_sync("after _combine_to_origin", x)
+    _debug_check_reduce_metadata(
+        routed_output_ND,
+        T_row_to_E_row_N,
+        routed_scores_N,
+        num_tokens,
+        top_k,
+    )
+    _debug_sync("before reduce_topk_slots_kernel", routed_output_ND)
     out_TD = reduce_topk_slots_kernel(  # noqa: N806
         routed_output_ND,
         T_row_to_E_row_N,
@@ -743,6 +945,7 @@ def combine_op(
         top_k=top_k,
         scores_are_slot_ordered=True,
     )
+    _debug_sync("after reduce_topk_slots_kernel", out_TD)
     return out_TD, routed_output_ND
 
 
