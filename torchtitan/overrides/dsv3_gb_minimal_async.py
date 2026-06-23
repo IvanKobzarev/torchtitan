@@ -37,7 +37,7 @@ def dsv3_gb_flex_flash(cfg: FlexAttention.Config) -> FlexAttention.Config:
     return derive(
         cfg,
         FlexAttention.Config,
-        block_size=(256, 128),
+        block_size=(256, 256),
         kernel_options=kernel_options,
     )
 

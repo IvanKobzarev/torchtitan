@@ -486,6 +486,8 @@ _compiled_create_block_mask = torch.compile(create_block_mask)
 
 def create_attention_mask(*args, **kwargs):
     """Create an attention mask using compiled create_block_mask."""
+    if torch.are_deterministic_algorithms_enabled():
+        kwargs.setdefault("compute_dq_write_order", True)
     return _compiled_create_block_mask(*args, **kwargs)
 
 
