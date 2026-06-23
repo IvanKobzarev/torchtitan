@@ -294,8 +294,9 @@ def _active_swiglu_forward_kernel(
     gate,
     up,
     out,
-    active_rows_ptr: tl.pointer_type(tl.int32),
+    offsets_ptr: tl.pointer_type(tl.int32),
     NUM_COLS: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
     GATE_ROW_STRIDE: tl.constexpr,
     GATE_COL_STRIDE: tl.constexpr,
     UP_ROW_STRIDE: tl.constexpr,
@@ -307,11 +308,11 @@ def _active_swiglu_forward_kernel(
 ) -> None:
     """Compute ``silu(gate) * up`` for active received rows only."""
     row_start = tl.program_id(0) * BLOCK_M
-    active_rows = tl.load(active_rows_ptr)
+    active_rows = tl.load(offsets_ptr + NUM_GROUPS - 1)
     if row_start >= active_rows:
         return
 
-    rows = row_start + tl.arange(0, BLOCK_M)
+    rows = (row_start + tl.arange(0, BLOCK_M)).to(tl.int64)
     cols = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
     mask = (rows[:, None] < active_rows) & (cols[None, :] < NUM_COLS)
 
@@ -340,8 +341,9 @@ def _active_swiglu_backward_kernel(
     up,
     grad_gate,
     grad_up,
-    active_rows_ptr: tl.pointer_type(tl.int32),
+    offsets_ptr: tl.pointer_type(tl.int32),
     NUM_COLS: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
     GRAD_OUT_ROW_STRIDE: tl.constexpr,
     GRAD_OUT_COL_STRIDE: tl.constexpr,
     GATE_ROW_STRIDE: tl.constexpr,
@@ -357,11 +359,11 @@ def _active_swiglu_backward_kernel(
 ) -> None:
     """Backward for ``_active_swiglu_forward_kernel`` over active rows only."""
     row_start = tl.program_id(0) * BLOCK_M
-    active_rows = tl.load(active_rows_ptr)
+    active_rows = tl.load(offsets_ptr + NUM_GROUPS - 1)
     if row_start >= active_rows:
         return
 
-    rows = row_start + tl.arange(0, BLOCK_M)
+    rows = (row_start + tl.arange(0, BLOCK_M)).to(tl.int64)
     cols = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
     mask = (rows[:, None] < active_rows) & (cols[None, :] < NUM_COLS)
 
@@ -439,16 +441,16 @@ def _copy_rows_to_peer_ptrs_kernel(
         row_limit = tl.load(num_valid_rows)
         if row_start >= row_limit:
             return
-    row = row_start + tl.arange(0, BLOCK_M)
+    row = (row_start + tl.arange(0, BLOCK_M)).to(tl.int64)
     col = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
     row_mask = row < row_limit
     col_mask = col < NUM_COLS
     mask = row_mask[:, None] & col_mask[None, :]
     src_row = row
     if HAS_SRC_ROWS:
-        src_row = tl.load(src_rows + row, mask=row_mask, other=0)
+        src_row = tl.load(src_rows + row, mask=row_mask, other=0).to(tl.int64)
     dst_rank = tl.load(dst_ranks + row, mask=row_mask, other=-1)
-    dst_row = tl.load(dst_rows + row, mask=row_mask, other=0)
+    dst_row = tl.load(dst_rows + row, mask=row_mask, other=0).to(tl.int64)
     dst_rank_mask = row_mask & (dst_rank >= 0)
     values = tl.load(
         src + src_row[:, None] * SRC_ROW_STRIDE + col[None, :] * SRC_COL_STRIDE,
@@ -751,11 +753,11 @@ def topk_scores_grad_kernel(
 def active_swiglu_forward_kernel(
     gate: torch.Tensor,
     up: torch.Tensor,
-    active_rows: torch.Tensor,
+    offsets: torch.Tensor,
 ) -> torch.Tensor:
-    if active_rows.dtype != torch.int32 or active_rows.numel() != 1:
-        raise ValueError("active_swiglu active_rows must be a single int32 element")
-    active_rows = active_rows.contiguous()
+    if offsets.dtype != torch.int32 or offsets.dim() != 1 or offsets.numel() == 0:
+        raise ValueError("active_swiglu offsets must be a non-empty 1D int32 tensor")
+    offsets = offsets.contiguous()
     out = torch.empty_like(gate)
 
     block_m = _SWIGLU_BLOCK_M
@@ -768,8 +770,9 @@ def active_swiglu_forward_kernel(
         gate,
         up,
         out,
-        active_rows,
+        offsets,
         NUM_COLS=gate.shape[1],
+        NUM_GROUPS=offsets.numel(),
         GATE_ROW_STRIDE=gate.stride(0),
         GATE_COL_STRIDE=gate.stride(1),
         UP_ROW_STRIDE=up.stride(0),
@@ -787,11 +790,11 @@ def active_swiglu_backward_kernel(
     grad_out: torch.Tensor,
     gate: torch.Tensor,
     up: torch.Tensor,
-    active_rows: torch.Tensor,
+    offsets: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if active_rows.dtype != torch.int32 or active_rows.numel() != 1:
-        raise ValueError("active_swiglu active_rows must be a single int32 element")
-    active_rows = active_rows.contiguous()
+    if offsets.dtype != torch.int32 or offsets.dim() != 1 or offsets.numel() == 0:
+        raise ValueError("active_swiglu offsets must be a non-empty 1D int32 tensor")
+    offsets = offsets.contiguous()
     grad_gate = torch.empty_like(gate)
     grad_up = torch.empty_like(up)
 
@@ -807,8 +810,9 @@ def active_swiglu_backward_kernel(
         up,
         grad_gate,
         grad_up,
-        active_rows,
+        offsets,
         NUM_COLS=gate.shape[1],
+        NUM_GROUPS=offsets.numel(),
         GRAD_OUT_ROW_STRIDE=grad_out.stride(0),
         GRAD_OUT_COL_STRIDE=grad_out.stride(1),
         GATE_ROW_STRIDE=gate.stride(0),

@@ -37,8 +37,8 @@ class TestMinimalAsyncEPKernels(unittest.TestCase):
         rows = 17
         cols = 13
         counts = torch.tensor([3, 2, 4, 2], device="cuda", dtype=torch.int32)
-        active_rows = torch.cumsum(counts, dim=0, dtype=torch.int32)[-1:]
-        active = int(active_rows.cpu().item())
+        offsets = torch.cumsum(counts, dim=0, dtype=torch.int32)
+        active = int(offsets[-1].cpu().item())
 
         torch.manual_seed(0)
         gate = torch.randn(rows, cols, device="cuda", dtype=torch.bfloat16)
@@ -46,7 +46,7 @@ class TestMinimalAsyncEPKernels(unittest.TestCase):
         gate.requires_grad_(True)
         up.requires_grad_(True)
 
-        out = active_swiglu_op(gate, up, active_rows)
+        out = active_swiglu_op(gate, up, offsets)
         expected = F.silu(gate[:active]) * up[:active]
         torch.testing.assert_close(
             out[:active].float(),
@@ -75,13 +75,13 @@ class TestMinimalAsyncEPKernels(unittest.TestCase):
             atol=2e-2,
         )
 
-    def test_active_swiglu_rejects_invalid_active_rows(self):
+    def test_active_swiglu_rejects_invalid_offsets(self):
         gate = torch.randn(4, 4, device="cuda", dtype=torch.bfloat16)
         up = torch.randn(4, 4, device="cuda", dtype=torch.bfloat16)
-        active_rows = torch.tensor([2], device="cuda", dtype=torch.int64)
+        offsets = torch.tensor([2], device="cuda", dtype=torch.int64)
 
-        with self.assertRaisesRegex(ValueError, "single int32"):
-            active_swiglu_op(gate, up, active_rows)
+        with self.assertRaisesRegex(ValueError, "1D int32"):
+            active_swiglu_op(gate, up, offsets)
 
     def test_topk_index_kernels_match_reference(self):
         flat_indices = torch.tensor([2, 0, 3, 1], device="cuda", dtype=torch.int64)

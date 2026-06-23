@@ -680,17 +680,17 @@ def _combine_to_origin(
 def active_swiglu_op(
     gate: torch.Tensor,
     up: torch.Tensor,
-    active_rows: torch.Tensor,
+    offsets: torch.Tensor,
 ) -> torch.Tensor:
     """Compute ``silu(gate) * up`` over active padded expert-buffer rows."""
-    return active_swiglu_forward_kernel(gate, up, active_rows)
+    return active_swiglu_forward_kernel(gate, up, offsets)
 
 
 @active_swiglu_op.register_fake
 def active_swiglu_op_fake(
     gate: torch.Tensor,
     up: torch.Tensor,
-    active_rows: torch.Tensor,
+    offsets: torch.Tensor,
 ) -> torch.Tensor:
     return torch.empty_like(gate)
 
@@ -981,10 +981,10 @@ def active_swiglu_backward_op(
     grad_out: torch.Tensor,
     gate: torch.Tensor,
     up: torch.Tensor,
-    active_rows: torch.Tensor,
+    offsets: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute active-row gradients for ``minimal_async_ep::active_swiglu``."""
-    return active_swiglu_backward_kernel(grad_out, gate, up, active_rows)
+    return active_swiglu_backward_kernel(grad_out, gate, up, offsets)
 
 
 @active_swiglu_backward_op.register_fake
@@ -992,7 +992,7 @@ def active_swiglu_backward_op_fake(
     grad_out: torch.Tensor,
     gate: torch.Tensor,
     up: torch.Tensor,
-    active_rows: torch.Tensor,
+    offsets: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return torch.empty_like(gate), torch.empty_like(up)
 
@@ -1135,19 +1135,19 @@ def combine_backward_op_fake(
 
 
 def active_swiglu_autograd_backward(ctx, grad_out):
-    gate, up, active_rows = ctx.saved_tensors
+    gate, up, offsets = ctx.saved_tensors
     grad_gate, grad_up = active_swiglu_backward_op(
         grad_out,
         gate,
         up,
-        active_rows,
+        offsets,
     )
     return grad_gate, grad_up, None
 
 
 def active_swiglu_setup_context(ctx, inputs, output):
-    gate, up, active_rows = inputs
-    ctx.save_for_backward(gate, up, active_rows)
+    gate, up, offsets = inputs
+    ctx.save_for_backward(gate, up, offsets)
 
 
 def dispatch_setup_context(ctx, inputs, output):

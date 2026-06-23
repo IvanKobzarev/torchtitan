@@ -105,7 +105,7 @@ class GroupedExperts(Module):
             offs=offsets_E,
         )
         if self._use_active_swiglu:
-            h_RF = active_swiglu_op(gate_RF, up_RF, offsets_E[-1:])
+            h_RF = active_swiglu_op(gate_RF, up_RF, offsets_E)
         else:
             h_RF = F.silu(gate_RF) * up_RF
         return torch._grouped_mm(
