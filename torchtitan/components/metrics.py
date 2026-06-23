@@ -277,7 +277,7 @@ class MetricsProcessor(Configurable):
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
         log_freq: int = 10
-        """How often to log metrics to TensorBoard, in iterations"""
+        """How often to log train metrics, in iterations. Set <= 0 to disable."""
 
         enable_tensorboard: bool = False
         """Whether to log metrics to TensorBoard"""
@@ -360,7 +360,9 @@ class MetricsProcessor(Configurable):
         self.model_parts = None
 
     def should_log(self, step: int) -> bool:
-        return step == 1 or step % self.config.log_freq == 0
+        return self.config.log_freq > 0 and (
+            step == 1 or step % self.config.log_freq == 0
+        )
 
     def _build_metric_logger(
         self,
