@@ -15,7 +15,7 @@ from torch.distributed.elastic.multiprocessing.errors import record
 
 from torchtitan.components.dataloader import BaseDataLoader, DataloaderExhaustedError
 from torchtitan.components.loss import IGNORE_INDEX
-from torchtitan.components.metrics import MetricsProcessor
+from torchtitan.components.metrics import format_device_memory_stats, MetricsProcessor
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.components.validate import Validator
 from torchtitan.config import ConfigManager
@@ -90,8 +90,7 @@ class Trainer(ForgeEngine):
         device_mem_stats = device_memory_monitor.get_peak_stats()
         logger.info(
             f"{utils.device_type.upper()} memory usage for model: "
-            f"{device_mem_stats.max_reserved_gib:.2f}GiB"
-            f"({device_mem_stats.max_reserved_pct:.2f}%)"
+            f"{format_device_memory_stats(device_mem_stats)}"
         )
 
         self.metrics_processor.optimizers = self.optimizers

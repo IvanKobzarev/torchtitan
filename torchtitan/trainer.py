@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import dataclasses
+import hashlib
 import json
 import os
 import time
@@ -23,7 +24,11 @@ from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.dataloader import BaseDataLoader, DataloaderExhaustedError
 from torchtitan.components.loss import BaseLoss, ChunkedLossWrapper, IGNORE_INDEX
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
-from torchtitan.components.metrics import ensure_pp_loss_visible, MetricsProcessor
+from torchtitan.components.metrics import (
+    ensure_pp_loss_visible,
+    format_device_memory_stats,
+    MetricsProcessor,
+)
 from torchtitan.components.optimizer import OptimizersContainer
 from torchtitan.components.quantization.utils import has_quantization
 from torchtitan.components.tokenizer import BaseTokenizer, HuggingFaceTokenizer
@@ -282,7 +287,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         model_config.update_from_config(
             config=config,
         )
-        self.model_config = model_config
 
         # Apply overrides to the full config tree, before any component is
         # built. The model config is reached via ModelSpec.traverse. Model
@@ -291,6 +295,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         # loss, dataloader, …) are built later in __init__.
         if config.override.imports:
             apply_overrides(config.override, config)
+            model_config = model_spec.model
+            # Overrides can introduce replacement configs whose runtime fields
+            # are normally populated by update_from_config.
+            model_config.update_from_config(
+                config=config,
+            )
+        self.model_config = model_config
 
         logger.info(f"Building {model_spec.name} {model_spec.flavor}")
 
@@ -469,8 +480,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         device_mem_stats = device_memory_monitor.get_peak_stats()
         logger.info(
             f"{device_type.upper()} memory usage for model: "
-            f"{device_mem_stats.max_reserved_gib:.2f}GiB"
-            f"({device_mem_stats.max_reserved_pct:.2f}%)"
+            f"{format_device_memory_stats(device_mem_stats)}"
         )
 
         # build optimizer after applying parallelisms to the model
@@ -754,6 +764,193 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         # The returned loss here is local SUM loss / global_valid_tokens
         return loss
 
+    def _dump_weight_hash_diagnostics(self) -> None:
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+            return
+
+        out_dir = os.path.join(self.config.dump_folder, "weight_hash_diagnostics")
+        os.makedirs(out_dir, exist_ok=True)
+
+        for part_idx, model in enumerate(self.model_parts):
+            value_hash = hashlib.sha256()
+            named_hash = hashlib.sha256()
+            multiset_hashes: list[str] = []
+            entries: list[dict[str, Any]] = []
+
+            def add_tensor(name: str, tensor: torch.Tensor, kind: str) -> None:
+                name, local_tensor, raw_bytes = self._weight_hash_tensor(name, tensor)
+                tensor_hash = hashlib.sha256(raw_bytes).hexdigest()
+                value_hash.update(raw_bytes)
+                named_hash.update(name.encode("utf-8"))
+                named_hash.update(raw_bytes)
+                multiset_hashes.append(tensor_hash)
+                entries.append(
+                    {
+                        "kind": kind,
+                        "name": name,
+                        "shape": list(local_tensor.shape),
+                        "dtype": str(local_tensor.dtype),
+                        "hash": tensor_hash,
+                    }
+                )
+
+            with torch.no_grad():
+                for name, param in model.named_parameters():
+                    add_tensor(name, param, "parameter")
+                for name, buffer in model.named_buffers():
+                    add_tensor(name, buffer, "buffer")
+
+            name_order_hash = hashlib.sha256(
+                "\n".join(entry["name"] for entry in entries).encode("utf-8")
+            ).hexdigest()
+            multiset_hash = hashlib.sha256(
+                "\n".join(sorted(multiset_hashes)).encode("utf-8")
+            ).hexdigest()
+            payload = {
+                "step": self.step,
+                "part": part_idx,
+                "num_tensors": len(entries),
+                "named_hash": named_hash.hexdigest(),
+                "value_hash": value_hash.hexdigest(),
+                "value_multiset_hash": multiset_hash,
+                "name_order_hash": name_order_hash,
+                "entries": entries,
+            }
+
+            run_name = "_".join(
+                (
+                    os.environ.get("MODULE", "module"),
+                    os.environ.get("CONFIG", "config"),
+                )
+            )
+            run_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in run_name)
+            out_path = os.path.join(
+                out_dir, f"{run_name}_rank0_step{self.step}_part{part_idx}.json"
+            )
+            with open(out_path, "w") as f:
+                json.dump(payload, f, indent=2)
+            logger.info(
+                f"[step {self.step}] weight_hash_diagnostics: part={part_idx} "
+                f"path={out_path} value_hash={payload['value_hash']} "
+                f"value_multiset_hash={payload['value_multiset_hash']} "
+                f"name_order_hash={payload['name_order_hash']}"
+            )
+
+    def _dump_grad_hash_diagnostics(self) -> None:
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+
+        out_dir = os.path.join(self.config.dump_folder, "grad_hash_diagnostics")
+        os.makedirs(out_dir, exist_ok=True)
+
+        run_name = "_".join(
+            (
+                os.environ.get("MODULE", "module"),
+                os.environ.get("CONFIG", "config"),
+            )
+        )
+        run_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in run_name)
+
+        for part_idx, model in enumerate(self.model_parts):
+            grad_hash = hashlib.sha256()
+            entries: list[dict[str, Any]] = []
+
+            with torch.no_grad():
+                for name, param in model.named_parameters():
+                    grad = param.grad
+                    if grad is None:
+                        entries.append(
+                            {
+                                "name": name.replace("._checkpoint_wrapped_module", ""),
+                                "has_grad": False,
+                            }
+                        )
+                        continue
+
+                    name, local_grad, raw_bytes = self._weight_hash_tensor(name, grad)
+                    local_grad_float = local_grad.float()
+                    tensor_hash = hashlib.sha256(raw_bytes).hexdigest()
+                    grad_hash.update(name.encode("utf-8"))
+                    grad_hash.update(raw_bytes)
+                    entries.append(
+                        {
+                            "name": name,
+                            "has_grad": True,
+                            "shape": list(local_grad.shape),
+                            "dtype": str(local_grad.dtype),
+                            "hash": tensor_hash,
+                            "l2_norm": float(torch.linalg.vector_norm(local_grad_float)),
+                            "abs_max": float(torch.max(torch.abs(local_grad_float))),
+                            "sum": float(torch.sum(local_grad_float)),
+                        }
+                    )
+
+            payload = {
+                "step": self.step,
+                "rank": rank,
+                "part": part_idx,
+                "grad_hash": grad_hash.hexdigest(),
+                "entries": entries,
+            }
+            out_path = os.path.join(
+                out_dir,
+                f"{run_name}_rank{rank}_step{self.step}_part{part_idx}.json",
+            )
+            with open(out_path, "w") as f:
+                json.dump(payload, f, indent=2)
+            logger.info(
+                f"[step {self.step}] grad_hash_diagnostics: rank={rank} "
+                f"part={part_idx} path={out_path} grad_hash={payload['grad_hash']}"
+            )
+
+    @staticmethod
+    def _weight_hash_tensor(
+        name: str, tensor: torch.Tensor
+    ) -> tuple[str, torch.Tensor, bytes]:
+        name = name.replace("._checkpoint_wrapped_module", "")
+        if isinstance(tensor, DTensor):
+            local_tensor = tensor.to_local().detach().cpu().contiguous()
+        else:
+            local_tensor = tensor.detach().cpu().contiguous()
+        raw_bytes = local_tensor.reshape(-1).view(torch.uint8).numpy().tobytes()
+        return name, local_tensor, raw_bytes
+
+    def _hash_model_part(self, model: BaseModel) -> str:
+        h = hashlib.sha256()
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                name, _, raw_bytes = self._weight_hash_tensor(name, param)
+                h.update(name.encode("utf-8"))
+                h.update(raw_bytes)
+            for name, buffer in model.named_buffers():
+                name, _, raw_bytes = self._weight_hash_tensor(name, buffer)
+                h.update(name.encode("utf-8"))
+                h.update(raw_bytes)
+        return h.hexdigest()
+
+    @staticmethod
+    def _env_flag_enabled(name: str) -> bool:
+        return os.environ.get(name, "").lower() not in ("", "0", "false")
+
+    def _write_weight_hash_artifact(self, payload: dict[str, Any]) -> None:
+        out_dir = os.path.join(self.config.dump_folder, "weight_hashes")
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, "rank0_weight_hashes.jsonl")
+        with open(out_path, "a") as f:
+            f.write(json.dumps(payload, sort_keys=True) + "\n")
+            f.flush()
+
+    @staticmethod
+    def _trace_weight_hash_payload(payload: dict[str, Any]) -> None:
+        from torch._logging import trace_structured
+
+        trace_structured(
+            "gt_numerics_weight_hash",
+            metadata_fn=lambda: payload,
+            payload_fn=lambda: json.dumps(payload, sort_keys=True),
+            expect_trace_id=False,
+            record_logging_overhead=False,
+        )
+
     def train_step(
         self, data_iterator: Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]
     ):
@@ -802,6 +999,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             accumulated_losses.append(loss.detach())
 
         with sl.log_trace_span("optim"):
+            if self._env_flag_enabled("GT_GRAD_HASH_DIAGNOSTICS"):
+                try:
+                    self._dump_grad_hash_diagnostics()
+                except Exception:
+                    logger.exception(
+                        f"[step {self.step}] failed to write grad_hash diagnostics"
+                    )
             grad_norm = dist_utils.clip_grad_norm_(
                 [p for m in self.model_parts for p in m.parameters()],
                 self.config.training.max_norm,
@@ -813,11 +1017,70 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             self.optimizers.step()
             self.lr_schedulers.step()
 
+        if self._env_flag_enabled("GT_WEIGHT_HASH"):
+            rank = (
+                torch.distributed.get_rank()
+                if torch.distributed.is_initialized()
+                else 0
+            )
+            if rank == 0:
+                try:
+                    weight_hashes = [
+                        self._hash_model_part(m) for m in self.model_parts
+                    ]
+                    weight_hash_payload = {
+                        "step": self.step,
+                        "rank": rank,
+                        "hashes": weight_hashes,
+                        "module": os.environ.get("MODULE", ""),
+                        "config": os.environ.get("CONFIG", ""),
+                    }
+                except Exception:
+                    logger.exception(f"[step {self.step}] failed to compute weight_hash")
+                else:
+                    try:
+                        logger.info(
+                            f"[step {self.step}] weight_hash: {'|'.join(weight_hashes)}"
+                        )
+                    except Exception:
+                        logger.exception(
+                            f"[step {self.step}] failed to log weight_hash to stdout"
+                        )
+                    try:
+                        self._write_weight_hash_artifact(weight_hash_payload)
+                    except Exception:
+                        logger.exception(
+                            f"[step {self.step}] failed to write weight_hash artifact"
+                        )
+                    try:
+                        self._trace_weight_hash_payload(weight_hash_payload)
+                    except Exception:
+                        logger.exception(
+                            f"[step {self.step}] failed to trace weight_hash payload"
+                        )
+            if self._env_flag_enabled("GT_WEIGHT_HASH_DIAGNOSTICS"):
+                try:
+                    self._dump_weight_hash_diagnostics()
+                except Exception:
+                    logger.exception(
+                        f"[step {self.step}] failed to write weight_hash diagnostics"
+                    )
+
         # Reduce the data collected over gradient accumulation steps.
         loss = torch.sum(torch.stack(accumulated_losses))
 
         # log metrics
         if not self.metrics_processor.should_log(self.step):
+            return
+
+        if self.metrics_processor.config.perf_metrics_only:
+            self.metrics_processor.log_perf_only(
+                self.step,
+                extra_metrics={
+                    "n_tokens_seen": self.ntokens_seen,
+                    **lr_metrics,
+                },
+            )
             return
 
         with sl.log_trace_span("collect_dist_metrics"):

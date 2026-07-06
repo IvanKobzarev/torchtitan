@@ -4,6 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import json
+import os
 import re
 from collections import defaultdict
 from collections.abc import Callable, Iterator
@@ -401,21 +403,23 @@ def register_moe_load_balancing_hook(
 
     def _iter_moe_layers(
         model_parts: list[nn.Module],
-    ) -> Iterator[tuple[nn.Module, _MoELike]]:
+    ) -> Iterator[tuple[str, nn.Module, _MoELike]]:
         for model_part in model_parts:
             layers = model_part.get_submodule("layers")
             assert isinstance(layers, nn.ModuleDict)
-            for transformer_block in layers.values():
+            for layer_name, transformer_block in layers.items():
                 if getattr(transformer_block, "moe_enabled", False):
-                    yield transformer_block, cast(_MoELike, transformer_block.moe)
+                    yield layer_name, transformer_block, cast(
+                        _MoELike, transformer_block.moe
+                    )
 
     def _should_register_moe_balancing_hook(model_parts: list[nn.Module]) -> bool:
         moe_layers = list(_iter_moe_layers(model_parts))
         if not moe_layers:
             return False
 
-        load_balance_enabled = moe_layers[0][1].load_balance_coeff is not None
-        for _transformer_block, moe in moe_layers[1:]:
+        load_balance_enabled = moe_layers[0][2].load_balance_coeff is not None
+        for _layer_name, _transformer_block, moe in moe_layers[1:]:
             if (moe.load_balance_coeff is not None) != load_balance_enabled:
                 raise ValueError(
                     "MoE load_balance_coeff must be configured consistently "
@@ -432,19 +436,26 @@ def register_moe_load_balancing_hook(
         model_parts: list[nn.Module],
         parallel_dims: ParallelDims,
     ):
+        nonlocal moe_lb_diag_step
+        moe_lb_diag_step += 1
         loss_mesh = parallel_dims.get_optional_mesh("loss")
         # TODO: Currently this sync is blocking (thus exposed) and happens on the
         # default compute stream. Need to assess if this is OK performance-wise.
         tokens_per_expert_E_list = []
-        for transformer_block, moe in _iter_moe_layers(model_parts):
+        moe_layer_names = []
+        moe_recompute_adjusted = []
+        for layer_name, transformer_block, moe in _iter_moe_layers(model_parts):
             tokens_per_expert_E = moe.tokens_per_expert_E
-            if _is_recomputation_enabled(transformer_block):
+            recompute_adjusted = _is_recomputation_enabled(transformer_block)
+            if recompute_adjusted:
                 # TODO: This is a hack, we assume with full AC, the tokens_per_expert_E is counted twice.
                 # This does not affect to expert choice, but affects the experts usage metrics.
                 # We divide by 2 to correct for this double-counting due to recomputation
                 # TODO: new API to help determine if AC is enabled https://github.com/pytorch/pytorch/pull/160888
                 tokens_per_expert_E = tokens_per_expert_E // 2
             tokens_per_expert_E_list.append(tokens_per_expert_E)
+            moe_layer_names.append(layer_name)
+            moe_recompute_adjusted.append(recompute_adjusted)
 
         if not tokens_per_expert_E_list:
             return
@@ -492,34 +503,62 @@ def register_moe_load_balancing_hook(
                     run_check=False,
                 )
 
+        if (
+            os.environ.get("GT_MOE_LB_DIAGNOSTICS", "").lower()
+            not in ("", "0", "false")
+            and (
+                not torch.distributed.is_initialized()
+                or torch.distributed.get_rank() == 0
+            )
+        ):
+            if isinstance(
+                tokens_per_expert_E_by_layer, torch.distributed.tensor.DTensor
+            ):
+                local_counts = tokens_per_expert_E_by_layer.to_local()
+            else:
+                local_counts = tokens_per_expert_E_by_layer
+            local_counts = local_counts.detach().cpu()
+            for layer_idx, layer_name in enumerate(moe_layer_names):
+                counts = local_counts[layer_idx].to(torch.float32)
+                signs = torch.sign(counts.mean() - counts)
+                logger.info(
+                    "moe_lb_diagnostics: %s",
+                    json.dumps(
+                        {
+                            "step": moe_lb_diag_step,
+                            "layer": layer_name,
+                            "recompute_adjusted": moe_recompute_adjusted[layer_idx],
+                            "mean": float(counts.mean()),
+                            "min": float(counts.min()),
+                            "max": float(counts.max()),
+                            "counts": [float(x) for x in counts.tolist()],
+                            "signs": [float(x) for x in signs.tolist()],
+                        },
+                        separators=(",", ":"),
+                    ),
+                )
+
         moe_layer_idx = 0
         with torch.no_grad():
-            for model_part in model_parts:
-                layers = model_part.get_submodule("layers")
-                assert isinstance(layers, nn.ModuleDict)
-                for transformer_block in layers.values():
-                    if not transformer_block.moe_enabled:
-                        continue
-                    moe = cast(_MoELike, transformer_block.moe)
-                    load_balance_coeff = moe.load_balance_coeff
-                    assert load_balance_coeff is not None
+            for _layer_name, _transformer_block, moe in _iter_moe_layers(model_parts):
+                load_balance_coeff = moe.load_balance_coeff
+                assert load_balance_coeff is not None
 
-                    tokens_per_expert_E = tokens_per_expert_E_by_layer[
-                        moe_layer_idx
-                    ].float()
-                    moe_layer_idx += 1
+                tokens_per_expert_E = tokens_per_expert_E_by_layer[
+                    moe_layer_idx
+                ].float()
+                moe_layer_idx += 1
 
-                    # update the expert bias
-                    # this is not exactly the same as https://arxiv.org/pdf/2408.15664 proposed
-                    expert_bias_delta_E = load_balance_coeff * torch.sign(
-                        tokens_per_expert_E.mean() - tokens_per_expert_E
-                    )
-                    expert_bias_delta_E = (
-                        expert_bias_delta_E - expert_bias_delta_E.mean()
-                    )
-                    moe.expert_bias_E.add_(expert_bias_delta_E)
-                    moe.tokens_per_expert_E.zero_()
+                # update the expert bias
+                # this is not exactly the same as https://arxiv.org/pdf/2408.15664 proposed
+                expert_bias_delta_E = load_balance_coeff * torch.sign(
+                    tokens_per_expert_E.mean() - tokens_per_expert_E
+                )
+                expert_bias_delta_E = expert_bias_delta_E - expert_bias_delta_E.mean()
+                moe.expert_bias_E.add_(expert_bias_delta_E)
+                moe.tokens_per_expert_E.zero_()
 
+    moe_lb_diag_step = 0
     if _should_register_moe_balancing_hook(model_parts):
         optimizers.register_step_pre_hook(
             lambda *args, **kwargs: _update_expert_bias(

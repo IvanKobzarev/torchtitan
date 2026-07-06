@@ -17,6 +17,7 @@ from torch.distributed.elastic.multiprocessing.errors import record
 
 from torchtitan.components.dataloader import DataloaderExhaustedError
 from torchtitan.components.loss import IGNORE_INDEX
+from torchtitan.components.metrics import format_device_memory_stats
 from torchtitan.config import TORCH_DTYPE_MAP
 from torchtitan.distributed import ParallelDims, utils as dist_utils
 from torchtitan.experiments.torchft.config.job_config import FaultTolerance
@@ -253,8 +254,7 @@ class FaultTolerantTrainer(Trainer):
         device_mem_stats = device_memory_monitor.get_peak_stats()
         logger.info(
             f"{device_type.upper()} memory usage for model: "
-            f"{device_mem_stats.max_reserved_gib:.2f}GiB"
-            f"({device_mem_stats.max_reserved_pct:.2f}%)"
+            f"{format_device_memory_stats(device_mem_stats)}"
         )
 
         # build optimizer after applying parallelisms to the model

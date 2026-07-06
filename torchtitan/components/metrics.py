@@ -29,6 +29,10 @@ DeviceMemStats = namedtuple(
         "max_active_pct",
         "max_reserved_gib",
         "max_reserved_pct",
+        "cudagraph_pool_reserved_gib",
+        "cudagraph_pool_reserved_pct",
+        "max_cudagraph_pool_reserved_gib",
+        "max_cudagraph_pool_reserved_pct",
         "num_alloc_retries",
         "num_ooms",
     ],
@@ -58,6 +62,15 @@ class DeviceMemoryMonitor:
     def _to_pct(self, memory):
         return 100 * memory / self.device_capacity
 
+    def _sum_private_pool_reserved(self, device_info, stat):
+        prefix = "reserved_bytes_by_private_pools."
+        suffix = f".all.{stat}"
+        return sum(
+            value
+            for key, value in device_info.items()
+            if key.startswith(prefix) and key.endswith(suffix)
+        )
+
     def get_peak_stats(self):
         device_info = device_module.memory_stats(self.device)
 
@@ -68,6 +81,18 @@ class DeviceMemoryMonitor:
         max_reserved = device_info.get("reserved_bytes.all.peak", -1)
         max_reserved_gib = self._to_gib(max_reserved)
         max_reserved_pct = self._to_pct(max_reserved)
+
+        cudagraph_pool_reserved = self._sum_private_pool_reserved(
+            device_info, "current"
+        )
+        cudagraph_pool_reserved_gib = self._to_gib(cudagraph_pool_reserved)
+        cudagraph_pool_reserved_pct = self._to_pct(cudagraph_pool_reserved)
+
+        max_cudagraph_pool_reserved = self._sum_private_pool_reserved(
+            device_info, "peak"
+        )
+        max_cudagraph_pool_reserved_gib = self._to_gib(max_cudagraph_pool_reserved)
+        max_cudagraph_pool_reserved_pct = self._to_pct(max_cudagraph_pool_reserved)
 
         num_retries = device_info.get("num_alloc_retries", -1)
         num_ooms = device_info.get("num_ooms", -1)
@@ -84,6 +109,10 @@ class DeviceMemoryMonitor:
             max_active_pct,
             max_reserved_gib,
             max_reserved_pct,
+            cudagraph_pool_reserved_gib,
+            cudagraph_pool_reserved_pct,
+            max_cudagraph_pool_reserved_gib,
+            max_cudagraph_pool_reserved_pct,
             num_retries,
             num_ooms,
         )
@@ -99,6 +128,18 @@ def build_device_memory_monitor():
         f"with {device_memory_monitor.device_capacity_gib:.2f}GiB memory"
     )
     return device_memory_monitor
+
+
+def format_device_memory_stats(device_mem_stats: DeviceMemStats) -> str:
+    return (
+        f"active: {device_mem_stats.max_active_gib:5.2f}GiB"
+        f"({device_mem_stats.max_active_pct:.2f}%)  "
+        f"reserved: {device_mem_stats.max_reserved_gib:5.2f}GiB"
+        f"({device_mem_stats.max_reserved_pct:.2f}%)  "
+        "cudagraph pools reserved: "
+        f"{device_mem_stats.cudagraph_pool_reserved_gib:5.2f}GiB"
+        f"({device_mem_stats.cudagraph_pool_reserved_pct:.2f}%)"
+    )
 
 
 class BaseLogger:
@@ -277,7 +318,15 @@ class MetricsProcessor(Configurable):
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
         log_freq: int = 10
-        """How often to log metrics to TensorBoard, in iterations"""
+        """How often to log train metrics, in iterations. Set <= 0 to disable."""
+
+        perf_metrics_only: bool = False
+        """
+        Whether to log only performance metrics. This skips loss and grad-norm
+        metrics so the trainer does not need device-to-host scalar syncs.
+        Performance metrics synchronize before measuring throughput and MFU so
+        clean perf reports completed device work rather than CPU enqueue time.
+        """
 
         enable_tensorboard: bool = False
         """Whether to log metrics to TensorBoard"""
@@ -360,7 +409,9 @@ class MetricsProcessor(Configurable):
         self.model_parts = None
 
     def should_log(self, step: int) -> bool:
-        return step == 1 or step % self.config.log_freq == 0
+        return self.config.log_freq > 0 and (
+            step == 1 or step % self.config.log_freq == 0
+        )
 
     def _build_metric_logger(
         self,
@@ -469,8 +520,75 @@ class MetricsProcessor(Configurable):
             extra_metrics: Optional additional metrics to log
 
         """
+        metrics, device_mem_stats, tps, tflops, mfu = self._build_perf_metrics()
+
+        metrics = {
+            "loss_metrics/global_avg_loss": global_avg_loss,
+            "loss_metrics/global_max_loss": global_max_loss,
+            "grad_norm": grad_norm,
+            **metrics,
+        }
+
+        if extra_metrics:
+            metrics.update(extra_metrics)
+
+        self.logger.log(metrics, step)
+
+        color = self.color
+        mfu_str = f"{mfu:.2f}%" if mfu is not None else "N/A"
+        logger.info(
+            f"{color.red}step: {step:2}  "
+            f"{color.green}loss: {global_avg_loss:8.5f}  "
+            f"{color.orange}grad_norm: {grad_norm:7.4f}  "
+            f"{color.turquoise}memory: {format_device_memory_stats(device_mem_stats)}  "
+            f"{color.blue}tps: {round(tps):,}  "
+            f"{color.cyan}tflops: {tflops:,.2f}  "
+            f"{color.magenta}mfu: {mfu_str}{color.reset}"
+        )
+
+        self.ntokens_since_last_log = 0
+        self.data_loading_times.clear()
+        self.time_last_log = time.perf_counter()
+        self.device_memory_monitor.reset_peak_stats()
+
+    def log_perf_only(
+        self,
+        step: int,
+        extra_metrics: dict[str, Any] | None = None,
+    ):
+        """Log throughput, MFU, timing, and memory without loss/grad scalars."""
+        metrics, device_mem_stats, tps, tflops, mfu = self._build_perf_metrics()
+
+        if extra_metrics:
+            metrics.update(extra_metrics)
+
+        self.logger.log(metrics, step)
+
+        color = self.color
+        mfu_str = f"{mfu:.2f}%" if mfu is not None else "N/A"
+        time_end_to_end = metrics["time_metrics/end_to_end(s)"]
+        logger.info(
+            f"{color.red}step: {step:2}  "
+            f"{color.turquoise}memory: {format_device_memory_stats(device_mem_stats)}  "
+            f"{color.yellow}time: {time_end_to_end:.2f}s  "
+            f"{color.blue}tps: {round(tps):,}  "
+            f"{color.cyan}tflops: {tflops:,.2f}  "
+            f"{color.magenta}mfu: {mfu_str}{color.reset}"
+        )
+
+        self.ntokens_since_last_log = 0
+        self.data_loading_times.clear()
+        self.time_last_log = time.perf_counter()
+        self.device_memory_monitor.reset_peak_stats()
+
+    def _build_perf_metrics(
+        self,
+    ) -> tuple[dict[str, Any], DeviceMemStats, float, float, float | None]:
         assert self.num_flops_per_token > 0, "num_flops_per_token must be set"
 
+        # Clean perf logs are used for step-time comparisons. Synchronize before
+        # timing so tps/MFU measure completed device work, including graph replay.
+        device_module.synchronize()
         time_delta = time.perf_counter() - self.time_last_log
 
         # tokens per second per device, abbreviated as tps
@@ -489,15 +607,17 @@ class MetricsProcessor(Configurable):
             mfu = 100 * self.num_flops_per_token * tps / self.gpu_peak_flops
 
         time_end_to_end = time_delta / self.config.log_freq
-        time_data_loading = sum(self.data_loading_times) / len(self.data_loading_times)
-        time_data_loading_pct = 100 * sum(self.data_loading_times) / time_delta
+        data_loading_total = sum(self.data_loading_times)
+        time_data_loading = (
+            data_loading_total / len(self.data_loading_times)
+            if self.data_loading_times
+            else 0.0
+        )
+        time_data_loading_pct = 100 * data_loading_total / time_delta
 
         device_mem_stats = self.device_memory_monitor.get_peak_stats()
 
         metrics = {
-            "loss_metrics/global_avg_loss": global_avg_loss,
-            "loss_metrics/global_max_loss": global_max_loss,
-            "grad_norm": grad_norm,
             "throughput(tps)": tps,
             "tflops": tflops,
             "time_metrics/end_to_end(s)": time_end_to_end,
@@ -507,34 +627,25 @@ class MetricsProcessor(Configurable):
             "memory/max_active(%)": device_mem_stats.max_active_pct,
             "memory/max_reserved(GiB)": device_mem_stats.max_reserved_gib,
             "memory/max_reserved(%)": device_mem_stats.max_reserved_pct,
+            "memory/cudagraph_pool_reserved(GiB)": (
+                device_mem_stats.cudagraph_pool_reserved_gib
+            ),
+            "memory/cudagraph_pool_reserved(%)": (
+                device_mem_stats.cudagraph_pool_reserved_pct
+            ),
+            "memory/max_cudagraph_pool_reserved(GiB)": (
+                device_mem_stats.max_cudagraph_pool_reserved_gib
+            ),
+            "memory/max_cudagraph_pool_reserved(%)": (
+                device_mem_stats.max_cudagraph_pool_reserved_pct
+            ),
             "memory/num_alloc_retries": device_mem_stats.num_alloc_retries,
             "memory/num_ooms": device_mem_stats.num_ooms,
         }
         if mfu is not None:
             metrics["mfu(%)"] = mfu
 
-        if extra_metrics:
-            metrics.update(extra_metrics)
-
-        self.logger.log(metrics, step)
-
-        color = self.color
-        mfu_str = f"{mfu:.2f}%" if mfu is not None else "N/A"
-        logger.info(
-            f"{color.red}step: {step:2}  "
-            f"{color.green}loss: {global_avg_loss:8.5f}  "
-            f"{color.orange}grad_norm: {grad_norm:7.4f}  "
-            f"{color.turquoise}memory: {device_mem_stats.max_reserved_gib:5.2f}GiB"
-            f"({device_mem_stats.max_reserved_pct:.2f}%)  "
-            f"{color.blue}tps: {round(tps):,}  "
-            f"{color.cyan}tflops: {tflops:,.2f}  "
-            f"{color.magenta}mfu: {mfu_str}{color.reset}"
-        )
-
-        self.ntokens_since_last_log = 0
-        self.data_loading_times.clear()
-        self.time_last_log = time.perf_counter()
-        self.device_memory_monitor.reset_peak_stats()
+        return metrics, device_mem_stats, tps, tflops, mfu
 
     def log_validation(
         self, loss: float, step: int, extra_metrics: dict[str, Any] | None = None
@@ -555,6 +666,18 @@ class MetricsProcessor(Configurable):
             "validation_metrics/memory/max_active(%)": device_mem_stats.max_active_pct,
             "validation_metrics/memory/max_reserved(GiB)": device_mem_stats.max_reserved_gib,
             "validation_metrics/memory/max_reserved(%)": device_mem_stats.max_reserved_pct,
+            "validation_metrics/memory/cudagraph_pool_reserved(GiB)": (
+                device_mem_stats.cudagraph_pool_reserved_gib
+            ),
+            "validation_metrics/memory/cudagraph_pool_reserved(%)": (
+                device_mem_stats.cudagraph_pool_reserved_pct
+            ),
+            "validation_metrics/memory/max_cudagraph_pool_reserved(GiB)": (
+                device_mem_stats.max_cudagraph_pool_reserved_gib
+            ),
+            "validation_metrics/memory/max_cudagraph_pool_reserved(%)": (
+                device_mem_stats.max_cudagraph_pool_reserved_pct
+            ),
         }
 
         if extra_metrics:
@@ -566,8 +689,7 @@ class MetricsProcessor(Configurable):
         logger.info(
             f"{color.yellow}validate step: {step:2}  "
             f"{color.green}loss: {loss:7.4f}  "
-            f"{color.turquoise}memory: {device_mem_stats.max_reserved_gib:5.2f}GiB"
-            f"({device_mem_stats.max_reserved_pct:.2f}%)  "
+            f"{color.turquoise}memory: {format_device_memory_stats(device_mem_stats)}  "
             f"{color.blue}tps: {round(tps):,}{color.reset}"
         )
 
