@@ -27,7 +27,7 @@ import torch
 import torch.distributed as dist
 
 from torchtitan.components.loss import ChunkedLossWrapper
-from torchtitan.config import ConfigManager, TORCH_DTYPE_MAP
+from torchtitan.config import apply_overrides, ConfigManager, TORCH_DTYPE_MAP
 from torchtitan.distributed import ParallelDims
 from torchtitan.experiments.graph_trainer.common_utils import (
     maybe_register_blockmask_pytree_node,
@@ -116,6 +116,8 @@ def _common_setup(config):
     # and training share a single implementation of build/parallelize/init.
     model_config = model_spec.model
     model_config.update_from_config(config=config)
+    if config.override.imports:
+        apply_overrides(config.override, config)
 
     logger.info(f"Building {model_spec.name} {model_spec.flavor} on meta device")
     with (

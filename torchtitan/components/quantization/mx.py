@@ -58,6 +58,10 @@ class MXFP8LinearConverter(QuantizationConverter):
         Only Linear.Config entries whose FQN contains a match are converted.
         If empty, all Linear modules are converted.
         """
+        filter_fqns: list[str] = field(default_factory=list)
+        """
+        List of fully qualified names of modules to skip applying MXFP8 quantization to.
+        """
 
     def __init__(self, config: Config):
         self.config = config
@@ -79,8 +83,11 @@ class MXFP8LinearConverter(QuantizationConverter):
     def convert(self, model_config):
         assert MXFP8Linear is not None
         fqns = self.config.fqns
+        filter_fqns = self.config.filter_fqns
         for fqn, config, parent, attr in model_config.traverse(Linear.Config):
-            if not fqns or any(target_fqn in fqn for target_fqn in fqns):
+            if (not fqns or any(target_fqn in fqn for target_fqn in fqns)) and not any(
+                filter_fqn in fqn for filter_fqn in filter_fqns
+            ):
                 new_config = MXFP8Linear.Config(
                     in_features=config.in_features,
                     out_features=config.out_features,

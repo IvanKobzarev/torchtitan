@@ -12,11 +12,14 @@ from torchtitan.components.optimizer import default_adamw
 from torchtitan.components.quantization import (
     Float8GroupedExpertsConverter,
     Float8LinearConverter,
+    MXFP8GroupedExpertsConverter,
+    MXFP8LinearConverter,
 )
 from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 from torchtitan.models.common.config_utils import decoder_vocab_size
+from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.trainer import Trainer
 
 from . import model_registry
@@ -157,24 +160,10 @@ def deepseek_v3_16b_minimal_async_ep() -> Trainer.Config:
     return config
 
 
-def deepseek_v3_671b() -> Trainer.Config:
-    compile_config = CompileConfig(enable=True, components=["loss"])
-    model_compile_enabled = (
-        compile_config.enable and "model" in compile_config.components
-    )
-    model_spec = model_registry(
-        "671B",
-        attn_backend="flex",
-        converters=[
-            Float8LinearConverter.Config(
-                filter_fqns=["output", "router.gate"],
-                model_compile_enabled=model_compile_enabled,
-            ),
-            Float8GroupedExpertsConverter.Config(
-                model_compile_enabled=model_compile_enabled
-            ),
-        ],
-    )
+def _deepseek_v3_671b_config(
+    model_spec: ModelSpec,
+    compile_config: CompileConfig,
+) -> Trainer.Config:
     return Trainer.Config(
         loss=ChunkedLossWrapper.Config(
             loss_fn=CrossEntropyLoss.Config(
@@ -205,4 +194,58 @@ def deepseek_v3_671b() -> Trainer.Config:
         checkpoint=CheckpointManager.Config(interval=500),
         activation_checkpoint=SelectiveAC.Config(),
         compile=compile_config,
+    )
+
+
+def deepseek_v3_671b() -> Trainer.Config:
+    compile_config = CompileConfig(enable=True, components=["loss"])
+    model_compile_enabled = (
+        compile_config.enable and "model" in compile_config.components
+    )
+    return _deepseek_v3_671b_config(
+        model_registry(
+            "671B",
+            attn_backend="flex",
+            converters=[
+                Float8LinearConverter.Config(
+                    filter_fqns=["output", "router.gate"],
+                    model_compile_enabled=model_compile_enabled,
+                ),
+                Float8GroupedExpertsConverter.Config(
+                    model_compile_enabled=model_compile_enabled
+                ),
+            ],
+        ),
+        compile_config,
+    )
+
+
+def deepseek_v3_671b_bf16() -> Trainer.Config:
+    return _deepseek_v3_671b_config(
+        model_registry("671B", attn_backend="flex"),
+        CompileConfig(enable=True, components=["loss"]),
+    )
+
+
+def deepseek_v3_671b_mxfp8() -> Trainer.Config:
+    compile_config = CompileConfig(enable=True, components=["loss"])
+    model_compile_enabled = (
+        compile_config.enable and "model" in compile_config.components
+    )
+    return _deepseek_v3_671b_config(
+        model_registry(
+            "671B",
+            attn_backend="flex",
+            converters=[
+                MXFP8LinearConverter.Config(
+                    filter_fqns=["output", "router.gate"],
+                    model_compile_enabled=model_compile_enabled,
+                ),
+                MXFP8GroupedExpertsConverter.Config(
+                    model_compile_enabled=model_compile_enabled,
+                    pad_multiple=128,
+                ),
+            ],
+        ),
+        compile_config,
     )
