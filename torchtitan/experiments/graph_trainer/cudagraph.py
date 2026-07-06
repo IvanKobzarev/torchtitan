@@ -588,9 +588,11 @@ def cudagraph_pass(
         )
 
     if not is_cudagraph_compatible(gm):
+        offenders = [n for n in gm.graph.nodes if not is_cudagraphable(n)]
         logger.warning(
-            "Skipping cudagraph: graph is not compatible after all preceding "
-            "passes. Use --compile.disable_passes cudagraph_pass to silence."
+            "Skipping cudagraph because graph has %d non-cudagraphable node(s): %s",
+            len(offenders),
+            [(n.name, str(n.target)) for n in offenders[:30]],
         )
         return gm
 

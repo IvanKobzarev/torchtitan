@@ -1678,6 +1678,25 @@ class TestFullMemoryPolicy(TestCase):
                 CheckpointPolicy.MUST_RECOMPUTE,
             )
 
+    def test_topk_saved_under_full_policy(self):
+        """MoE routing topk must stay saved even with full recompute.
+
+        The dispatcher saves data-dependent split SymInts. Recomputing topk can
+        produce different tie-breaking in backward, making recomputed token
+        counts inconsistent with the saved split sizes.
+        """
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        topk = graph.call_function(torch.ops.aten.topk.default, args=(x, 2))
+        getitem = graph.call_function(operator.getitem, args=(topk, 1))
+        graph.output(getitem)
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+        tag_sac_policy(gm, policy_fn=_make_full_memory_policy())
+
+        self.assertEqual(topk.meta["recompute"], CheckpointPolicy.MUST_SAVE)
+        self.assertEqual(getitem.meta["recompute"], CheckpointPolicy.MUST_SAVE)
+
     def test_rng_ops_saved(self):
         """RNG ops (nondeterministic_seeded) are saved: the remat pass cannot
         replay their random state, unlike eager AC's preserve_rng_state."""

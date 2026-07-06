@@ -373,6 +373,25 @@ class TestCudagraphPass(unittest.TestCase):
             self.assertIs(result, gm)
             self.assertIs(gm.forward, mock_instance)
 
+    def test_graphmodule_skips_non_cudagraphable_node(self):
+        """cudagraph_pass leaves unsafe graphs unwrapped."""
+        from torchtitan.experiments.graph_trainer.passes import cudagraph_pass
+
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        item = graph.call_function(torch.ops.aten._local_scalar_dense.default, (x,))
+        item.meta["val"] = 0
+        graph.output(item)
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+        with patch(
+            "torchtitan.experiments.graph_trainer.cudagraph.CUDAGraphWrapper"
+        ) as MockWrapper:
+            result = cudagraph_pass(gm, (torch.ones(()),), static_input_indices=[])
+
+            self.assertIs(result, gm)
+            MockWrapper.assert_not_called()
+
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
     def test_minimal_async_ep_custom_ops_are_wrapped_by_cudagraph_pass(self):
         """MinimalAsyncEP custom ops should not force cudagraph_pass fallback."""

@@ -25,6 +25,8 @@ in order, and the pass registries.  Individual passes live in dedicated modules:
 from __future__ import annotations
 
 import functools
+import os
+from pathlib import Path
 import time
 import warnings
 from collections.abc import Callable
@@ -75,6 +77,7 @@ from torchtitan.experiments.graph_trainer.inductor_passes import (
     annotate_flex_attention_for_regional_inductor_pass,
     full_inductor_compilation_pass,
     regional_inductor_pass,
+    serialize_loss_chunks_pass,
 )
 from torchtitan.experiments.graph_trainer.make_fx_tracer import TracedResult
 from torchtitan.experiments.graph_trainer.memory_policy import (
@@ -368,6 +371,14 @@ def final_inductor_compile_passes(
     passes: list[Callable] = []
     inductor_compilation = compile_config.inductor_compilation
     if inductor_compilation == "full":
+        # Serialize the ChunkedCELoss chunks before full inductor: without this,
+        # Inductor batches all num_chunks lm_head matmuls so every chunk's
+        # [tokens, vocab] logits (and grad-logits) are live at once, defeating
+        # the chunking and OOM-ing DSv3-16B at B=16 (see
+        # dsv3_scaling_experiment_results.md Run 11). Must run before
+        # full_inductor_compilation_pass tags the graph. Disable with
+        # --compile.disable_passes serialize_loss_chunks_pass.
+        passes.append(serialize_loss_chunks_pass)
         # Compile the entire graph into optimized Triton kernels. Must be
         # terminal; the FX graph is no longer authoritative after this pass.
         passes.append(
@@ -529,4 +540,17 @@ def apply_graph_passes(
             log_graph_diff(before_snapshot, after_snapshot, pass_name)
     all_passes_elapsed = time.perf_counter() - all_passes_start
     logger.info(f"All {len(passes)} graph passes took {all_passes_elapsed:.3f}s")
+    if dump_dir := os.environ.get("GT_DEBUG_DUMP_GRAPH_DIR"):
+        rank = os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0"))
+        dump_path = Path(dump_dir) / f"after_graph_passes_rank{rank}.txt"
+        dump_path.parent.mkdir(parents=True, exist_ok=True)
+        dump_path.write_text(
+            gm.print_readable(
+                print_output=False,
+                include_stride=True,
+                include_device=True,
+                expanded_def=True,
+            )
+        )
+        logger.info("Dumped final graph to %s", dump_path)
     return gm
