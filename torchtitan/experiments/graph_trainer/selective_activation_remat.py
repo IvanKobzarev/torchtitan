@@ -10,6 +10,10 @@ import logging
 from typing import Any
 
 import torch
+
+# Import upstream custom ops for async activation offloading.
+# Registering the torch.ops.ao operators is a side effect of importing the module.
+import torch._functorch._activation_offloading.offload_ops  # noqa: F401
 import torch.fx as fx
 from torch._functorch.compile_utils import raise_getitems
 from torch._functorch.partitioners import (
@@ -193,33 +197,35 @@ def selective_activation_remat_pass(
     # ao.reload -> ao.wait_tensor). Used to redirect a recompute dup that
     # consumes an offloaded fwd to read from the bwd-region GPU value.
     offloaded_fwd_to_bwd_wait: dict[fx.Node, fx.Node] = {}
-    for node in gm.graph.find_nodes(
-        op="call_function", target=torch.ops.ao.offload.default
+    offload_target = torch.ops.ao.offload.default
+    reload_target = torch.ops.ao.reload.default
+    wait_target = torch.ops.ao.wait_tensor.default
+    if (
+        offload_target is not None
+        and reload_target is not None
+        and wait_target is not None
     ):
-        offloaded_fwd = node.args[0]
-        fwd_wait = next(
-            (u for u in node.users if u.target is torch.ops.ao.wait_tensor.default),
-            None,
-        )
-        if fwd_wait is None:
-            continue
-        reload_op = next(
-            (u for u in fwd_wait.users if u.target is torch.ops.ao.reload.default),
-            None,
-        )
-        if reload_op is None:
-            continue
-        bwd_wait = next(
-            (
-                u
-                for u in reload_op.users
-                if u.target is torch.ops.ao.wait_tensor.default
-            ),
-            None,
-        )
-        if bwd_wait is None:
-            continue
-        offloaded_fwd_to_bwd_wait[offloaded_fwd] = bwd_wait
+        for node in gm.graph.find_nodes(op="call_function", target=offload_target):
+            offloaded_fwd = node.args[0]
+            fwd_wait = next(
+                (u for u in node.users if u.target is wait_target),
+                None,
+            )
+            if fwd_wait is None:
+                continue
+            reload_op = next(
+                (u for u in fwd_wait.users if u.target is reload_target),
+                None,
+            )
+            if reload_op is None:
+                continue
+            bwd_wait = next(
+                (u for u in reload_op.users if u.target is wait_target),
+                None,
+            )
+            if bwd_wait is None:
+                continue
+            offloaded_fwd_to_bwd_wait[offloaded_fwd] = bwd_wait
 
     def ensure_offload_chain_before(reload_node: fx.Node, target: fx.Node) -> None:
         """Move ``reload_node`` and its bwd-region deps in front of ``target``.

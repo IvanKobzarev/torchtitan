@@ -53,12 +53,14 @@ from torchtitan.experiments.graph_trainer.common_utils import (
     is_fsdp_unshard_all_gather,
 )
 from torchtitan.experiments.graph_trainer.fsdp_patterns import find_fsdp_unshard_outputs
+from torchtitan.experiments.graph_trainer.subgraph_regions import (
+    SUBGRAPH_REGION,
+    SUBGRAPH_REGION_ROLE,
+)
 from torchtitan.tools.logging import logger
 
 
 _FSDP_BUCKET_META = "fsdp_bucket"
-_FSDP_UNSHARD_REGION_META = "graph_trainer_subgraph_region"
-_FSDP_UNSHARD_ROLE_META = "graph_trainer_subgraph_region_role"
 _RESHARD_RECOMPUTE = {
     CheckpointPolicy.PREFER_RECOMPUTE,
     CheckpointPolicy.MUST_RECOMPUTE,
@@ -234,13 +236,7 @@ def extract_common_fsdp_unshards_pass(
     chain_targets=_FSDP_UNSHARD_CHAIN_TARGETS,
     is_unshard_anchor=is_fsdp_unshard_all_gather,
 ):
-    """Share identical forward FSDP unshard chains across same-role regions.
-
-    The pass expects candidate nodes to carry ``custom`` metadata with
-    ``_FSDP_UNSHARD_REGION_META`` and ``_FSDP_UNSHARD_ROLE_META`` keys. Regions
-    identify repeated graph sections, while roles identify sections that may
-    share an equivalent unshard chain.
-    """
+    """Share identical forward FSDP unshard chains across same-role regions."""
     for module in list(gm.modules()):
         if not isinstance(module, torch.fx.GraphModule):
             continue
@@ -259,17 +255,17 @@ def _custom(node):
 
 
 def _region(node):
-    return _custom(node).get(_FSDP_UNSHARD_REGION_META)
+    return _custom(node).get(SUBGRAPH_REGION)
 
 
 def _role(node):
-    return _custom(node).get(_FSDP_UNSHARD_ROLE_META)
+    return _custom(node).get(SUBGRAPH_REGION_ROLE)
 
 
 def _drop_region_meta(node):
     custom = dict(_custom(node))
-    custom.pop(_FSDP_UNSHARD_REGION_META, None)
-    custom.pop(_FSDP_UNSHARD_ROLE_META, None)
+    custom.pop(SUBGRAPH_REGION, None)
+    custom.pop(SUBGRAPH_REGION_ROLE, None)
     if custom:
         node.meta["custom"] = custom
     else:

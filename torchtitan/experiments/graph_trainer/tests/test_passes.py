@@ -77,8 +77,6 @@ from torchtitan.experiments.graph_trainer.ep_process_group_pass import (
 )
 from torchtitan.experiments.graph_trainer.fsdp_passes import (
     _FSDP_BUCKET_META,
-    _FSDP_UNSHARD_REGION_META,
-    _FSDP_UNSHARD_ROLE_META,
     deduplicate_fsdp_unshard_chains_pass,
     extract_common_fsdp_unshards_pass,
     fsdp_reshard_after_forward_pass,
@@ -111,6 +109,10 @@ from torchtitan.experiments.graph_trainer.remove_noop_passes import (
     remove_identity_view_pass,
 )
 from torchtitan.experiments.graph_trainer.simple_fsdp import data_parallel
+from torchtitan.experiments.graph_trainer.subgraph_regions import (
+    SUBGRAPH_REGION,
+    SUBGRAPH_REGION_ROLE,
+)
 from torchtitan.experiments.graph_trainer.tests.test_cpu_offload import (  # noqa: F401
     TestCpuOffloadPass,
 )
@@ -260,7 +262,7 @@ class TestFSDPReshardAfterForwardPass(TestCase):
             c10d.all_gather_into_tensor.default, args=(ag_input, 2, "pg")
         )
         if subgraph_region:
-            ag.meta["custom"] = {_FSDP_UNSHARD_REGION_META: "loss_head_chunk"}
+            ag.meta["custom"] = {SUBGRAPH_REGION: "loss_head_chunk"}
         wait = graph.call_function(c10d.wait_tensor.default, args=(ag,))
         view = graph.call_function(aten.view.default, args=(wait, [4, 4]))
         embedding = graph.call_function(aten.embedding.default, args=(view, indices))
@@ -304,7 +306,7 @@ class TestFSDPReshardAfterForwardPass(TestCase):
         gm, nodes = self._make_graph(subgraph_region=True)
         fsdp_reshard_after_forward_pass(
             gm,
-            skip_node_fn=lambda node: _FSDP_UNSHARD_REGION_META
+            skip_node_fn=lambda node: SUBGRAPH_REGION
             in (node.meta.get("custom") or {}),
         )
         self.assertNotIn("recompute", nodes["ag"].meta)
@@ -388,8 +390,8 @@ class TestExtractCommonFSDPUnshardsPass(TestCase):
 
         def mark(node, region):
             node.meta["custom"] = {
-                _FSDP_UNSHARD_REGION_META: region,
-                _FSDP_UNSHARD_ROLE_META: "loss_head",
+                SUBGRAPH_REGION: region,
+                SUBGRAPH_REGION_ROLE: "loss_head",
             }
             return node
 
@@ -446,8 +448,8 @@ class TestExtractCommonFSDPUnshardsPass(TestCase):
             nodes = self._nodes_with_target(gm, target)
             self.assertEqual(len(nodes), 1)
             self.assertEqual(nodes[0].meta["recompute"], CheckpointPolicy.MUST_SAVE)
-            self.assertNotIn(_FSDP_UNSHARD_REGION_META, nodes[0].meta.get("custom", {}))
-            self.assertNotIn(_FSDP_UNSHARD_ROLE_META, nodes[0].meta.get("custom", {}))
+            self.assertNotIn(SUBGRAPH_REGION, nodes[0].meta.get("custom", {}))
+            self.assertNotIn(SUBGRAPH_REGION_ROLE, nodes[0].meta.get("custom", {}))
 
     def test_default_anchor_ignores_non_fsdp_all_gather(self):
         gm = self._make_graph(fsdp_all_gather=False)
