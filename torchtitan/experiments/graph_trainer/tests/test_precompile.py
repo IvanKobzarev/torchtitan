@@ -127,6 +127,30 @@ def _make_stub_model(params=None, buffers=None):
 
 
 class TestPrecompileMain(unittest.TestCase):
+    def test_decoder_trace_kwargs_skip_delta_attention_layers(self):
+        from torchtitan.experiments.graph_trainer.kimi_k3 import model_registry
+        from torchtitan.experiments.graph_trainer.precompile_main import (
+            _decoder_trace_kwargs,
+        )
+
+        model_config = model_registry("16B").model
+        self.assertIsNone(model_config.layers[0].attention)
+        model = MagicMock()
+        attention_mask = object()
+        model.get_attention_masks.return_value = attention_mask
+
+        kwargs = _decoder_trace_kwargs(
+            model,
+            model_config,
+            num_tokens=16,
+            max_context_length=8,
+            device=torch.device("cpu"),
+        )
+
+        expected_positions = torch.arange(16, dtype=torch.int32) % 8
+        self.assertEqual(kwargs["positions"].tolist(), expected_positions.tolist())
+        self.assertIs(kwargs["attention_masks"], attention_mask)
+
     def test_validates_memory_policy_after_model_setup(self):
         from torchtitan.experiments.graph_trainer import precompile_main
 

@@ -68,6 +68,7 @@ from torchtitan.experiments.graph_trainer.fsdp_passes import (
     get_fsdp_param_module_order,
     get_transformer_block_bucket_counts,
     joint_transformer_block_bucketing_reordering_pass,
+    materialize_fsdp_bucket_outputs_pass,
     reassign_collective_pgs_pass,
     schedule_fsdp_comms_to_dense_regions_pass,
 )
@@ -284,6 +285,13 @@ def compile_time_passes(
             ),
         )
     )
+    if config.compile.fsdp_contiguous_module_fqns:
+        passes.append(
+            functools.partial(
+                materialize_fsdp_bucket_outputs_pass,
+                module_fqn_patterns=tuple(config.compile.fsdp_contiguous_module_fqns),
+            )
+        )
 
     if ep_overlap_enabled:
         assert ep_overlap_module_fqn is not None
@@ -442,6 +450,11 @@ def construct_default_graph_passes(
     transformed during precompile phase, so only cudagraph is returned.
     """
     want_cudagraph = "cudagraph_pass" not in config.compile.disable_passes
+    if config.compile.require_cudagraph and not want_cudagraph:
+        raise ValueError(
+            "compile.require_cudagraph cannot be combined with disabling "
+            "cudagraph_pass"
+        )
 
     has_precompile_artifact = bool(config.compile.precompile_artifact_dir)
 
@@ -463,6 +476,7 @@ def construct_default_graph_passes(
                 cudagraph_pass,
                 static_input_indices=static_input_indices,
                 tensor_input_indices=traced_result.tensor_input_indices,
+                require=config.compile.require_cudagraph,
             )
         )
     return passes
