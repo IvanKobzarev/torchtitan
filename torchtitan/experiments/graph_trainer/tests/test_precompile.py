@@ -85,6 +85,11 @@ class _StubCompileConfig:
     passes: list = field(default_factory=list)
     memory_policy: str = "default"
     full_recompute_save_ops: str = ""
+    enable_coda: bool = False
+    coda_patterns: list[str] = field(default_factory=list)
+    compile_time_benchmark: bool | None = None
+    coda_benchmark_strict: bool = False
+    coda_autotune: bool | None = None
     ep_overlap: EpOverlapConfig = field(default_factory=EpOverlapConfig)
 
 
@@ -243,6 +248,16 @@ class TestConfigFingerprint(unittest.TestCase):
         fp_a = compute_config_fingerprint(_make_stub_model(), cfg_a, dims)
         fp_b = compute_config_fingerprint(_make_stub_model(), cfg_b, dims)
         self.assertNotEqual(fp_a, fp_b)
+
+        cfg_without_coda = _StubCompileConfig(enable_coda=False)
+        cfg_with_coda = _StubCompileConfig(enable_coda=True)
+        fp_without_coda = compute_config_fingerprint(
+            _make_stub_model(), cfg_without_coda, dims
+        )
+        fp_with_coda = compute_config_fingerprint(
+            _make_stub_model(), cfg_with_coda, dims
+        )
+        self.assertNotEqual(fp_without_coda, fp_with_coda)
 
         cfg_graph_batch = _StubCompileConfig(ep_overlap=EpOverlapConfig(enabled=True))
         cfg_graph_seq = _StubCompileConfig(

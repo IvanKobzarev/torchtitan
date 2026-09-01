@@ -3526,6 +3526,35 @@ class TestChunkPasses(TestCase):
             names.index("full_inductor_compilation_pass"),
         )
 
+    def test_coda_pass_pipeline_gating_and_order(self):
+        traced_result, config = self._compile_config_for_ep_overlap_test()
+        config.compile.enable_coda = True
+        config.compile.coda_patterns = ["B_linear_dw_bf16_to_fp32"]
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "--compile.enable_coda requires --compile.numerics_changing_optim",
+        ):
+            self._compile_pass_names(traced_result, config)
+
+        config.compile.numerics_changing_optim = True
+        names = self._compile_pass_names(traced_result, config)
+        self.assertLess(
+            names.index("B_linear_dw_bf16_to_fp32"),
+            names.index("full_inductor_compilation_pass"),
+        )
+
+        config.compile.inductor_compilation = "regional"
+        names = self._compile_pass_names(traced_result, config)
+        self.assertLess(
+            names.index("concretize_ep_chunk_symbolic_shapes_pass"),
+            names.index("B_linear_dw_bf16_to_fp32"),
+        )
+        self.assertLess(
+            names.index("B_linear_dw_bf16_to_fp32"),
+            names.index("regional_inductor_pass"),
+        )
+
     def test_graph_ep_chunking_rejects_tensor_parallel(self):
         cases = (
             ("seq", "layers.*.moe"),
