@@ -32,6 +32,7 @@ from torchtitan.experiments.graph_trainer.common_utils import (
     _is_backward_node,
     _MODULE_FQN,
     _NOT_IN_LAYERS,
+    _RECOMPUTE_MUTATIONS,
     matches_module_fqn_pattern,
 )
 from torchtitan.experiments.graph_trainer.cpu_offload import (
@@ -47,7 +48,7 @@ from torchtitan.experiments.graph_trainer.registry import (
     MEMORY_POLICY_REGISTRY,
     register_memory_policy,
 )
-from torchtitan.tools.logging import logger
+from torchtitan.tools.logging import logger, warn_once
 
 if TYPE_CHECKING:
     from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConfig
@@ -62,6 +63,19 @@ def _make_default_memory_policy(save_ops: set | None = None) -> Callable:
         if node.target in save_ops:
             return CheckpointPolicy.MUST_SAVE
         return CheckpointPolicy.PREFER_RECOMPUTE
+
+    return policy_fn
+
+
+def _make_no_ac_memory_policy() -> Callable:
+    """Create a policy that saves every forward activation.
+
+    Returns:
+        Policy function that disables activation rematerialization.
+    """
+
+    def policy_fn(node: torch.fx.Node) -> CheckpointPolicy:
+        return CheckpointPolicy.MUST_SAVE
 
     return policy_fn
 
@@ -256,8 +270,31 @@ def _storage_roots(node: torch.fx.Node) -> set[torch.fx.Node]:
     return roots
 
 
-def _force_save_mutated_storage_roots(gm: torch.fx.GraphModule) -> int:
-    roots: set[torch.fx.Node] = set()
+_MM_OPS = frozenset(
+    {
+        torch.ops.aten.mm.default,
+        torch.ops.aten.linear.default,
+        torch.ops.aten._scaled_mm.default,
+    }
+)
+
+
+def _matches_forced_recompute_mm(
+    node: torch.fx.Node,
+    module_fqns: tuple[str, ...],
+) -> bool:
+    """Return whether an MM node matches an explicit recompute module FQN."""
+    if node.target not in _MM_OPS:
+        return False
+    fqn = node.meta.get("custom", {}).get(_MODULE_FQN, "")
+    return any(pattern in fqn for pattern in module_fqns)
+
+
+def _force_save_mutated_storage_roots(
+    gm: torch.fx.GraphModule,
+    force_recompute_mm_fqns: tuple[str, ...],
+) -> tuple[int, int]:
+    root_mutations: dict[torch.fx.Node, list[torch.fx.Node]] = defaultdict(list)
     for node in gm.graph.nodes:
         if node.op != "call_function" or _is_backward_node(node):
             continue
@@ -269,17 +306,38 @@ def _force_save_mutated_storage_roots(gm: torch.fx.GraphModule) -> int:
                 continue
             value = _node_argument(node, index, argument.name)
             if isinstance(value, torch.fx.Node):
-                roots.update(_storage_roots(value))
+                for root in _storage_roots(value):
+                    root_mutations[root].append(node)
 
     num_forced = 0
-    for root in roots:
-        if root.meta.get("recompute") in (
+    num_replayed = 0
+    for root, mutations in root_mutations.items():
+        if root.meta.get("recompute") not in (
             CheckpointPolicy.PREFER_RECOMPUTE,
             CheckpointPolicy.MUST_RECOMPUTE,
         ):
-            root.meta["recompute"] = CheckpointPolicy.MUST_SAVE
-            num_forced += 1
-    return num_forced
+            continue
+        if _matches_forced_recompute_mm(root, force_recompute_mm_fqns):
+            non_recomputable = [
+                node.name
+                for node in mutations
+                if node.meta.get("recompute")
+                not in (
+                    CheckpointPolicy.PREFER_RECOMPUTE,
+                    CheckpointPolicy.MUST_RECOMPUTE,
+                )
+            ]
+            if non_recomputable:
+                raise RuntimeError(
+                    f"Cannot replay mutations of forced-recompute MM {root.name}: "
+                    f"non-recomputable writes {non_recomputable}"
+                )
+            root.meta[_RECOMPUTE_MUTATIONS] = tuple(mutations)
+            num_replayed += 1
+            continue
+        root.meta["recompute"] = CheckpointPolicy.MUST_SAVE
+        num_forced += 1
+    return num_forced, num_replayed
 
 
 def tag_sac_policy(
@@ -288,6 +346,7 @@ def tag_sac_policy(
     *,
     policy_fn: Callable[[torch.fx.Node], CheckpointPolicy] | None = None,
     force_save_nodes: set[torch.fx.Node] | None = None,
+    force_recompute_mm_fqns: tuple[str, ...] = (),
 ) -> torch.fx.GraphModule:
     """Apply selective activation checkpointing on the joint graph.
 
@@ -297,7 +356,9 @@ def tag_sac_policy(
     boundary (layer N → layer N+1), since recomputing them would require
     rerunning the entire preceding layer.
 
-    ``getitem`` / ``wait_tensor`` nodes inherit the parent's tag.
+    Effectful nodes and storage roots mutated through aliases are saved unless
+    an explicit MM recompute contract also replays their writes. ``getitem`` /
+    ``wait_tensor`` nodes inherit the parent's tag.
 
     The model must have been annotated with ``annotate_module_fqns`` before
     tracing so that nodes carry ``module_fqn`` metadata.
@@ -309,6 +370,8 @@ def tag_sac_policy(
         force_save_nodes: Nodes that must be saved independent of ``policy_fn``.
             Used for graph-structure constraints such as FSDP unshards with
             ``reshard_after_forward=False``.
+        force_recompute_mm_fqns: Module FQN substrings whose MM outputs and
+            replay-safe in-place consumers must be rematerialized.
 
     Returns:
         The annotated graph module
@@ -343,6 +406,16 @@ def tag_sac_policy(
             node.meta["recompute"] = CheckpointPolicy.MUST_SAVE
             continue
 
+        if _matches_forced_recompute_mm(node, force_recompute_mm_fqns):
+            node.meta["recompute"] = CheckpointPolicy.MUST_RECOMPUTE
+            continue
+
+        # Replaying an effectful op during backward would apply its external
+        # state transition twice instead of rematerializing a pure value.
+        if has_effects(node.target):
+            node.meta["recompute"] = CheckpointPolicy.MUST_SAVE
+            continue
+
         if node.target in (
             operator.getitem,
             torch.ops._c10d_functional.wait_tensor.default,
@@ -369,7 +442,9 @@ def tag_sac_policy(
         # because the alternating heuristic is arbitrary.
         node.meta["recompute"] = policy_fn(node)
 
-    mutated_storage_saves = _force_save_mutated_storage_roots(gm)
+    mutated_storage_saves, replayed_mutated_storage = _force_save_mutated_storage_roots(
+        gm, force_recompute_mm_fqns
+    )
 
     # Pass 2: Force MUST_SAVE at layer boundaries. If a recomputable node
     # feeds into a node in a higher layer, saving it is cheaper than
@@ -422,6 +497,11 @@ def tag_sac_policy(
         logger.info(
             f"  Forced {mutated_storage_saves} mutated storage roots to MUST_SAVE"
         )
+    if replayed_mutated_storage:
+        logger.info(
+            f"  Replaying {replayed_mutated_storage} explicitly forced "
+            "mutated MM storage roots"
+        )
     if boundary_saves:
         logger.info(f"  Forced {boundary_saves} nodes to MUST_SAVE at layer boundaries")
     for layer_id in sorted(layer_stats):
@@ -432,6 +512,47 @@ def tag_sac_policy(
             f"{stats['save']} MUST_SAVE, "
             f"{stats['recompute']} RECOMPUTE"
         )
+    return gm
+
+
+def _force_recompute_mm_fqns(config: "GraphTrainer.Config") -> tuple[str, ...]:
+    """Return explicit MM recompute FQNs from the activation policy.
+
+    Args:
+        config: GraphTrainer configuration owning the activation policy.
+
+    Returns:
+        Module FQN substrings whose MM outputs must be recomputed.
+    """
+    return tuple(config.compile.force_recompute_mm_shapes_by_fqns)
+
+
+@register_memory_policy("none")
+def _no_ac_memory_policy_pass(
+    gm: torch.fx.GraphModule,
+    *,
+    config: "GraphTrainer.Config",
+) -> torch.fx.GraphModule:
+    """Save every forward activation without rematerialization.
+
+    Args:
+        gm: Joint forward-backward graph module.
+        config: GraphTrainer configuration carrying explicit MM overrides.
+
+    Returns:
+        Graph module with all eligible forward nodes marked ``MUST_SAVE``.
+    """
+    force_recompute_mm_fqns = _force_recompute_mm_fqns(config)
+    if force_recompute_mm_fqns:
+        warn_once(
+            logger,
+            "Ignoring compile.force_recompute_mm_shapes_by_fqns because "
+            "compile.memory_policy='none' disables rematerialization.",
+        )
+    tag_sac_policy(
+        gm,
+        policy_fn=_make_no_ac_memory_policy(),
+    )
     return gm
 
 
@@ -453,6 +574,7 @@ def _default_memory_policy_pass(
         gm,
         policy_fn=_make_default_memory_policy(),
         force_save_nodes=force_save_nodes,
+        force_recompute_mm_fqns=_force_recompute_mm_fqns(config),
     )
     return gm
 
@@ -467,6 +589,7 @@ def _full_memory_policy_pass(
     tag_sac_policy(
         gm,
         policy_fn=_make_full_memory_policy(config.compile.full_recompute_save_ops),
+        force_recompute_mm_fqns=_force_recompute_mm_fqns(config),
     )
     return gm
 
@@ -478,7 +601,11 @@ def _eager_memory_policy_pass(
     config: "GraphTrainer.Config",
 ) -> torch.fx.GraphModule:
     """SAC policy that alternates mm ops between save/recompute."""
-    tag_sac_policy(gm, policy_fn=_make_eager_memory_policy())
+    tag_sac_policy(
+        gm,
+        policy_fn=_make_eager_memory_policy(),
+        force_recompute_mm_fqns=_force_recompute_mm_fqns(config),
+    )
     return gm
 
 

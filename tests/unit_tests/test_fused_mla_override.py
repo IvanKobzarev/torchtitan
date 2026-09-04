@@ -21,10 +21,33 @@ from torchtitan.models.common.attention import FlexAttention
 from torchtitan.models.common.rope import ComplexRoPE
 from torchtitan.models.deepseek_v3.config_registry import deepseek_v3_debugmodel
 from torchtitan.models.deepseek_v3.model import Attention, DeepSeekV3Model
-from torchtitan.overrides.fused_mla import fused_mla_kv, fused_mla_q, FusedMLAAttention
+from torchtitan.overrides.fused_mla import (
+    fused_mla_kv,
+    fused_mla_q,
+    FusedMLAAttention,
+    FusedMLAKernelConfig,
+)
 
 
 class TestFusedMLAOverrideConfig(unittest.TestCase):
+    def test_kernel_config_defaults_and_validation(self):
+        tuning = FusedMLAKernelConfig()
+        self.assertEqual(
+            (
+                tuning.q_block_h,
+                tuning.q_num_warps,
+                tuning.k_block_h,
+                tuning.k_num_warps,
+                tuning.kv_backward_block_h,
+                tuning.kv_backward_num_warps,
+            ),
+            (64, 4, 16, 4, 64, 4),
+        )
+        with self.assertRaisesRegex(ValueError, "positive power of two"):
+            FusedMLAKernelConfig(q_block_h=48)
+        with self.assertRaisesRegex(ValueError, "must be one of"):
+            FusedMLAKernelConfig(k_num_warps=3)
+
     def test_override_replaces_all_debug_attention_configs(self):
         config = deepseek_v3_debugmodel()
         model_spec = config.model_spec
@@ -58,7 +81,8 @@ class TestFusedMLAOverrideConfig(unittest.TestCase):
 
 @unittest.skipUnless(torch.cuda.is_available(), "Fused MLA requires CUDA")
 class TestFusedMLANumerics(unittest.TestCase):
-    num_tokens = 32
+    batch = 2
+    seq_len = 16
     n_heads = 128
     q_nope_dim = 128
     rope_dim = 64
@@ -72,7 +96,7 @@ class TestFusedMLANumerics(unittest.TestCase):
         cuda = torch.device("cuda")
         self.rope = ComplexRoPE.Config(
             dim=self.rope_dim,
-            max_context_length=128,
+            max_seq_len=128,
             scaling="yarn",
             rope_factor=40.0,
             beta_fast=32.0,
@@ -80,7 +104,17 @@ class TestFusedMLANumerics(unittest.TestCase):
             original_seq_len=4096,
         ).build()
         self.rope = self.rope.to(cuda)
-        self.positions = torch.arange(self.num_tokens, device=cuda)
+        self.positions = torch.stack(
+            [
+                torch.arange(self.seq_len, device=cuda),
+                torch.arange(
+                    self.seq_len - 1,
+                    -1,
+                    -1,
+                    device=cuda,
+                ),
+            ]
+        )
 
     def tearDown(self):
         FlexAttention.inductor_configs.clear()
@@ -116,23 +150,23 @@ class TestFusedMLANumerics(unittest.TestCase):
         )
 
     @parametrize("dtype", [torch.bfloat16, torch.float32])
-    def test_q_forward_backward_and_storage_match_eager(self, dtype: torch.dtype):
-        self._check_q_forward_backward_and_storage(dtype)
+    def test_q_forward_backward_out_of_place_matches_eager(self, dtype: torch.dtype):
+        self._check_q_forward_backward_out_of_place(dtype)
 
-    def _check_q_forward_backward_and_storage(self, dtype: torch.dtype) -> None:
+    def _check_q_forward_backward_out_of_place(self, dtype: torch.dtype) -> None:
         torch.manual_seed(42)
         q_source = torch.randn(
-            1,
-            self.num_tokens,
+            self.batch,
+            self.seq_len,
             self.n_heads,
             self.q_nope_dim + self.rope_dim,
             device=self.positions.device,
             dtype=dtype,
             requires_grad=True,
         )
-        q_storage = q_source.clone()
+        q_input = q_source.clone()
         fused_q = fused_mla_q(
-            q_storage,
+            q_input,
             self.rope.cache,
             self.positions,
             self.q_nope_dim,
@@ -144,7 +178,7 @@ class TestFusedMLANumerics(unittest.TestCase):
             [self.q_nope_dim, self.rope_dim],
             dim=-1,
         )
-        cache = self.rope.cache[self.positions].unsqueeze(0).unsqueeze(2)
+        cache = self.rope._reshape_cache(q_pos, self.positions)
         q_pos, _ = self.rope.apply_rotary_emb(
             q_pos,
             q_pos[:, :, :1],
@@ -152,7 +186,11 @@ class TestFusedMLANumerics(unittest.TestCase):
         )
         reference_q = torch.cat([q_nope, q_pos], dim=-1)
 
-        self.assertEqual(fused_q.data_ptr(), q_storage.data_ptr())
+        # The rotation is out of place, so the projection output keeps its own
+        # allocation and its pre-rotation values. Mutating it would need
+        # ctx.mark_dirty and cost a CopySlices copy in the backward pass.
+        self.assertNotEqual(fused_q.data_ptr(), q_input.data_ptr())
+        self.assert_dtype_close(q_input, q_source, dtype, exact=True)
         self.assert_dtype_close(
             fused_q[..., : self.q_nope_dim],
             reference_q[..., : self.q_nope_dim],
@@ -177,10 +215,43 @@ class TestFusedMLANumerics(unittest.TestCase):
         self.assert_dtype_close(fused_grad, reference_grad, dtype)
 
     @parametrize("dtype", [torch.bfloat16, torch.float32])
+    def test_q_backward_preserves_shared_grad_output(self, dtype: torch.dtype) -> None:
+        q = torch.randn(
+            self.batch,
+            self.seq_len,
+            self.n_heads,
+            self.q_nope_dim + self.rope_dim,
+            device=self.positions.device,
+            dtype=dtype,
+            requires_grad=True,
+        )
+        sibling = torch.randn_like(q, requires_grad=True)
+        output = (
+            fused_mla_q(
+                q,
+                self.rope.cache,
+                self.positions,
+                self.q_nope_dim,
+            )
+            + sibling
+        )
+        grad_output = torch.randn_like(output)
+        expected_grad = grad_output.clone()
+
+        _, sibling_grad = torch.autograd.grad(
+            output,
+            (q, sibling),
+            grad_output,
+        )
+
+        self.assert_dtype_close(grad_output, expected_grad, dtype, exact=True)
+        self.assert_dtype_close(sibling_grad, expected_grad, dtype, exact=True)
+
+    @parametrize("dtype", [torch.bfloat16, torch.float32])
     def test_q_sum_backward_matches_eager(self, dtype: torch.dtype):
         q_source = torch.randn(
-            1,
-            self.num_tokens,
+            self.batch,
+            self.seq_len,
             self.n_heads,
             self.q_nope_dim + self.rope_dim,
             device=self.positions.device,
@@ -200,7 +271,7 @@ class TestFusedMLANumerics(unittest.TestCase):
             [self.q_nope_dim, self.rope_dim],
             dim=-1,
         )
-        cache = self.rope.cache[self.positions].unsqueeze(0).unsqueeze(2)
+        cache = self.rope._reshape_cache(q_pos, self.positions)
         q_pos, _ = self.rope.apply_rotary_emb(
             q_pos,
             q_pos[:, :, :1],
@@ -215,6 +286,116 @@ class TestFusedMLANumerics(unittest.TestCase):
         )
         self.assert_dtype_close(fused_grad, reference_grad, dtype)
 
+    def test_flat_q_custom_projection_output_matches_eager(self):
+        """Fusing before the head view preserves custom projection autograd.
+
+        This is the shape production runs: ``Attention.forward`` rotates the
+        ``[B, L, H * D]`` projection output and only views it into heads
+        afterwards, so the flat branch of the out-of-place ``q_nope`` copy is
+        the one that matters.
+        """
+
+        class Projection(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, source: torch.Tensor) -> torch.Tensor:
+                return source.clone()
+
+            @staticmethod
+            def backward(ctx, grad: torch.Tensor) -> torch.Tensor:
+                return grad
+
+        dtype = torch.bfloat16
+        head_dim = self.q_nope_dim + self.rope_dim
+        q_source = torch.randn(
+            self.batch,
+            self.seq_len,
+            self.n_heads * head_dim,
+            device=self.positions.device,
+            dtype=dtype,
+            requires_grad=True,
+        )
+        q_projection = Projection.apply(q_source)
+        projection_storage = q_projection.untyped_storage().data_ptr()
+        fused_flat = fused_mla_q(
+            q_projection,
+            self.rope.cache,
+            self.positions,
+            self.q_nope_dim,
+        )
+
+        reference_source = q_source.detach().clone().requires_grad_()
+        reference_q = reference_source.view(
+            self.batch,
+            self.seq_len,
+            self.n_heads,
+            head_dim,
+        )
+        q_nope, q_pos = torch.split(
+            reference_q,
+            [self.q_nope_dim, self.rope_dim],
+            dim=-1,
+        )
+        cache = self.rope._reshape_cache(q_pos, self.positions)
+        q_pos, _ = self.rope.apply_rotary_emb(
+            q_pos,
+            q_pos[:, :, :1],
+            cache,
+        )
+        reference_q = torch.cat([q_nope, q_pos], dim=-1)
+        fused_q = fused_flat.view_as(reference_q)
+
+        self.assertNotEqual(
+            fused_flat.untyped_storage().data_ptr(),
+            projection_storage,
+        )
+        self.assert_dtype_close(q_projection, q_source, dtype, exact=True)
+        self.assert_dtype_close(fused_q, reference_q, dtype)
+
+        grad = torch.randn_like(fused_q)
+        (fused_grad,) = torch.autograd.grad(fused_q, q_source, grad.clone())
+        (reference_grad,) = torch.autograd.grad(
+            reference_q,
+            reference_source,
+            grad,
+        )
+        self.assert_dtype_close(fused_grad, reference_grad, dtype)
+
+    @parametrize("dtype", [torch.bfloat16, torch.float32])
+    def test_singleton_positions_broadcast_matches_eager(self, dtype: torch.dtype):
+        self._check_singleton_positions_broadcast(dtype)
+
+    def _check_singleton_positions_broadcast(self, dtype: torch.dtype) -> None:
+        torch.manual_seed(42)
+        q = torch.randn(
+            self.batch,
+            self.seq_len,
+            self.n_heads,
+            self.q_nope_dim + self.rope_dim,
+            device=self.positions.device,
+            dtype=dtype,
+        )
+        singleton_positions = self.positions[:1]
+        q_nope, q_pos = torch.split(
+            q,
+            [self.q_nope_dim, self.rope_dim],
+            dim=-1,
+        )
+        cache = self.rope._reshape_cache(q_pos, singleton_positions)
+        q_pos, _ = self.rope.apply_rotary_emb(
+            q_pos,
+            q_pos[:, :, :1],
+            cache,
+        )
+        reference_q = torch.cat([q_nope, q_pos], dim=-1)
+
+        fused_q = fused_mla_q(
+            q.clone(),
+            self.rope.cache,
+            singleton_positions,
+            self.q_nope_dim,
+        )
+        self.assert_dtype_close(fused_q, reference_q, dtype)
+
     @parametrize("dtype", [torch.bfloat16, torch.float32])
     def test_kv_forward_backward_and_storage_match_eager(self, dtype: torch.dtype):
         self._check_kv_forward_backward_and_storage(dtype)
@@ -222,8 +403,8 @@ class TestFusedMLANumerics(unittest.TestCase):
     def _check_kv_forward_backward_and_storage(self, dtype: torch.dtype) -> None:
         torch.manual_seed(42)
         kv = torch.randn(
-            1,
-            self.num_tokens,
+            self.batch,
+            self.seq_len,
             self.n_heads,
             self.q_nope_dim + self.value_dim,
             device=self.positions.device,
@@ -231,8 +412,8 @@ class TestFusedMLANumerics(unittest.TestCase):
             requires_grad=True,
         )
         k_pos = torch.randn(
-            1,
-            self.num_tokens,
+            self.batch,
+            self.seq_len,
             self.rope_dim,
             device=self.positions.device,
             dtype=dtype,
@@ -254,7 +435,7 @@ class TestFusedMLANumerics(unittest.TestCase):
             dim=-1,
         )
         k_pos_view = reference_k_pos.unsqueeze(2)
-        cache = self.rope.cache[self.positions].unsqueeze(0).unsqueeze(2)
+        cache = self.rope._reshape_cache(k_pos_view, self.positions)
         _, rotated_k_pos = self.rope.apply_rotary_emb(
             k_pos_view,
             k_pos_view,
@@ -308,25 +489,33 @@ class TestFusedMLANumerics(unittest.TestCase):
 
     def test_make_fx_keeps_forward_and_backward_custom_ops(self):
         """GraphTrainer fake tracing sees stable fused MLA operator nodes."""
+        tuning = FusedMLAKernelConfig(
+            q_block_h=32,
+            q_num_warps=2,
+            k_block_h=8,
+            k_num_warps=2,
+            kv_backward_block_h=32,
+            kv_backward_num_warps=8,
+        )
         q = torch.randn(
-            1,
-            self.num_tokens,
+            self.batch,
+            self.seq_len,
             self.n_heads,
             self.q_nope_dim + self.rope_dim,
             device=self.positions.device,
             requires_grad=True,
         )
         kv = torch.randn(
-            1,
-            self.num_tokens,
+            self.batch,
+            self.seq_len,
             self.n_heads,
             self.q_nope_dim + self.value_dim,
             device=self.positions.device,
             requires_grad=True,
         )
         k_pos = torch.randn(
-            1,
-            self.num_tokens,
+            self.batch,
+            self.seq_len,
             self.rope_dim,
             device=self.positions.device,
             requires_grad=True,
@@ -349,6 +538,7 @@ class TestFusedMLANumerics(unittest.TestCase):
                 cache,
                 positions,
                 self.q_nope_dim,
+                tuning,
             )
             k, v = fused_mla_kv(
                 kv,
@@ -356,6 +546,7 @@ class TestFusedMLANumerics(unittest.TestCase):
                 cache,
                 positions,
                 self.q_nope_dim,
+                tuning,
             )
             return torch.autograd.grad(
                 (q_out, k, v),
@@ -374,12 +565,26 @@ class TestFusedMLANumerics(unittest.TestCase):
             grad_v,
         )
         targets = [node.target for node in graph.graph.nodes]
-        self.assertEqual(
-            targets.count(torch.ops.torchtitan.fused_mla_q_rope_.default),
-            2,
-        )
+        # Both directions rotate out of place. Autograd may share its incoming
+        # gradient with sibling paths, so mutating it in backward is unsafe.
+        q_rope_op = torch.ops.torchtitan.fused_mla_q_rope.default
+        self.assertEqual(targets.count(q_rope_op), 2)
         self.assertIn(torch.ops.torchtitan.fused_mla_k_rope.default, targets)
         self.assertIn(torch.ops.torchtitan.fused_mla_kv_backward.default, targets)
+        q_nodes = [node for node in graph.graph.nodes if node.target == q_rope_op]
+        k_node = next(
+            node
+            for node in graph.graph.nodes
+            if node.target is torch.ops.torchtitan.fused_mla_k_rope.default
+        )
+        kv_backward_node = next(
+            node
+            for node in graph.graph.nodes
+            if node.target is torch.ops.torchtitan.fused_mla_kv_backward.default
+        )
+        self.assertTrue(all(node.args[-2:] == (32, 2) for node in q_nodes))
+        self.assertEqual(k_node.args[-2:], (8, 2))
+        self.assertEqual(kv_backward_node.args[-2:], (32, 8))
 
     @parametrize("dtype", [torch.bfloat16, torch.float32])
     def test_attention_module_forward_backward_matches_eager(self, dtype: torch.dtype):
@@ -423,24 +628,27 @@ class TestFusedMLANumerics(unittest.TestCase):
                     parameter.normal_(mean=0.0, std=0.02)
         fused.load_state_dict(stock.state_dict(), strict=True)
 
+        batch = 2
+        seq_len = 16
         hidden_dim = cast(Attention.Config, stock_config).dim
         x = torch.randn(
-            self.num_tokens,
+            batch,
+            seq_len,
             hidden_dim,
             device=self.positions.device,
             dtype=dtype,
         )
         stock_x = x.detach().clone().requires_grad_()
         fused_x = x.detach().clone().requires_grad_()
-        positions = self.positions
+        positions = self.positions[:, :seq_len]
         attention_mask = create_block_mask(
             lambda batch_idx, head_idx, query_idx, key_value_idx: (
                 query_idx >= key_value_idx
             ),
             B=None,
             H=None,
-            Q_LEN=self.num_tokens,
-            KV_LEN=self.num_tokens,
+            Q_LEN=seq_len,
+            KV_LEN=seq_len,
             device=self.positions.device,
         )
 

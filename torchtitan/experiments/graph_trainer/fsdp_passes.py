@@ -15,17 +15,23 @@ from __future__ import annotations
 
 import heapq
 import operator
+import warnings
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
 import torch
+import torch.distributed as dist
+import torch.distributed._symmetric_memory as symm_mem
 import torch.fx as fx
+import torch.utils._pytree as pytree
 from torch._dynamo.graph_deduplication import _stable_topological_sort
 from torch._inductor.fx_passes.bucketing import (
     _recompute_changed_user_metadata,
     BucketMode,
+    enable_symmetric_memory_for_fsdp_buckets,
+    FSDPSymmetricMemoryAllocation,
     is_all_gather_into_tensor as is_all_gather,
     is_wait_tensor,
 )
@@ -51,13 +57,241 @@ from torchtitan.experiments.graph_trainer.common_utils import (
     matches_module_fqn_pattern,
 )
 from torchtitan.experiments.graph_trainer.fsdp_patterns import (
+    _PACKED_FSDP_UNSHARD_PARAM,
     find_fsdp_unshard_outputs,
+    find_fsdp_unshard_reconstruction_outputs,
     is_fsdp_all_gather_output_split,
+)
+from torchtitan.experiments.graph_trainer.make_fx_tracer import (
+    capture_graph_state_output_metadata,
+    restore_graph_state_output_metadata,
 )
 from torchtitan.tools.logging import logger
 
 
 _FSDP_BUCKET_META = "fsdp_bucket"
+
+
+def configure_fsdp_symmetric_memory_backend() -> None:
+    """Select NCCL before any GraphTrainer model runtime can allocate symm mem."""
+    backend = symm_mem.get_backend(torch.device("cuda"))
+    if backend == "NCCL":
+        return
+    try:
+        symm_mem.set_backend("NCCL")
+    except RuntimeError as error:
+        raise RuntimeError(
+            "GraphTrainer FSDP symmetric memory could not select the NCCL "
+            f"backend before model setup; the current CUDA backend is {backend!r}. "
+            "Symmetric-memory backends cannot change after the first allocation."
+        ) from error
+
+
+def _bucketed_fsdp_all_gather_widths(gm: fx.GraphModule) -> set[int]:
+    widths: set[int] = set()
+    target = torch.ops.bucketing._pre_bucket_all_gather.default
+    for node in gm.graph.nodes:
+        if node.op != "call_function" or node.target != target:
+            continue
+        group_size = node.args[1]
+        if type(group_size) is not int or group_size <= 0:
+            raise ValueError(
+                "FSDP symmetric memory requires positive static all-gather "
+                f"group sizes, got {group_size!r}"
+            )
+        widths.add(group_size)
+    return widths
+
+
+def _selected_fsdp_symmetric_memory_widths(
+    gm: fx.GraphModule,
+    policy: str,
+) -> set[int]:
+    if policy not in {"all", "widest"}:
+        raise ValueError(
+            "fsdp_symm_mem_policy must be 'all' or 'widest', " f"got {policy!r}"
+        )
+    widths = _bucketed_fsdp_all_gather_widths(gm)
+    if policy == "all" or not widths:
+        return widths
+    return {max(widths)}
+
+
+def _resolve_symmetric_memory_group(
+    group_name: str,
+    group: object,
+) -> dist.ProcessGroup:
+    if isinstance(group, str):
+        return dist.distributed_c10d._resolve_process_group(group_name)
+    if isinstance(group, dist.ProcessGroup):
+        return group
+    raise TypeError(
+        "FSDP symmetric-memory group must be a name or ProcessGroup, "
+        f"got {type(group).__name__}"
+    )
+
+
+def _initialize_fsdp_symmetric_memory_groups(
+    selected_groups: dict[str, object],
+) -> None:
+    resolved_groups = []
+    for group_name, group in selected_groups.items():
+        process_group = _resolve_symmetric_memory_group(group_name, group)
+        backend = dist.get_backend(process_group)
+        if backend != dist.Backend.NCCL:
+            raise ValueError(
+                "FSDP symmetric memory requires NCCL process groups, got "
+                f"{backend!r} for {group_name!r}"
+            )
+        resolved_groups.append(process_group)
+
+    if not resolved_groups:
+        return
+    backend = symm_mem.get_backend(torch.device("cuda"))
+    if backend != "NCCL":
+        raise RuntimeError(
+            "GraphTrainer FSDP symmetric memory requires the NCCL backend to "
+            f"be selected before model setup, got {backend!r}"
+        )
+    device_id = torch.cuda.current_device()
+    for process_group in resolved_groups:
+        dist.barrier(group=process_group, device_ids=[device_id])
+
+
+def _rewrite_fsdp_symmetric_memory_graphs(
+    graph_modules: Iterable[fx.GraphModule],
+    group_sizes: set[int],
+    *,
+    preallocate: bool,
+    max_reduce_scatter_input_buffers: int,
+) -> tuple[
+    int,
+    int,
+    dict[str, object],
+    Counter[str],
+    list[FSDPSymmetricMemoryAllocation],
+]:
+    num_all_gathers = 0
+    num_reduce_scatters = 0
+    selected_groups: dict[str, object] = {}
+    planned_bytes_by_role: Counter[str] = Counter()
+    preallocated_buffers: list[FSDPSymmetricMemoryAllocation] = []
+    for gm in graph_modules:
+        result = enable_symmetric_memory_for_fsdp_buckets(
+            gm,
+            group_sizes,
+            preallocate=preallocate,
+            max_reduce_scatter_input_buffers=max_reduce_scatter_input_buffers,
+        )
+        num_all_gathers += result.num_all_gathers
+        num_reduce_scatters += result.num_reduce_scatters
+        planned_bytes_by_role.update(dict(result.planned_bytes))
+        preallocated_buffers.extend(result.preallocated_buffers)
+        for group_name, group in result.selected_groups:
+            selected_groups.setdefault(group_name, group)
+    return (
+        num_all_gathers,
+        num_reduce_scatters,
+        selected_groups,
+        planned_bytes_by_role,
+        preallocated_buffers,
+    )
+
+
+def _rendezvous_fsdp_symmetric_memory_buffers(
+    allocations: Iterable[FSDPSymmetricMemoryAllocation],
+) -> Counter[str]:
+    allocated_bytes_by_role: Counter[str] = Counter()
+    for allocation in allocations:
+        process_group = _resolve_symmetric_memory_group(
+            allocation.group_name,
+            allocation.group,
+        )
+        symm_mem.rendezvous(allocation.tensor, group=process_group)
+        allocated_bytes_by_role[allocation.role] += (
+            allocation.tensor.numel() * allocation.tensor.element_size()
+        )
+    return allocated_bytes_by_role
+
+
+def enable_fsdp_symmetric_memory_for_graphs(
+    graph_modules: Iterable[fx.GraphModule],
+    *,
+    selection_graph: fx.GraphModule,
+    policy: str,
+    preallocate: bool = False,
+    max_reduce_scatter_input_buffers: int = 1,
+) -> tuple[int, int]:
+    """Rewrite selected FSDP buckets and initialize their real process groups."""
+    group_sizes = _selected_fsdp_symmetric_memory_widths(selection_graph, policy)
+    if not group_sizes:
+        warnings.warn(
+            "FSDP symmetric memory found no eligible bucketed all-gathers; "
+            "the FSDP degree may be one or the bucketing pass may be disabled",
+            stacklevel=2,
+        )
+        return 0, 0
+    if not dist.is_initialized():
+        raise RuntimeError("FSDP symmetric memory requires distributed initialization")
+    if dist.get_backend() == dist.Backend.FAKE:
+        warnings.warn(
+            "FSDP symmetric memory is disabled for the fake process-group backend",
+            stacklevel=2,
+        )
+        return 0, 0
+
+    (
+        num_all_gathers,
+        num_reduce_scatters,
+        selected_groups,
+        planned_bytes_by_role,
+        preallocated_buffers,
+    ) = _rewrite_fsdp_symmetric_memory_graphs(
+        graph_modules,
+        group_sizes,
+        preallocate=preallocate,
+        max_reduce_scatter_input_buffers=max_reduce_scatter_input_buffers,
+    )
+    if not selected_groups:
+        warnings.warn(
+            "FSDP symmetric memory found no concrete positive-size buckets "
+            f"at the selected group sizes {sorted(group_sizes)}",
+            stacklevel=2,
+        )
+        return num_all_gathers, num_reduce_scatters
+    _initialize_fsdp_symmetric_memory_groups(selected_groups)
+    preallocated_bytes_by_role = _rendezvous_fsdp_symmetric_memory_buffers(
+        preallocated_buffers
+    )
+    logger.info(
+        "Enabled FSDP symmetric memory for %d all-gather and %d "
+        "reduce-scatter buckets at group sizes %s; planned bytes by role %s; "
+        "preallocated bytes by role %s",
+        num_all_gathers,
+        num_reduce_scatters,
+        sorted(group_sizes),
+        dict(planned_bytes_by_role),
+        dict(preallocated_bytes_by_role),
+    )
+    return num_all_gathers, num_reduce_scatters
+
+
+def enable_fsdp_symmetric_memory_pass(
+    gm: fx.GraphModule,
+    example_inputs: tuple | None = None,
+    *,
+    policy: str,
+    preallocate: bool,
+) -> fx.GraphModule:
+    """Apply FSDP symmetric memory after scheduling and before compilation."""
+    del example_inputs
+    enable_fsdp_symmetric_memory_for_graphs(
+        (gm,),
+        selection_graph=gm,
+        policy=policy,
+        preallocate=preallocate,
+    )
+    return gm
 
 
 def _chain_nodes_to_placeholder(
@@ -76,6 +310,93 @@ def _chain_nodes_to_placeholder(
     return chain_nodes
 
 
+def _fsdp_chain_signature(value: Any, placeholder: fx.Node) -> Any:
+    """Build a structural signature for one unshard/preparation result.
+
+    Args:
+        value: FX value to describe.
+        placeholder: Parameter placeholder shared by candidate chains.
+
+    Returns:
+        A recursively comparable signature that ignores FX node identity while
+        retaining operators, literal arguments, and other input identities.
+    """
+    memo: dict[fx.Node, Any] = {}
+
+    def signature(item: Any) -> Any:
+        if isinstance(item, fx.Node):
+            if item is placeholder:
+                return ("parameter",)
+            if item in memo:
+                return memo[item]
+            if item.op == "placeholder":
+                result = ("placeholder", item.name)
+            else:
+                result = (
+                    item.op,
+                    item.target,
+                    signature(item.args),
+                    signature(item.kwargs),
+                )
+            memo[item] = result
+            return result
+        if isinstance(item, tuple):
+            return ("tuple", tuple(signature(element) for element in item))
+        if isinstance(item, list):
+            return ("list", tuple(signature(element) for element in item))
+        if isinstance(item, dict):
+            return (
+                "dict",
+                tuple((key, signature(element)) for key, element in item.items()),
+            )
+        try:
+            hash(item)
+        except TypeError:
+            return ("literal", repr(item))
+        return ("literal", item)
+
+    return signature(value)
+
+
+def _pack_distinct_unshard_outputs(
+    placeholder: fx.Node,
+    outputs: tuple[fx.Node, ...],
+) -> None:
+    """Pack heterogeneous preparation results into one parameter value.
+
+    Args:
+        placeholder: Flat FSDP parameter input shared by the outputs.
+        outputs: Distinct post-all-gather preparation results.
+    """
+    region_nodes = set().union(
+        *(_chain_nodes_to_placeholder(output, placeholder) for output in outputs)
+    )
+    external_users = {
+        output: tuple(user for user in output.users if user not in region_nodes)
+        for output in outputs
+    }
+    live_outputs = tuple(output for output in outputs if external_users[output])
+    if len(live_outputs) <= 1:
+        return
+
+    positions = {node: index for index, node in enumerate(placeholder.graph.nodes)}
+    last_output = max(live_outputs, key=positions.__getitem__)
+    with placeholder.graph.inserting_after(last_output):
+        packed = placeholder.graph.call_function(tuple, args=(live_outputs,))
+    packed.meta[_PACKED_FSDP_UNSHARD_PARAM] = placeholder.name
+
+    insertion_point = packed
+    for index, output in enumerate(live_outputs):
+        with placeholder.graph.inserting_after(insertion_point):
+            unpacked = placeholder.graph.call_function(
+                operator.getitem,
+                args=(packed, index),
+            )
+        insertion_point = unpacked
+        for user in external_users[output]:
+            user.replace_input_with(output, unpacked)
+
+
 def deduplicate_fsdp_unshard_chains_pass(
     gm: torch.fx.GraphModule,
     example_inputs: tuple | None = None,
@@ -83,11 +404,10 @@ def deduplicate_fsdp_unshard_chains_pass(
     """Canonicalize duplicate SimpleFSDP unshard chains per flat parameter.
 
     A traced parametrized module can read the same FSDP parameter more than
-    once. Each read materializes an equivalent all-gather/wait reconstruction
-    chain from the same flat parameter placeholder. Downstream FSDP passes
-    assume one unsharded value per flat parameter, so this pass rewrites all
-    duplicate chains to the first chain and removes the now-dead duplicate
-    collective infrastructure.
+    once. Equivalent preparation chains are deduplicated directly. Distinct
+    preparations share the high-precision reconstruction and are packed into
+    one per-parameter value so GraphPP can hoist every preparation without
+    conflating their layouts.
     """
     del example_inputs
 
@@ -97,16 +417,57 @@ def deduplicate_fsdp_unshard_chains_pass(
         unshard_outputs = find_fsdp_unshard_outputs(placeholder)
         if len(unshard_outputs) <= 1:
             continue
-        canonical_output = unshard_outputs[0]
-        for duplicate_output in unshard_outputs[1:]:
+        preparation_groups: dict[Any, list[fx.Node]] = defaultdict(list)
+        for output in unshard_outputs:
+            preparation_groups[_fsdp_chain_signature(output, placeholder)].append(
+                output
+            )
+        canonical_preparations: dict[fx.Node, fx.Node] = {}
+        for group in preparation_groups.values():
+            canonical_output = group[0]
+            canonical_preparations[canonical_output] = canonical_output
+            for duplicate_output in group[1:]:
+                removable_nodes.update(
+                    _chain_nodes_to_placeholder(duplicate_output, placeholder)
+                )
+                duplicate_output.replace_all_uses_with(canonical_output)
+                canonical_preparations[duplicate_output] = canonical_output
+                num_duplicate_chains += 1
+        if len(preparation_groups) == 1:
+            continue
+
+        reconstruction_outputs = find_fsdp_unshard_reconstruction_outputs(placeholder)
+        if len(reconstruction_outputs) != len(unshard_outputs):
+            raise ValueError(
+                "FSDP preparation and reconstruction chain counts differ for "
+                f"{placeholder.name}: {len(unshard_outputs)} preparation "
+                f"outputs but {len(reconstruction_outputs)} reconstructions"
+            )
+        canonical_reconstruction = reconstruction_outputs[0]
+        replacements: dict[fx.Node, fx.Node] = {}
+        for duplicate_output in reconstruction_outputs[1:]:
             removable_nodes.update(
                 _chain_nodes_to_placeholder(duplicate_output, placeholder)
             )
-            duplicate_output.replace_all_uses_with(canonical_output)
+            duplicate_output.replace_all_uses_with(canonical_reconstruction)
+            replacements[duplicate_output] = canonical_reconstruction
             num_duplicate_chains += 1
+        distinct_outputs = tuple(
+            dict.fromkeys(
+                replacements.get(
+                    canonical_preparations[output], canonical_preparations[output]
+                )
+                for output in unshard_outputs
+            )
+        )
+        _pack_distinct_unshard_outputs(placeholder, distinct_outputs)
 
     if num_duplicate_chains == 0:
         return gm
+
+    # Heterogeneous forward/backward preparations are packed at one boundary,
+    # so their pure producer chains must move before the earliest compute user.
+    _stable_topological_sort(gm.graph, {})
 
     def _is_impure_for_fsdp_dedup(node: fx.Node) -> bool:
         if node in removable_nodes:
@@ -120,6 +481,47 @@ def deduplicate_fsdp_unshard_chains_pass(
         "Canonicalized %d duplicate FSDP unshard chain(s)",
         num_duplicate_chains,
     )
+    return gm
+
+
+def preserve_fsdp_unshard_output_boundaries_pass(
+    gm: torch.fx.GraphModule,
+    example_inputs: tuple | None = None,
+    *,
+    num_model_state_tensor_inputs: int,
+) -> torch.fx.GraphModule:
+    """Preserve canonical post-all-gather outputs through FSDP bucketing.
+
+    This pass must run after the final unshard deduplication and immediately
+    before bucketing. Bucketing rewrites the all-gather reconstruction, so the
+    structural matcher would otherwise fall back to the reconstructed
+    high-precision parameter instead of a format-specific prepared value.
+    """
+    del example_inputs
+
+    placeholders = gm.graph.find_nodes(op="placeholder")
+    if not 0 <= num_model_state_tensor_inputs <= len(placeholders):
+        raise ValueError(
+            "num_model_state_tensor_inputs must be between zero and the graph's "
+            f"{len(placeholders)} placeholders, got "
+            f"{num_model_state_tensor_inputs}"
+        )
+
+    num_boundaries = 0
+    for placeholder in placeholders[:num_model_state_tensor_inputs]:
+        unshard_outputs = find_fsdp_unshard_outputs(placeholder)
+        if not unshard_outputs:
+            continue
+        if len(unshard_outputs) != 1:
+            raise ValueError(
+                "FSDP unshard boundary preservation expects one canonical "
+                f"output for {placeholder.name}, got {len(unshard_outputs)}. "
+                "Run deduplicate_fsdp_unshard_chains_pass first."
+            )
+        unshard_outputs[0].meta[_PACKED_FSDP_UNSHARD_PARAM] = placeholder.name
+        num_boundaries += 1
+
+    logger.info("Preserved %d FSDP unshard output boundary(s)", num_boundaries)
     return gm
 
 
@@ -200,39 +602,68 @@ def _get_or_create_extra_fsdp_pg(source_pg_name: str) -> str:
     )
 
 
+def _is_backward_fsdp_all_gather_wait(node: fx.Node) -> bool:
+    if not (
+        is_wait_tensor(node)
+        and isinstance(node.args[0], fx.Node)
+        and is_all_gather(node.args[0])
+    ):
+        return False
+    all_gather = node.args[0]
+    bucket_meta = _read_fsdp_bucket_meta(all_gather) or _read_fsdp_bucket_meta(node)
+    if bucket_meta is not None:
+        _plan_fqns, direction = bucket_meta
+        return direction == "bwd"
+    if not is_wait_tensor_from_fsdp(node):
+        return False
+    return any(
+        _is_backward_or_recomputed_node(candidate)
+        for candidate in (all_gather, node, *node.users)
+    )
+
+
 def reassign_collective_pgs_pass(
     gm: torch.fx.GraphModule,
     example_inputs: tuple | None = None,
 ) -> torch.fx.GraphModule:
-    """Reassign collectives to dedicated NCCL process groups.
+    """Reassign backward FSDP all-gathers to dedicated NCCL process groups.
 
-    Each PG runs on its own CUDA stream, so moving a collective to an extra PG
-    (same ranks) lets it overlap with the collectives left on the original PG --
-    e.g. all-gathers overlapping reduce-scatters in backward, or isolating EP
-    collectives. No-op without targeted collectives; run before bucketing so
-    bucketed collectives inherit the new PG.
+    Each PG runs on its own CUDA stream, so moving backward all-gathers to an
+    extra PG with the same ranks lets them overlap reduce-scatters left on the
+    original PG. Forward all-gathers stay on the original PG because they do
+    not participate in that overlap. No-op without targeted collectives. Run
+    after bucketing, whose direction metadata distinguishes surviving forward
+    and backward parameter all-gathers exactly.
     """
     source_pg_names: OrderedSet[str] = OrderedSet()
+    backward_all_gathers: OrderedSet[fx.Node] = OrderedSet()
     for node in gm.graph.nodes:
-        if is_wait_tensor_from_fsdp(node):
+        if _is_backward_fsdp_all_gather_wait(node):
             ag_node = node.args[0]
             source_pg_names.add(ag_node.args[2])
+            backward_all_gathers.add(ag_node)
 
     if not source_pg_names:
+        logger.info(
+            "FSDP AG/RS overlap found no backward all-gathers; "
+            "forward all-gathers remain on their source process groups"
+        )
         return gm
 
     pg_mapping: dict[str, str] = {
         pg: _get_or_create_extra_fsdp_pg(pg) for pg in source_pg_names
     }
-    ag_count = 0
-    for node in gm.graph.nodes:
-        if is_all_gather(node) and node.args[2] in pg_mapping:
-            # AG args: (input_tensor, group_size, group_name)
-            node.args = (node.args[0], node.args[1], pg_mapping[node.args[2]])
-            ag_count += 1
-    if ag_count > 0:
-        for source, target in pg_mapping.items():
-            logger.info(f"Rewrote all-gather node(s) from PG {source} to PG {target}")
+    for all_gather in backward_all_gathers:
+        source_pg_name = all_gather.args[2]
+        all_gather.args = (
+            all_gather.args[0],
+            all_gather.args[1],
+            pg_mapping[source_pg_name],
+        )
+    for source, target in pg_mapping.items():
+        logger.info(
+            f"Rewrote backward all-gather node(s) from PG {source} to PG {target}"
+        )
     gm.recompile()
     return gm
 
@@ -561,8 +992,9 @@ def joint_transformer_block_bucketing_reordering_pass(
     Buckets forward all-gathers, backward all-gathers, and backward reduce-scatters
     of each module into separate buckets per transformer block and emits prefetching.
 
-    Run ``reassign_collective_pgs_pass`` first to put collectives on dedicated
-    streams; bucketed collectives inherit the new PGs.
+    Run ``reassign_collective_pgs_pass`` after this pass so its authoritative
+    bucket-direction metadata selects only backward all-gathers for dedicated
+    process groups and streams.
 
     Args:
         gm: joint forward+backward graph module.
@@ -584,6 +1016,7 @@ def joint_transformer_block_bucketing_reordering_pass(
             return []
         return [(fqn, torch.nn.Module)]
 
+    graph_state_output_metadata = capture_graph_state_output_metadata(gm)
     scheduler = JointManualOverlapScheduler(
         gm,
         module_bucket_plans,
@@ -593,7 +1026,14 @@ def joint_transformer_block_bucketing_reordering_pass(
         bucket_mode=bucket_mode,
         fsdp_param_module_order=fsdp_param_module_order,
     )
+    # TODO: Produce compact per-parameter all-gather outputs directly instead
+    # of materializing bucket slices. Joint forward-backward CUDA graphs can
+    # otherwise retain every compact weight copy until its backward use.
     overlapped_gm = scheduler.run()
+    restore_graph_state_output_metadata(
+        overlapped_gm,
+        graph_state_output_metadata,
+    )
     overlapped_gm.recompile()
     return overlapped_gm
 
@@ -735,6 +1175,7 @@ def _is_dense_region_target_node(node: fx.Node) -> bool:
         torch.ops.aten.reshape.default,
         torch.ops.aten.slice.Tensor,
         torch.ops.aten.split_with_sizes.default,
+        torch.ops.aten.split_with_sizes_copy.default,
         torch.ops.aten.sym_size.int,
         torch.ops.aten.t.default,
         torch.ops.aten.transpose.int,
@@ -1085,6 +1526,13 @@ def _validate_transformer_block_bucket_counts(
     n_layers: int,
     expected_bucket_counts: dict[int, int],
 ) -> None:
+    """Validate required buckets while allowing saved forward unshards.
+
+    Forward all-gathers and backward reduce-scatters are required for every
+    planned bucket. A backward all-gather exists only when activation remat
+    needs to reconstruct that bucket, so its count may range from zero to the
+    planned count independently for each layer.
+    """
     missing_expected = [
         layer_id
         for layer_id in range(n_layers)
@@ -1116,22 +1564,166 @@ def _validate_transformer_block_bucket_counts(
             "bwd_ag": len(layer_comms["bwd_ag"]),
             "bwd_rs": len(layer_comms["bwd_rs"]),
         }
+        required_kinds = ("fwd_ag", "bwd_rs")
         mismatches = {
-            kind: count for kind, count in actual.items() if count != expected
+            kind: actual[kind] for kind in required_kinds if actual[kind] != expected
         }
+        if actual["bwd_ag"] > expected:
+            mismatches["bwd_ag"] = actual["bwd_ag"]
         if mismatches:
             errors.append(
-                f"layer {layer_id}: expected {expected} buckets per kind, "
+                f"layer {layer_id}: expected {expected} forward all-gather and "
+                f"backward reduce-scatter buckets, and at most {expected} "
+                "backward all-gather buckets; "
                 f"got fwd_ag={actual['fwd_ag']} bwd_ag={actual['bwd_ag']} "
                 f"bwd_rs={actual['bwd_rs']}"
             )
 
     if errors:
         raise ValueError(
-            "FSDP dense-region scheduling requires one bucketed transformer-block "
-            "collective per expected bucket in each direction/type:\n"
+            "FSDP dense-region scheduling requires complete transformer-block "
+            "forward all-gather and backward reduce-scatter buckets. Backward "
+            "all-gather buckets may be absent when their forward values are saved:\n"
             + "\n".join(f"- {error}" for error in errors)
         )
+
+
+def _call_mutates_node(call: fx.Node, value: fx.Node) -> bool:
+    target = call.target
+    if call.op != "call_function" or not isinstance(target, torch._ops.OpOverload):
+        return False
+    for index, schema_arg in enumerate(target._schema.arguments):
+        if schema_arg.alias_info is None or not schema_arg.alias_info.is_write:
+            continue
+        if index < len(call.args):
+            argument = call.args[index]
+        elif schema_arg.name in call.kwargs:
+            argument = call.kwargs[schema_arg.name]
+        else:
+            continue
+        leaves, _ = pytree.tree_flatten(argument)
+        if any(leaf is value for leaf in leaves):
+            return True
+    return False
+
+
+def _find_mutable_alias_use(
+    value: fx.Node,
+    *,
+    order: dict[fx.Node, int],
+    start_pos: int,
+    end_pos: int,
+    ignored_calls: set[fx.Node],
+) -> fx.Node | None:
+    aliases = [value]
+    visited: set[fx.Node] = set()
+    while aliases:
+        alias = aliases.pop()
+        if alias in visited:
+            continue
+        visited.add(alias)
+        for user in alias.users:
+            if (
+                user not in ignored_calls
+                and start_pos <= order[user] < end_pos
+                and _call_mutates_node(user, alias)
+            ):
+                return user
+            target = user.target
+            if user.op == "call_function" and (
+                target is operator.getitem
+                or target is torch.ops.aten._unsafe_view.default
+                or (isinstance(target, torch._ops.OpOverload) and target.is_view)
+            ):
+                aliases.append(user)
+    return None
+
+
+def _plan_static_all_gather_hoist(
+    launch: fx.Node,
+    target: fx.Node,
+    wait: fx.Node,
+    *,
+    order: dict[fx.Node, int],
+    model_state_placeholders: set[fx.Node],
+    infra_chain: set[fx.Node],
+) -> tuple[list[fx.Node] | None, str | None]:
+    if order[wait] <= order[target]:
+        return None, f"wait {wait.name} does not follow target {target.name}"
+
+    target_pos = order[target]
+    ancestors: set[fx.Node] = {launch}
+    roots: set[fx.Node] = set()
+    getattrs: set[fx.Node] = set()
+    launch_data = (launch.args[0], launch.kwargs.get("out"))
+    data_leaves, _ = pytree.tree_flatten(launch_data)
+    work = [leaf for leaf in data_leaves if isinstance(leaf, fx.Node)]
+    while work:
+        node = work.pop()
+        if node in ancestors:
+            continue
+        if node.op == "placeholder":
+            roots.add(node)
+            continue
+        if node.op == "get_attr":
+            getattrs.add(node)
+            continue
+        ancestors.add(node)
+        work.extend(node.all_input_nodes)
+
+    late_non_data_inputs = [
+        node
+        for node in launch.all_input_nodes
+        if node not in ancestors and order[node] >= target_pos
+    ]
+    if late_non_data_inputs:
+        names = ", ".join(sorted(node.name for node in late_non_data_inputs))
+        return None, f"all-gather launch has late non-tensor inputs: {names}"
+    late_getattrs = [node for node in getattrs if order[node] >= target_pos]
+    if late_getattrs:
+        names = ", ".join(sorted(node.name for node in late_getattrs))
+        return None, f"all-gather preparation has late get_attr inputs: {names}"
+
+    launch_pos = order[launch]
+    interval_start = min(launch_pos, target_pos)
+    interval_end = max(launch_pos, target_pos)
+    mutated_values = [
+        (node, mutation)
+        for node in ancestors | roots | getattrs
+        if (
+            mutation := _find_mutable_alias_use(
+                node,
+                order=order,
+                start_pos=interval_start,
+                end_pos=interval_end,
+                ignored_calls={launch},
+            )
+        )
+        is not None
+    ]
+    if mutated_values:
+        details = ", ".join(
+            f"{value.name} by {mutation.name}"
+            for value, mutation in sorted(
+                mutated_values, key=lambda pair: order[pair[1]]
+            )
+        )
+        return None, f"all-gather preparation crosses mutations: {details}"
+
+    to_hoist = [node for node in ancestors if order[node] >= target_pos]
+    external_prep = [node for node in to_hoist if node not in infra_chain]
+    if external_prep:
+        invalid_roots = roots - model_state_placeholders
+        if invalid_roots:
+            names = ", ".join(sorted(node.name for node in invalid_roots))
+            return None, f"all-gather preparation depends on non-model inputs: {names}"
+    unsafe = [node for node in to_hoist if node is not launch and node.is_impure()]
+    if unsafe:
+        names = ", ".join(sorted(node.name for node in unsafe))
+        return None, f"all-gather preparation has effectful nodes: {names}"
+    if target in ancestors:
+        return None, f"target {target.name} is an all-gather dependency"
+    return sorted(to_hoist, key=order.__getitem__), None
 
 
 def schedule_fsdp_comms_to_dense_regions_pass(
@@ -1140,6 +1732,7 @@ def schedule_fsdp_comms_to_dense_regions_pass(
     *,
     moe_layer_ids: frozenset[int],
     n_layers: int,
+    num_model_state_tensor_inputs: int = 0,
     transformer_bucket_counts_by_layer: dict[int, int] | None = None,
     strict: bool = False,
 ) -> torch.fx.GraphModule:
@@ -1164,8 +1757,10 @@ def schedule_fsdp_comms_to_dense_regions_pass(
       RS(0) is left to the original bucketing schedule.
       RS waits and pure output-unpack users are sunk to the graph tail.
 
-    Embedding buckets are left to the upstream bucketer. The top-level norm/lm_head
-    bucket is treated as the edge after transformer block N-1.
+    Embedding and standalone loss buckets are left to the upstream bucketer. Their
+    reduce-scatter waits are sunk only when their users are output-only. The
+    top-level norm/lm_head bucket is treated as the edge after transformer block
+    N-1.
     """
     del example_inputs
     regions = _build_layer_dense_regions(gm, n_layers, moe_layer_ids)
@@ -1184,6 +1779,13 @@ def schedule_fsdp_comms_to_dense_regions_pass(
         )
 
     order = {node: i for i, node in enumerate(gm.graph.nodes)}
+    placeholders = [node for node in gm.graph.nodes if node.op == "placeholder"]
+    if not 0 <= num_model_state_tensor_inputs <= len(placeholders):
+        raise ValueError(
+            "num_model_state_tensor_inputs must be between zero and the graph's "
+            f"{len(placeholders)} placeholders, got {num_model_state_tensor_inputs}"
+        )
+    model_state_placeholders = set(placeholders[:num_model_state_tensor_inputs])
 
     _FSDP_INFRA_OPS = {
         torch.ops.bucketing._pre_bucket_all_gather.default,
@@ -1191,10 +1793,13 @@ def schedule_fsdp_comms_to_dense_regions_pass(
         torch.ops._c10d_functional.all_gather_into_tensor.default,
         torch.ops._c10d_functional.all_gather_into_tensor_out.default,
         torch.ops._c10d_functional.reduce_scatter_tensor.default,
+        torch.ops.aten.constant_pad_nd.default,
         torch.ops.aten.slice.Tensor,
     }
+
     _FSDP_WAIT_OUTPUT_OPS = {
         operator.getitem,
+        torch.ops.aten.alias.default,
         torch.ops.aten._to_copy.default,
         torch.ops.aten._unsafe_view.default,
         torch.ops.aten.clone.default,
@@ -1202,6 +1807,7 @@ def schedule_fsdp_comms_to_dense_regions_pass(
         torch.ops.aten.reshape.default,
         torch.ops.aten.slice.Tensor,
         torch.ops.aten.split_with_sizes.default,
+        torch.ops.aten.split_with_sizes_copy.default,
         torch.ops.aten.view.default,
         torch.ops.aten.view.dtype,
     }
@@ -1245,14 +1851,14 @@ def schedule_fsdp_comms_to_dense_regions_pass(
         work = [launch]
         visited: set[fx.Node] = set()
         while work:
-            n = work.pop()
-            if n in visited or n.op in ("placeholder", "get_attr"):
+            node = work.pop()
+            if node in visited or node.op in ("placeholder", "get_attr"):
                 continue
-            if n.target not in _FSDP_INFRA_OPS:
+            if node.target not in _FSDP_INFRA_OPS:
                 continue
-            visited.add(n)
-            chain.append(n)
-            work.extend(n.all_input_nodes)
+            visited.add(node)
+            chain.append(node)
+            work.extend(node.all_input_nodes)
         return chain
 
     def _find_dense_target(
@@ -1263,8 +1869,8 @@ def schedule_fsdp_comms_to_dense_regions_pass(
         if not chain:
             return None
         min_pos = 0
-        for n in chain:
-            for inp in n.all_input_nodes:
+        for node in chain:
+            for inp in node.all_input_nodes:
                 if inp not in chain:
                     min_pos = max(min_pos, order.get(inp, -1) + 1)
         for target in dense_region:
@@ -1295,65 +1901,47 @@ def schedule_fsdp_comms_to_dense_regions_pass(
         return True, None
 
     def _move_chain_before(launch: fx.Node, target: fx.Node) -> tuple[bool, list[str]]:
-        """Move an AG/RS launch and its FSDP infrastructure chain before ``target``.
-
-        Only moves FSDP-specific infrastructure nodes. In particular, RS
-        gradient producers such as casts or adds stay where autograd produced
-        them; target selection ensures the launch moves after those producers.
-        """
+        """Move an AG/RS launch and its FSDP infrastructure before ``target``."""
         target_pos = order[target]
-
         chain = _collect_launch_chain(launch)
-
-        # Only move nodes whose inputs can remain before the insertion point
-        # and whose existing users will not be stranded before the moved node.
-        # This supports both pulling late RS launches earlier and delaying
-        # upstream-prefetched AG launches into the intended dense region.
         movable = set(chain)
         reasons: list[str] = []
         changed = True
         while changed:
             changed = False
-            for n in list(movable):
-                for inp in n.all_input_nodes:
+            for node in list(movable):
+                for inp in node.all_input_nodes:
                     if inp not in movable and order.get(inp, -1) >= target_pos:
                         reasons.append(
-                            f"{n.name} is pinned before {target.name}: "
+                            f"{node.name} is pinned before {target.name}: "
                             f"input {inp.name} occurs at {order.get(inp, -1)}, "
                             f"target at {target_pos}"
                         )
-                        movable.discard(n)
+                        movable.discard(node)
                         changed = True
                         break
-                if n not in movable:
+                if node not in movable or order.get(node, -1) >= target_pos:
                     continue
-                if order.get(n, -1) < target_pos:
-                    for user in n.users:
-                        if user not in movable and order.get(user, -1) < target_pos:
-                            reasons.append(
-                                f"{n.name} is pinned before {target.name}: "
-                                f"user {user.name} occurs at {order.get(user, -1)}, "
-                                f"target at {target_pos}"
-                            )
-                            movable.discard(n)
-                            changed = True
-                            break
-        to_move = sorted(movable, key=lambda x: order.get(x, 0))
+                for user in node.users:
+                    if user not in movable and order.get(user, -1) < target_pos:
+                        reasons.append(
+                            f"{node.name} is pinned before {target.name}: "
+                            f"user {user.name} occurs at {order.get(user, -1)}, "
+                            f"target at {target_pos}"
+                        )
+                        movable.discard(node)
+                        changed = True
+                        break
 
+        to_move = sorted(movable, key=order.__getitem__)
         if not to_move:
             return False, reasons
-
-        # Prepend in ascending order: each successive prepend inserts
-        # between the previously moved node and target, producing
-        # correct topological order before target.
-        for n in to_move:
-            target.prepend(n)
+        for node in to_move:
+            target.prepend(node)
         return True, []
 
     moved = 0
-    # Collect all moves first, then apply.  Recompute order after each
-    # successful move so stale positions don't cause violations.
-    moves: list[tuple[fx.Node, fx.Node, fx.Node, str]] = []
+    moves: list[tuple[fx.Node, fx.Node, fx.Node, str, list[fx.Node]]] = []
     blockers: list[str] = []
 
     def _add_move(
@@ -1361,15 +1949,35 @@ def schedule_fsdp_comms_to_dense_regions_pass(
         wait: fx.Node,
         dense_region: list[fx.Node],
         description: str,
+        *,
+        allow_static_ag_hoist: bool,
     ) -> None:
         if not dense_region:
             blockers.append(f"{description}: no dense target region")
             return
-        target = _find_dense_target(launch, dense_region)
-        if target is None:
-            blockers.append(f"{description}: launch inputs are after dense region")
-            return
-        moves.append((launch, wait, target, description))
+        if allow_static_ag_hoist:
+            infra_chain = set(_collect_launch_chain(launch))
+            for candidate in dense_region:
+                to_hoist, reason = _plan_static_all_gather_hoist(
+                    launch,
+                    candidate,
+                    wait,
+                    order=order,
+                    model_state_placeholders=model_state_placeholders,
+                    infra_chain=infra_chain,
+                )
+                if to_hoist is not None:
+                    moves.append((launch, wait, candidate, description, to_hoist))
+                    return
+        else:
+            target = _find_dense_target(launch, dense_region)
+            if target is not None:
+                moves.append((launch, wait, target, description, []))
+                return
+            reason = "launch inputs are after dense region"
+        blockers.append(
+            f"{description}: {reason or 'no safe all-gather preparation hoist'}"
+        )
 
     for layer_id, layer_comms in sorted(comms.items()):
         for ag_launch, _ag_wait in layer_comms["fwd_ag"]:
@@ -1380,6 +1988,7 @@ def schedule_fsdp_comms_to_dense_regions_pass(
                     _ag_wait,
                     regions[prev]["fwd_dense"],
                     f"fwd AG layer {layer_id} -> dense_fwd layer {prev}",
+                    allow_static_ag_hoist=True,
                 )
         for ag_launch, _ag_wait in layer_comms["bwd_ag"]:
             next_layer = layer_id + 1
@@ -1389,6 +1998,7 @@ def schedule_fsdp_comms_to_dense_regions_pass(
                     _ag_wait,
                     regions[next_layer]["bwd_dense"],
                     f"bwd AG layer {layer_id} -> dense_bwd layer {next_layer}",
+                    allow_static_ag_hoist=True,
                 )
         for rs_launch, _rs_wait in layer_comms["bwd_rs"]:
             prev = layer_id - 1
@@ -1398,6 +2008,7 @@ def schedule_fsdp_comms_to_dense_regions_pass(
                     _rs_wait,
                     regions[prev]["bwd_dense"],
                     f"bwd RS layer {layer_id} -> dense_bwd layer {prev}",
+                    allow_static_ag_hoist=False,
                 )
 
     for comm in all_comms:
@@ -1409,6 +2020,7 @@ def schedule_fsdp_comms_to_dense_regions_pass(
                 comm.wait,
                 regions[n_layers - 1]["fwd_dense"],
                 "fwd AG top-level bucket -> dense_fwd last transformer block",
+                allow_static_ag_hoist=True,
             )
         elif comm.kind == "rs" and comm.direction == "bwd" and n_layers > 0:
             _add_move(
@@ -1416,15 +2028,17 @@ def schedule_fsdp_comms_to_dense_regions_pass(
                 comm.wait,
                 regions[n_layers - 1]["bwd_dense"],
                 "bwd RS top-level bucket -> dense_bwd last transformer block",
+                allow_static_ag_hoist=False,
             )
 
     if n_layers > 0 and top_regions["bwd_dense"]:
-        for ag_launch, ag_wait in comms.get(n_layers - 1, {}).get("bwd_ag", []):
+        for ag_launch, _ag_wait in comms.get(n_layers - 1, {}).get("bwd_ag", []):
             _add_move(
                 ag_launch,
-                ag_wait,
+                _ag_wait,
                 top_regions["bwd_dense"],
                 "bwd AG last transformer block -> top-level backward dense",
+                allow_static_ag_hoist=True,
             )
 
     if blockers and strict:
@@ -1433,20 +2047,32 @@ def schedule_fsdp_comms_to_dense_regions_pass(
             + "\n".join(f"- {blocker}" for blocker in blockers)
         )
 
-    failed_moves: list[str] = []
     for comm in all_comms:
         if comm.kind != "rs":
             continue
         moved_wait, reason = _sink_output_only_wait_closure(comm.wait)
         wait_closures_sunk += int(moved_wait)
-        if not moved_wait and strict:
-            failed_moves.append(
+        if not moved_wait and strict and comm.logical_index is not None:
+            blockers.append(
                 f"RS wait sink for {comm.plan_fqns!r} {comm.wait.name}: {reason}"
             )
 
-    for launch, _wait, target, description in moves:
-        # Recompute order before each move to account for prior moves.
+    if blockers and strict:
+        raise ValueError(
+            "Could not finish FSDP dense-region scheduling:\n"
+            + "\n".join(f"- {blocker}" for blocker in blockers)
+        )
+
+    failed_moves: list[str] = []
+    for launch, _wait, target, description, to_hoist in moves:
         order = {node: i for i, node in enumerate(gm.graph.nodes)}
+        if to_hoist:
+            target_pos = order[target]
+            pending = [node for node in to_hoist if order[node] >= target_pos]
+            for node in sorted(pending, key=order.__getitem__):
+                target.prepend(node)
+            moved += 1
+            continue
         moved_chain, reasons = _move_chain_before(launch, target)
         if moved_chain:
             moved += 1

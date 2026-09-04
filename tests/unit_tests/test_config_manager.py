@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import dataclasses
+import io
 import sys
 import unittest
 from unittest import mock
@@ -122,6 +123,20 @@ class TestConfigManager(unittest.TestCase):
         assert config.training.num_tokens_per_train_step == 8192
         assert config.training.max_context_length == 1024
 
+    def test_cli_accepts_bfloat16_reduction(self):
+        """Mixed-precision FSDP reductions may use BF16."""
+        config = ConfigManager().parse_args(
+            [
+                "--module",
+                "llama3",
+                "--config",
+                "llama3_debugmodel",
+                "--training.mixed_precision_reduce",
+                "bfloat16",
+            ]
+        )
+        assert config.training.mixed_precision_reduce == "bfloat16"
+
     def test_num_tokens_per_microbatch_must_be_positive(self):
         config_manager = ConfigManager()
         with pytest.raises(SystemExit):
@@ -162,7 +177,10 @@ class TestConfigManager(unittest.TestCase):
 
     def test_cuda_graphs_reject_pipeline_parallelism(self):
         config_manager = ConfigManager()
-        with pytest.raises(ValueError, match="do not support pipeline parallelism"):
+        with (
+            mock.patch.object(sys, "stderr", new_callable=io.StringIO) as stderr,
+            pytest.raises(SystemExit),
+        ):
             config_manager.parse_args(
                 [
                     "--module",
@@ -173,6 +191,7 @@ class TestConfigManager(unittest.TestCase):
                     "2",
                 ]
             )
+        assert "do not support pipeline parallelism" in stderr.getvalue()
 
     def test_cuda_graphs_enabled_by_default(self):
         config = ConfigManager().parse_args(
@@ -182,7 +201,10 @@ class TestConfigManager(unittest.TestCase):
 
     def test_cuda_graphs_reject_unsupported_expert_parallelism(self):
         config_manager = ConfigManager()
-        with pytest.raises(ValueError, match="without CPU synchronization"):
+        with (
+            mock.patch.object(sys, "stderr", new_callable=io.StringIO) as stderr,
+            pytest.raises(SystemExit),
+        ):
             config_manager.parse_args(
                 [
                     "--module",
@@ -193,6 +215,7 @@ class TestConfigManager(unittest.TestCase):
                     "2",
                 ]
             )
+        assert "without CPU synchronization" in stderr.getvalue()
 
     def test_cuda_graphs_allow_non_blocking_hybridep(self):
         config_manager = ConfigManager()

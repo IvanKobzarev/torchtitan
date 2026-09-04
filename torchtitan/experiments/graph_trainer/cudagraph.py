@@ -555,6 +555,7 @@ def cudagraph_pass(
     static_input_indices: list[int] | None = None,
     tensor_input_indices: list[int] | None = None,
     require: bool = False,
+    annotate_kernels: bool = False,
 ) -> torch.fx.GraphModule:
     """
     Apply cudagraph.
@@ -579,6 +580,16 @@ def cudagraph_pass(
             opposed to opaque values like DeviceMesh). Used to compute which
             inputs need copying for cudagraph replay. When not provided, this
             is inferred from ``example_inputs``.
+        require: Whether incompatibility must raise instead of skipping capture.
+        annotate_kernels: Whether to add module attribution to kernels recorded
+            by the CUDA graph. Annotation calls are only inserted after the
+            graph passes the CUDA-graph compatibility check.
+
+    Returns:
+        Graph module whose forward is CUDA-graph wrapped when compatible.
+
+    Raises:
+        RuntimeError: If capture is required but the graph is incompatible.
     """
     if not isinstance(gm, torch.fx.GraphModule):
         raise TypeError(
@@ -598,6 +609,9 @@ def cudagraph_pass(
             "passes. Use --compile.disable_passes cudagraph_pass to silence."
         )
         return gm
+
+    if annotate_kernels:
+        gm = insert_kernel_annotations_pass(gm)
 
     if static_input_indices is None:
         static_input_indices = get_static_input_indices(gm, is_forward)

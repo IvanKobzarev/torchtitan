@@ -38,10 +38,7 @@ from torchtitan.experiments.graph_trainer.configs import (
 )
 
 from torchtitan.experiments.graph_trainer.cpu_offload import apply_cpu_offload_pass
-from torchtitan.experiments.graph_trainer.cudagraph import (
-    cudagraph_pass,
-    insert_kernel_annotations_pass,
-)
+from torchtitan.experiments.graph_trainer.cudagraph import cudagraph_pass
 from torchtitan.experiments.graph_trainer.debug_utils import (
     log_graph_diff,
     snapshot_graph,
@@ -65,12 +62,18 @@ from torchtitan.experiments.graph_trainer.ep_process_group_pass import (
 )
 from torchtitan.experiments.graph_trainer.fsdp_passes import (
     deduplicate_fsdp_unshard_chains_pass,
+    enable_fsdp_symmetric_memory_pass,
     get_fsdp_param_module_order,
     get_transformer_block_bucket_counts,
     joint_transformer_block_bucketing_reordering_pass,
     materialize_fsdp_bucket_outputs_pass,
+    preserve_fsdp_unshard_output_boundaries_pass,
     reassign_collective_pgs_pass,
     schedule_fsdp_comms_to_dense_regions_pass,
+)
+from torchtitan.experiments.graph_trainer.gradient_accumulation import (
+    finalize_graph_gradient_accumulation,
+    validate_graph_gradient_output_mapping,
 )
 from torchtitan.experiments.graph_trainer.inductor_passes import (
     annotate_flex_attention_for_regional_inductor_pass,
@@ -142,10 +145,13 @@ def compile_time_passes(
     traced_result: "TracedResult",
     config: "GraphTrainer.Config",
     *,
-    use_cudagraph: bool = False,
+    fsdp_bucket_plan: list[list[str] | str],
     parallel_dims=None,
     include_inductor: bool = True,
     include_mandatory_normalization: bool = True,
+    deduplicate_fsdp_before_bucketing: bool = False,
+    include_gradient_sink: bool = True,
+    include_fsdp_symmetric_memory: bool = True,
 ) -> list[Callable]:
     """Cleanup, FlexAttention annotation, and regional_inductor passes.
 
@@ -156,9 +162,10 @@ def compile_time_passes(
     cudagraph is excluded because it needs to re-capture the graph into
     an in-memory CUDA graph at runtime.
 
-    ``reassign_collective_pgs_pass`` runs just before bucketing to place
-    collectives on dedicated process groups / streams (bucketing then inherits
-    the new PGs). Disable with
+    ``reassign_collective_pgs_pass`` runs immediately after bucketing, whose
+    direction metadata identifies backward all-gathers exactly. This ensures
+    only surviving backward all-gathers receive dedicated process groups and
+    streams. Disable with
     ``--compile.disable_passes reassign_collective_pgs_pass``.
 
     ``include_inductor=False`` leaves the graph in FX form after the
@@ -168,36 +175,40 @@ def compile_time_passes(
     ``include_mandatory_normalization=False`` lets GraphPP run required
     normalization unconditionally and then append only the optional passes
     controlled by ``enable_passes``.
-    """
-    from torchtitan.components.loss import ChunkedLossWrapper
-    from torchtitan.experiments.graph_trainer.common_utils import (
-        get_default_transformer_block_buckets,
-    )
 
+    ``deduplicate_fsdp_before_bucketing=True`` canonicalizes FSDP unshards
+    after activation rematerialization and before bucket construction. GraphPP
+    uses this for RAF=false so rematerialization cannot recreate separate
+    forward and backward unshards that are meant to share one stage lifetime.
+
+    ``include_fsdp_symmetric_memory=False`` leaves bucket collectives in their
+    ordinary form for a later graph partitioner. Deferred FSDP uses this and
+    rewrites its extracted child graphs after validating their boundaries.
+    """
+    enable_fsdp_symm_mem = getattr(
+        config.parallelism,
+        "enable_fsdp_symm_mem",
+        False,
+    )
+    if enable_fsdp_symm_mem and config.compile.precompile_artifact_dir:
+        raise ValueError(
+            "GraphTrainer FSDP symmetric memory does not yet support "
+            "precompiled artifacts"
+        )
+    if enable_fsdp_symm_mem and (
+        getattr(config.parallelism, "pipeline_parallel_degree", 1) > 1
+    ):
+        raise ValueError(
+            "GraphTrainer FSDP symmetric memory currently supports SPMD only"
+        )
     n_layers = len(config.model_spec.model.layers)
-    loss_config = getattr(config, "loss", None)
-    uses_chunked_loss = isinstance(loss_config, ChunkedLossWrapper.Config)
     moe_layer_ids = frozenset(
         i
         for i, layer_cfg in enumerate(config.model_spec.model.layers)
         if getattr(layer_cfg, "moe", None) is not None
     )
     ep_overlap_enabled = config.compile.ep_overlap.enabled
-    if parallel_dims is not None and hasattr(parallel_dims, "get_optional_mesh"):
-        efsdp_mesh = parallel_dims.get_optional_mesh("efsdp")
-        efsdp_degree = 1 if efsdp_mesh is None else efsdp_mesh.size()
-    else:
-        dp_shard = max(1, getattr(config.parallelism, "data_parallel_shard_degree", 1))
-        cp_degree = getattr(config.parallelism, "context_parallel_degree", 1)
-        tp_degree = getattr(config.parallelism, "tensor_parallel_degree", 1)
-        ep_degree = max(1, getattr(config.parallelism, "expert_parallel_degree", 1))
-        efsdp_degree = max(1, (dp_shard * cp_degree * tp_degree) // ep_degree)
-    module_bucket_plans = get_default_transformer_block_buckets(
-        n_layers,
-        chunked_loss_enabled=uses_chunked_loss,
-        moe_layer_ids=moe_layer_ids,
-        split_moe_expert_buckets=efsdp_degree > 1,
-    )
+    module_bucket_plans = fsdp_bucket_plan
 
     passes: list[Callable] = (
         [
@@ -272,8 +283,18 @@ def compile_time_passes(
         passes.append(isolate_ep_process_group_pass)
         passes.append(eliminate_dead_code_pass)
 
-    if config.compile.enable_fsdp_ag_rs_overlap:
-        passes.append(reassign_collective_pgs_pass)
+    if deduplicate_fsdp_before_bucketing:
+        passes.extend(
+            [
+                deduplicate_fsdp_unshard_chains_pass,
+                functools.partial(
+                    preserve_fsdp_unshard_output_boundaries_pass,
+                    num_model_state_tensor_inputs=(
+                        traced_result.num_model_state_tensor_inputs
+                    ),
+                ),
+            ]
+        )
     passes.append(
         functools.partial(
             joint_transformer_block_bucketing_reordering_pass,
@@ -285,6 +306,8 @@ def compile_time_passes(
             ),
         )
     )
+    if config.compile.enable_fsdp_ag_rs_overlap:
+        passes.append(reassign_collective_pgs_pass)
     if config.compile.fsdp_contiguous_module_fqns:
         passes.append(
             functools.partial(
@@ -334,6 +357,9 @@ def compile_time_passes(
                 schedule_fsdp_comms_to_dense_regions_pass,
                 moe_layer_ids=moe_layer_ids,
                 n_layers=n_layers,
+                num_model_state_tensor_inputs=(
+                    traced_result.num_model_state_tensor_inputs
+                ),
                 transformer_bucket_counts_by_layer=get_transformer_block_bucket_counts(
                     module_bucket_plans,
                     n_layers=n_layers,
@@ -365,13 +391,29 @@ def compile_time_passes(
         )
         passes.append(materialize_coda_inductor_regions_pass)
 
+    if include_gradient_sink and traced_result.graph_state_output_indices:
+        passes.append(
+            functools.partial(
+                finalize_graph_gradient_accumulation,
+                traced_result=traced_result,
+            )
+        )
+
+    if enable_fsdp_symm_mem and include_fsdp_symmetric_memory:
+        passes.append(
+            functools.partial(
+                enable_fsdp_symmetric_memory_pass,
+                policy=config.parallelism.fsdp_symm_mem_policy,
+                preallocate=config.compile.inductor_compilation != "full",
+            )
+        )
+
     if not include_inductor:
         return passes
 
     passes.extend(
         final_inductor_compile_passes(
             config.compile,
-            use_cudagraph=use_cudagraph,
         )
     )
     return passes
@@ -380,7 +422,6 @@ def compile_time_passes(
 def final_inductor_compile_passes(
     compile_config: GraphTrainerCompileConfig,
     *,
-    use_cudagraph: bool = False,
     boxed_codegen: bool = False,
 ) -> list[Callable]:
     """Return the terminal Inductor passes for a traced graph.
@@ -391,10 +432,13 @@ def final_inductor_compile_passes(
     only depends on compile config; model- and parallelism-aware rewrites stay
     in ``compile_time_passes``.
     """
-    from torchtitan.models.common.attention import FlexAttention
-
     passes: list[Callable] = []
     inductor_compilation = compile_config.inductor_compilation
+    if inductor_compilation == "none":
+        return passes
+
+    from torchtitan.models.common.attention import FlexAttention
+
     if inductor_compilation == "full":
         # Compile the entire graph into optimized Triton kernels. Must be
         # terminal; the FX graph is no longer authoritative after this pass.
@@ -425,11 +469,9 @@ def final_inductor_compile_passes(
                 boxed_codegen=boxed_codegen,
             )
         )
-        if use_cudagraph:
-            passes.append(insert_kernel_annotations_pass)
     else:
         raise ValueError(
-            "--compile.inductor_compilation must be 'regional' or 'full', "
+            "--compile.inductor_compilation must be 'none', 'regional', or 'full', "
             f"got {inductor_compilation!r}"
         )
     return passes
@@ -439,6 +481,7 @@ def construct_default_graph_passes(
     traced_result: "TracedResult",
     config: "GraphTrainer.Config",
     *,
+    fsdp_bucket_plan: list[list[str] | str],
     parallel_dims=None,
 ) -> list[Callable]:
     """Build the pass list for the aot_fx_trace path.
@@ -464,7 +507,7 @@ def construct_default_graph_passes(
             compile_time_passes(
                 traced_result,
                 config,
-                use_cudagraph=want_cudagraph,
+                fsdp_bucket_plan=fsdp_bucket_plan,
                 parallel_dims=parallel_dims,
             )
         )
@@ -477,6 +520,11 @@ def construct_default_graph_passes(
                 static_input_indices=static_input_indices,
                 tensor_input_indices=traced_result.tensor_input_indices,
                 require=config.compile.require_cudagraph,
+                annotate_kernels=(
+                    config.compile.inductor_compilation != "full"
+                    and "insert_kernel_annotations_pass"
+                    not in config.compile.disable_passes
+                ),
             )
         )
     return passes
@@ -495,6 +543,14 @@ def _filter_disabled_passes(
 ) -> list[Callable]:
     """Remove passes whose names exactly match any entry in ``disable_names``."""
     disable_set = set(disable_names)
+    mandatory = {"finalize_graph_gradient_accumulation"}
+    available_names = {_get_pass_name(pass_fn) for pass_fn in passes}
+    disabled_mandatory = disable_set & mandatory & available_names
+    if disabled_mandatory:
+        raise ValueError(
+            "The following correctness passes cannot be disabled: "
+            f"{sorted(disabled_mandatory)}"
+        )
     filtered = []
     skipped = []
     for pass_fn in passes:
@@ -515,6 +571,7 @@ def apply_graph_passes(
     *,
     compile_config: "GraphTrainerCompileConfig | None" = None,
     respect_disable_passes: bool = True,
+    traced_result: "TracedResult | None" = None,
 ) -> torch.fx.GraphModule:
     """Apply graph passes to the traced fwd+bwd graph.
 
@@ -529,6 +586,8 @@ def apply_graph_passes(
         respect_disable_passes: Whether ``compile_config.disable_passes`` may
             remove passes from this invocation. GraphPP sets this to ``False``
             for mandatory pre-partition normalization.
+        traced_result: Optional metadata whose gradient-output mapping is
+            validated after every pass until the terminal sink consumes it.
     """
     debug = compile_config is not None and compile_config.debug_graph_passes
     disable_patterns = (
@@ -545,6 +604,8 @@ def apply_graph_passes(
     # pass-local fake inputs in sync so later compiler passes see the same
     # static/dynamic contract as the FX graph.
     pass_example_inputs = list(example_inputs)
+    if traced_result is not None and traced_result.graph_state_output_indices:
+        validate_graph_gradient_output_mapping(gm, traced_result)
     for pass_fn in passes:
         pass_name = _get_pass_name(pass_fn)
         if debug:
@@ -555,6 +616,17 @@ def apply_graph_passes(
         assert isinstance(
             gm, torch.fx.GraphModule
         ), f"Pass {pass_name} returned {type(gm).__name__}, expected GraphModule"
+        if (
+            traced_result is not None
+            and traced_result.graph_state_output_indices
+            and not traced_result.grad_sink_active
+        ):
+            try:
+                validate_graph_gradient_output_mapping(gm, traced_result)
+            except ValueError as error:
+                raise ValueError(
+                    f"Graph pass {pass_name} invalidated the gradient-output mapping"
+                ) from error
         if debug:
             elapsed = time.perf_counter() - start
             logger.info(f"Pass {pass_name} took {elapsed:.3f}s")

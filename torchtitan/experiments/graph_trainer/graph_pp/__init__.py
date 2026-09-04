@@ -17,19 +17,19 @@ from torchtitan.experiments.graph_trainer.graph_pp.split_di_dw import (
 )
 from torchtitan.experiments.graph_trainer.graph_pp.split_fsdp_collectives import (
     GraphPPFSDPBackwardSplit,
-    GraphPPFSDPForwardSplit,
+    GraphPPFSDPUnshardSplit,
     split_backward_fsdp_collectives,
-    split_forward_fsdp_collectives,
+    split_fsdp_unshard_collectives,
 )
 
 __all__ = [
     "GraphPPDiDwSplit",
     "GraphPPFSDPBackwardSplit",
-    "GraphPPFSDPForwardSplit",
+    "GraphPPFSDPUnshardSplit",
     "GraphMeta",
     "multiplex_fw_bw_graph",
     "partition_joint_graph",
     "split_backward_fsdp_collectives",
     "split_di_dw_graph",
-    "split_forward_fsdp_collectives",
+    "split_fsdp_unshard_collectives",
 ]

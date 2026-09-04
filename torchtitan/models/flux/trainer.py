@@ -111,6 +111,7 @@ class FluxTrainer(Trainer):
             parallel_dims=self.parallel_dims,
             training=config.training,
             enable_symm_mem=config.parallelism.enable_fsdp_symm_mem,
+            symm_mem_policy=config.parallelism.fsdp_symm_mem_policy,
         )
 
         if config.validator.enable:

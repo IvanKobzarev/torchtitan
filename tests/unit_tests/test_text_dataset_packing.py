@@ -16,9 +16,16 @@ from torchtitan.hf_datasets.text_datasets import DATASETS
 _TOKENIZER_PATH = os.path.join(os.path.dirname(__file__), "..", "assets", "tokenizer")
 
 
-def _build_dataloader(max_context_length: int) -> GrainDataLoader:
+def _build_dataloader(
+    max_context_length: int,
+    *,
+    mask_document_boundaries: bool = True,
+) -> GrainDataLoader:
     return GrainDataLoader.Config(
-        dataset=ConcatThenSplitPackingConfig(dataset=DATASETS["c4_test"]),
+        dataset=ConcatThenSplitPackingConfig(
+            dataset=DATASETS["c4_test"],
+            mask_document_boundaries=mask_document_boundaries,
+        ),
         shuffle=False,
         num_prefetch_batches=0,
     ).build(
@@ -82,6 +89,14 @@ class TestTextDatasetPacking(unittest.TestCase):
 
         # Guard against the assertions above passing vacuously.
         self.assertGreater(interior_doc_starts, 0)
+
+    def test_unmasked_document_boundaries_use_continuous_positions(self):
+        dataloader = _build_dataloader(256, mask_document_boundaries=False)
+        try:
+            input_dict, _labels = next(iter(dataloader))
+            self.assertTrue(torch.equal(input_dict["positions"], torch.arange(256)))
+        finally:
+            dataloader.close()
 
 
 class TestTextDatasetBufferCheckpointing(unittest.TestCase):

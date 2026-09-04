@@ -21,6 +21,7 @@ from torch._functorch.partitioners import (
 from torchtitan.experiments.graph_trainer.common_utils import (
     _get_module_fqn,
     _is_backward_node,
+    _RECOMPUTE_MUTATIONS,
 )
 
 
@@ -174,6 +175,12 @@ def selective_activation_remat_pass(
             remat_targets.setdefault(n, bwd_node)
             for inp in n.all_input_nodes:
                 _gather(inp)
+            for mutation in n.meta.get(_RECOMPUTE_MUTATIONS, ()):
+                if not isinstance(mutation, fx.Node):
+                    raise RuntimeError(
+                        f"Invalid replay mutation metadata on {n.name}: {mutation!r}"
+                    )
+                _gather(mutation)
 
         # bwd_node itself may not be must_recompute; start from its inputs.
         for inp in bwd_node.all_input_nodes:

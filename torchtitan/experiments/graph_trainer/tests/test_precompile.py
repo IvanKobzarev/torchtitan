@@ -299,6 +299,29 @@ class TestConfigFingerprint(unittest.TestCase):
         )
         self.assertNotEqual(fp_graph_batch, fp_graph_seq)
 
+    def test_reduce_dtype_sensitivity(self):
+        from torchtitan.experiments.graph_trainer.precompile import (
+            compute_config_fingerprint,
+        )
+
+        model = _make_stub_model()
+        cfg = _StubCompileConfig()
+        dims = _StubParallelDims()
+
+        fp_bf16 = compute_config_fingerprint(
+            model,
+            cfg,
+            dims,
+            mixed_precision_reduce="bfloat16",
+        )
+        fp_fp32 = compute_config_fingerprint(
+            model,
+            cfg,
+            dims,
+            mixed_precision_reduce="float32",
+        )
+        self.assertNotEqual(fp_bf16, fp_fp32)
+
     def test_pass_order_sensitive(self):
         from torchtitan.experiments.graph_trainer.precompile import (
             compute_config_fingerprint,
@@ -326,13 +349,41 @@ class TestPrecompileLossSetup(unittest.TestCase):
         model = SimpleNamespace(lm_head=lm_head, _skip_lm_head=False)
         loss_fn = ChunkedLossWrapperWithParamGrads.Config().build()
 
-        _prepare_loss_for_precompile(model, loss_fn)
+        _prepare_loss_for_precompile(
+            model,
+            loss_fn,
+            weight_gradient_reduce_dtype=torch.bfloat16,
+        )
 
         self.assertIs(loss_fn.lm_head, lm_head)
+        self.assertEqual(loss_fn.weight_gradient_reduce_dtype, torch.bfloat16)
         self.assertTrue(model._skip_lm_head)
 
 
 class TestPrecompiledFxTraceArtifact(unittest.TestCase):
+    def test_loaded_artifact_supports_bound_runner(self):
+        from torchtitan.experiments.graph_trainer.make_fx_tracer import (
+            bind_traced,
+            minimal_fx_tracer,
+        )
+        from torchtitan.experiments.graph_trainer.precompile import (
+            PrecompiledFxTraceArtifact,
+        )
+
+        model = torch.nn.Linear(3, 2, dtype=torch.float64)
+        inputs = torch.randn(4, 3, dtype=torch.float64)
+
+        def forward(value):
+            return model(value)
+
+        traced = minimal_fx_tracer(forward, module=model)(inputs)
+        loaded = PrecompiledFxTraceArtifact.from_traced_result(
+            traced
+        ).to_traced_result()
+        run = bind_traced(loaded, module=model)
+
+        self.assertTrue(torch.equal(model(inputs), run(inputs)))
+
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
     def test_standalone_inductor_precompile(self):
         from torchtitan.experiments.graph_trainer.inductor_passes import (
@@ -411,6 +462,7 @@ class TestPrecompiledFxTraceArtifact(unittest.TestCase):
         self.assertEqual(len(loaded.input_subclass_layouts), 2)
         self.assertEqual(loaded.num_flat_outputs, 2)
         self.assertEqual(loaded.config_fingerprint, "test_fp_123")
+        self.assertEqual(loaded.num_optimizer_state_inputs, 0)
 
     def test_artifact_pickle_with_blockmask_treespec(self):
         """Verify artifact pickles when user_inputs_spec contains BlockMask.
@@ -462,12 +514,22 @@ class TestPrecompiledFxTraceArtifact(unittest.TestCase):
             output_subclass_layouts={},
             output_spec=dummy_spec,
             state_fqns=[],
+            graph_state_fqns=[],
+            graph_state_input_indices=(),
+            graph_state_output_indices=(),
+            grad_sink_active=False,
         )
 
         artifact = PrecompiledFxTraceArtifact.from_traced_result(traced_result)
         data = pickle.dumps(artifact)
         loaded = pickle.loads(data)
         self.assertEqual(loaded.serialized_gm, artifact.serialized_gm)
+
+        traced_result.graph_state_fqns = ["weight"]
+        traced_result.graph_state_input_indices = ((0,),)
+        traced_result.graph_state_output_indices = (1,)
+        with self.assertRaisesRegex(ValueError, "graph-owned gradient state"):
+            PrecompiledFxTraceArtifact.from_traced_result(traced_result)
 
     def test_fx_trace_save_load_fingerprint_mismatch(self):
         from torchtitan.experiments.graph_trainer.precompile import (

@@ -785,12 +785,68 @@ def build_graph_trainer_autoparallel_h100_test_list() -> list[OverrideDefinition
     return _build_autoparallel_h100_tests()
 
 
+def build_graph_trainer_blackwell_test_list() -> list[OverrideDefinitions]:
+    """Return SM100 tests for BF16 and MXFP8 DistMoE CUDA graph replay.
+
+    Returns:
+        Two-rank DSV3 16B training configurations that require CUDA capture.
+    """
+    common = [
+        "--compile.mode aot_fx_trace",
+        "--compile.inductor_compilation none",
+        "--compile.memory_policy full",
+        "--compile.require_cudagraph",
+        "--parallelism.data_parallel_shard_degree 2",
+        "--parallelism.tensor_parallel_degree 1",
+        "--parallelism.expert_parallel_degree 2",
+        "--training.num_tokens_per_microbatch_per_dp_rank 128",
+        "--training.max_context_length 128",
+        "--training.steps 4",
+        "--dataloader.dataset c4_test",
+        "--hf_assets_path ./tests/assets/tokenizer",
+        "--metrics.no-enable_tensorboard",
+        "--profiler.no-enable_profiling",
+        "--comm.trace_buf_size 0",
+    ]
+    return [
+        OverrideDefinitions(
+            [
+                [
+                    "--module graph_trainer.deepseek_v3",
+                    "--config graph_trainer_deepseek_v3_16b_dist_moe_bf16",
+                    *common,
+                ]
+            ],
+            "aot_fx_trace DSV3 16B BF16 DistMoE CUDA graph",
+            "aot_fx_trace_dsv3_16b_dist_moe_bf16_cudagraph",
+            ngpu=2,
+            skip_rocm_test=True,
+            timeout=1800,
+        ),
+        OverrideDefinitions(
+            [
+                [
+                    "--module torchtitan.experiments.graph_trainer.tests.test_dist_moe",
+                    "--config graph_trainer_deepseek_v3_16b_dist_moe_mxfp8_cudagraph_test",
+                    *common,
+                ]
+            ],
+            "aot_fx_trace DSV3 16B MXFP8 DistMoE CUDA graph",
+            "aot_fx_trace_dsv3_16b_dist_moe_mxfp8_cudagraph",
+            ngpu=2,
+            skip_rocm_test=True,
+            timeout=1800,
+        ),
+    ]
+
+
 _TEST_SUITES_FUNCTION = {
     "graph_trainer": build_graph_trainer_test_list,
     "graph_trainer_default": build_graph_trainer_default_test_list,
     "graph_trainer_h100": build_graph_trainer_h100_test_list,
     "graph_trainer_autoparallel": build_graph_trainer_autoparallel_test_list,
     "graph_trainer_autoparallel_h100": build_graph_trainer_autoparallel_h100_test_list,
+    "graph_trainer_blackwell": build_graph_trainer_blackwell_test_list,
 }
 
 

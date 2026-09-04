@@ -288,6 +288,7 @@ def apply_fsdp_to_mtp_decoder(
     dp_mesh_dims: DataParallelMeshDims | None = None,
     edp_mesh_dims: DataParallelMeshDims | None = None,
     enable_symm_mem: bool = False,
+    symm_mem_policy: str = "all",
 ) -> None:
     mtp_layer_keys = []
     try:
@@ -311,6 +312,7 @@ def apply_fsdp_to_mtp_decoder(
             dp_mesh_dims=dp_mesh_dims,
             edp_mesh_dims=edp_mesh_dims,
             enable_symm_mem=enable_symm_mem,
+            symm_mem_policy=symm_mem_policy,
         )
     finally:
         for key in mtp_layer_keys:

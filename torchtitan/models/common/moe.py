@@ -20,7 +20,7 @@ from torchtitan.models.common.feed_forward import FeedForward
 from torchtitan.models.common.linear import Linear
 from torchtitan.protocols.module import Module
 
-from .token_dispatcher import LocalTokenDispatcher
+from .token_dispatcher import DeepEPTokenDispatcher, LocalTokenDispatcher
 
 # Shape suffix legend
 # (https://medium.com/@NoamShazeer/shape-suffixes-good-coding-style-f836e72e24fd):
@@ -136,12 +136,24 @@ class RoutedExperts(Module):
         self.num_experts = self.inner_experts.num_experts
         self.token_dispatcher = config.token_dispatcher.build()
 
+    @property
+    def sp_size(self) -> int:
+        """Return the sequence-parallel degree used by routed experts."""
+        return getattr(self.token_dispatcher, "sp_size", 1)
+
     def expert_parameters_module(self) -> nn.Module:
         """Return the module that directly owns all expert parameters."""
         return self.inner_experts
 
     def synchronize(self) -> None:
         """Wait for deferred routed-expert work, when the backend has any."""
+        if (
+            isinstance(self.token_dispatcher, DeepEPTokenDispatcher)
+            and getattr(self.token_dispatcher, "sp_size", 1) == 1
+        ):
+            from torchtitan.distributed.deepep.deepep import sync_combine
+
+            sync_combine()
 
     def forward(
         self,
@@ -187,6 +199,36 @@ class RoutedExperts(Module):
         self.token_dispatcher.wire_meshes(
             ep_mesh=parallel_dims.get_optional_mesh("ep"),
         )
+
+
+def get_expert_parameter_owner(routed_experts: RoutedExperts) -> nn.Module:
+    """Return and validate the module that owns routed-expert parameters.
+
+    Args:
+        routed_experts: Routed-expert module whose parameter owner is needed.
+
+    Returns:
+        The routed module itself or one of its registered descendants.
+
+    Raises:
+        ValueError: If the owner is outside the routed subtree, has no
+            parameters, or does not own every parameter in that subtree.
+    """
+    owner = routed_experts.expert_parameters_module()
+    if owner not in set(routed_experts.modules()):
+        raise ValueError(
+            "Expert parameter owner must be the routed experts module or one "
+            "of its descendants."
+        )
+    owner_params = set(owner.parameters())
+    if not owner_params:
+        raise ValueError("Expert parameter owner must contain parameters.")
+    if owner_params != set(routed_experts.parameters()):
+        raise ValueError(
+            "Expert parameter owner must own every parameter in the routed "
+            "experts subtree."
+        )
+    return owner
 
 
 class TokenChoiceTopKRouter(Module):
@@ -478,22 +520,3 @@ class MoE(Module):
                 self.expert_bias_E = torch.zeros(
                     self.routed_experts.num_experts, dtype=torch.float32
                 )
-
-
-def get_expert_parameter_owner(routed_experts: RoutedExperts) -> nn.Module:
-    """Return and validate the module owning routed-expert parameters."""
-    owner = routed_experts.expert_parameters_module()
-    if owner not in set(routed_experts.modules()):
-        raise ValueError(
-            "Expert parameter owner must be the routed experts module or one "
-            "of its descendants."
-        )
-    owner_params = set(owner.parameters())
-    if not owner_params:
-        raise ValueError("Expert parameter owner must contain parameters.")
-    if owner_params != set(routed_experts.parameters()):
-        raise ValueError(
-            "Expert parameter owner must own every parameter in the routed "
-            "experts subtree."
-        )
-    return owner

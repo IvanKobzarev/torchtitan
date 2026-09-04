@@ -20,6 +20,22 @@ from torchtitan.experiments.graph_trainer.trainer import GraphTrainer
 from torchtitan.trainer import Trainer
 
 
+class _SingleRankParallelDims(SimpleNamespace):
+    """Provide the parallel-topology interface used by single-rank tests."""
+
+    def get_optional_mesh(self, mesh_name: str) -> None:
+        """Return no optional mesh for a single-rank test topology.
+
+        Args:
+            mesh_name: Requested optional mesh name.
+
+        Returns:
+            ``None`` because focused unit tests do not construct device meshes.
+        """
+        del mesh_name
+        return None
+
+
 def build_minimal_trainer(
     model: nn.Module,
     model_config,
@@ -38,12 +54,42 @@ def build_minimal_trainer(
     compile_numerics_changing_optim: bool = False,
     tokenizer=None,
     fsdp_reshard_after_forward: str = "default",
+    parallel_dims=None,
 ) -> Trainer:
-    """Build the minimal Trainer/GraphTrainer needed for single-GPU test steps."""
+    """Build the minimal Trainer state needed for test steps.
+
+    Args:
+        model: Model executed by the trainer.
+        model_config: Configuration used to build ``model``.
+        trainer_cls: Trainer implementation to instantiate without ``__init__``.
+        activation_checkpoint_mode: Activation-checkpoint policy name.
+        compile_enable_passes: Whether GraphTrainer applies graph passes.
+        compile_passes: Additional graph pass names.
+        compile_ep_overlap_enabled: Whether EP overlap is enabled.
+        compile_ep_overlap_chunk_dim: Dimension used for EP overlap chunks.
+        compile_ep_overlap_chunk_strategy: Eager or graph chunking strategy.
+        compile_ep_overlap_module_fqn: Module pattern chunked for EP overlap.
+        compile_ep_overlap_disable_early_grad_accumulation: Whether to defer
+            parameter-gradient accumulation until after chunk recombination.
+        compile_inductor_compilation: GraphTrainer Inductor compilation mode.
+        compile_disable_passes: Graph pass names disabled for the test.
+        compile_numerics_changing_optim: Whether numerics-changing passes run.
+        tokenizer: Optional tokenizer used to prepare model inputs.
+        fsdp_reshard_after_forward: FSDP parameter reshard policy.
+        parallel_dims: Optional real parallel topology for distributed tests.
+
+    Returns:
+        A minimally initialized trainer suitable for focused tests.
+    """
     trainer = object.__new__(trainer_cls)
     trainer.model_parts = [model]
-    trainer.loss_fn = CrossEntropyLoss.Config().build()
-    trainer.parallel_dims = SimpleNamespace(pp_enabled=False, cp_enabled=False)
+    loss_config = CrossEntropyLoss.Config()
+    trainer.loss_fn = loss_config.build()
+    trainer.parallel_dims = (
+        _SingleRankParallelDims(pp_enabled=False, cp_enabled=False)
+        if parallel_dims is None
+        else parallel_dims
+    )
     trainer.train_context = get_spmd_context()
     trainer.fwd_bwd_fn = trainer._forward_backward_body
     trainer.model_config = model_config
@@ -75,6 +121,7 @@ def build_minimal_trainer(
                     ),
                 ),
             ),
+            loss=loss_config,
             model_spec=SimpleNamespace(model=model_config),
             activation_checkpoint={
                 "none": None,

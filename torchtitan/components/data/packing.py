@@ -22,6 +22,8 @@ class ConcatThenSplitPackingConfig:
     """Concatenates tokenized documents and splits fixed-length rows."""
 
     dataset: DatasetConfig
+    mask_document_boundaries: bool = True
+    """Reset positions at document boundaries within each packed row."""
 
     def build(
         self,
@@ -52,7 +54,12 @@ class ConcatThenSplitPackingConfig:
             },
         )
         dataset = dataset.filter(_packing_output_is_full)
-        return dataset.map(_packing_output_to_text_sequence)
+        return dataset.map(
+            partial(
+                _packing_output_to_text_sequence,
+                mask_document_boundaries=self.mask_document_boundaries,
+            )
+        )
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
@@ -138,6 +145,8 @@ def _text_sequence_to_packing_input(
 
 def _packing_output_to_text_sequence(
     packing_output: dict[str, np.ndarray],
+    *,
+    mask_document_boundaries: bool = True,
 ) -> TextSequence:
     """Finalize packed text by masking padding and canonicalizing positions."""
     labels = np.asarray(packing_output["labels"]).copy()
@@ -145,12 +154,16 @@ def _packing_output_to_text_sequence(
 
     # A zero starts a document. For [0, 1, 2, 0, 1], segment_starts is
     # [0, 0, 0, 3, 3], so subtracting it restores [0, 1, 2, 0, 1].
-    boundaries = np.asarray(packing_output["positions"]) == 0
-    token_indices = np.arange(len(boundaries), dtype=np.int64)
-    segment_starts = np.maximum.accumulate(np.where(boundaries, token_indices, 0))
+    token_indices = np.arange(len(labels), dtype=np.int64)
+    if mask_document_boundaries:
+        boundaries = np.asarray(packing_output["positions"]) == 0
+        segment_starts = np.maximum.accumulate(np.where(boundaries, token_indices, 0))
+        positions = token_indices - segment_starts
+    else:
+        positions = token_indices
 
     return TextSequence(
         input_ids=np.asarray(packing_output["input_ids"]),
         labels=labels,
-        positions=token_indices - segment_starts,
+        positions=positions,
     )

@@ -29,6 +29,10 @@ from torch.distributed.pipelining.schedules import (
 )
 from torch.distributed.pipelining.stage import _normalize_model_output_as_tuple
 
+from torchtitan.distributed.pipeline_parallel import (
+    _get_pipeline_microbatch_callback,
+    _set_pipeline_microbatch,
+)
 from torchtitan.experiments.graph_trainer.common_utils import accumulate_param_grads_
 from torchtitan.experiments.graph_trainer.graph_pp.stage import (
     GraphPipelineStage,
@@ -441,6 +445,7 @@ class GraphPipelineRuntime:
             mb_index,
             is_next_stage_on_this_rank,
         ) = _prepare_fwd_common(self.schedule, action)
+        _set_pipeline_microbatch(stage.submod, mb_index)
         args, kwargs, target = _prepare_fwd_user_args(stage, mb_index, ctx)
         graphs = self.stage_graphs[stage.stage_index]
         _ensure_unsharded_param_values(stage, graphs)
@@ -473,6 +478,7 @@ class GraphPipelineRuntime:
         ) = _prepare_backward_common(self.schedule, action)
         if not stage.has_backward:
             return
+        _set_pipeline_microbatch(stage.submod, mb_index)
         graphs = self.stage_graphs[stage.stage_index]
         (
             stage_output,
@@ -511,6 +517,7 @@ class GraphPipelineRuntime:
         ) = _prepare_backward_common(self.schedule, action)
         if not stage.has_backward:
             return
+        _set_pipeline_microbatch(stage.submod, mb_index)
         graphs = self.stage_graphs[stage.stage_index]
         (
             stage_output,
@@ -554,6 +561,7 @@ class GraphPipelineRuntime:
             return
         if not stage.has_backward:
             return
+        _set_pipeline_microbatch(stage.submod, mb_index)
         saved_values_for_backward_weight = (
             stage.saved_values_for_backward_weight_cache.pop(mb_index)
         )
@@ -599,6 +607,20 @@ class GraphPipelineRuntime:
         ) = _prepare_backward_common(self.schedule, bw_action)
         if not bw_stage.has_backward:
             return
+
+        fw_callback = _get_pipeline_microbatch_callback(fw_stage.submod)
+        bw_callback = _get_pipeline_microbatch_callback(bw_stage.submod)
+        if (
+            fw_callback is not None
+            and fw_callback is bw_callback
+            and fw_mb_index != bw_mb_index
+        ):
+            raise RuntimeError(
+                "GraphPP cannot multiplex different microbatches through one "
+                "stage-local backend context"
+            )
+        _set_pipeline_microbatch(fw_stage.submod, fw_mb_index)
+        _set_pipeline_microbatch(bw_stage.submod, bw_mb_index)
 
         args, kwargs, target = _prepare_fwd_user_args(fw_stage, fw_mb_index, ctx)
         fw_graphs = self.stage_graphs[fw_stage.stage_index]

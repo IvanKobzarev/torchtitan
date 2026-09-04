@@ -86,6 +86,23 @@ class GraphTrainerCompileConfig(CompileConfig):
     partitioning contracts depend on canonical graph structure.
     """
 
+    enable_graph_gradient_accumulation: bool = False
+    """Accumulate SPMD AOT gradients into stable buffers inside minimal FX.
+
+    This is independent of CUDA graph capture. V1 does not support GraphPP,
+    full Inductor, precompiled artifacts, parameter aliases, or custom pass
+    pipelines.
+    """
+
+    enable_deferred_fsdp_gradient_sync: bool = False
+    """Reduce FSDP gradients once after all SPMD accumulation microbatches.
+
+    The whole accumulation loop remains a minimal-FX program whether CUDA
+    graphs are enabled or disabled. The initial implementation requires
+    ``enable_graph_gradient_accumulation`` and ``fsdp_reshard_after_forward``
+    set to ``never``.
+    """
+
     disable_passes: list[str] = field(default_factory=list)
     """Pass names to selectively disable for debugging and ablation
     studies. A pass is skipped if its name exactly matches any entry.
@@ -97,9 +114,12 @@ class GraphTrainerCompileConfig(CompileConfig):
     require_cudagraph: bool = False
     """Fail when the CUDA graph pass cannot capture the full train-step graph."""
 
-    memory_policy: Literal["default", "full", "eager", "sac_and_offload"] = "default"
+    memory_policy: Literal[
+        "none", "default", "full", "eager", "sac_and_offload"
+    ] = "default"
     """
     Memory optimization policy for activation management (SAC, offload).
+        none: save forward activations without rematerialization.
         default: SAC — save all compute-intensive ops and FSDP all_gathers.
         full: full recompute, saving layer outputs and operations selected by
             full_recompute_save_ops. With no selectors, this mirrors eager's
@@ -119,13 +139,21 @@ class GraphTrainerCompileConfig(CompileConfig):
     ``layers.*.moe.router.gate::aten.mm.default | layers.*.attention.wkv_a::aten.mm.default``.
     """
 
+    force_recompute_mm_shapes_by_fqns: list[str] = field(default_factory=list)
+    """Module FQN substrings whose MM outputs must be rematerialized.
+
+    Ignored when ``memory_policy`` is ``none``, which always saves forward
+    activations.
+    """
+
     pass_pipeline: str = "default"
     """Pass pipeline selection. Controls which graph pass pipeline, post-init
     hooks, and pre-train-step hooks are activated."""
 
-    inductor_compilation: Literal["regional", "full"] = "regional"
+    inductor_compilation: Literal["none", "regional", "full"] = "regional"
     """
     Inductor compilation strategy. Mutually exclusive options:
+        none: keep the transformed train-step FX graph interpreted.
         regional: compile tagged regions (e.g. FlexAttention HOPs) with
             regional_inductor while leaving the rest interpreted.
         full: compile the entire graph with inductor into optimized
@@ -135,7 +163,8 @@ class GraphTrainerCompileConfig(CompileConfig):
 
     numerics_changing_optim: bool = False
     """Enable passes that improve performance but may change numerics
-    compared to the uncompiled path (e.g. RMSNorm Inductor fusion)."""
+    compared to the uncompiled path, including RMSNorm Inductor fusion and
+    deferred BF16 WGrad accumulation fused into its producer."""
 
     enable_coda: bool = False
     """Fuse supported GEMM epilogues with FlexGEMM in the joint training graph.

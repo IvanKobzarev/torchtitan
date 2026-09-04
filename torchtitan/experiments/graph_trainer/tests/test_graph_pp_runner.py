@@ -32,7 +32,13 @@ from torchtitan.experiments.graph_trainer.common_utils import (
     maybe_register_blockmask_pytree_node,
 )
 from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConfig
-from torchtitan.experiments.graph_trainer.graph_pp import multiplex_fw_bw_graph
+from torchtitan.experiments.graph_trainer.fsdp_passes import (
+    deduplicate_fsdp_unshard_chains_pass,
+)
+from torchtitan.experiments.graph_trainer.graph_pp import (
+    multiplex_fw_bw_graph,
+    split_fsdp_unshard_collectives,
+)
 from torchtitan.experiments.graph_trainer.graph_pp.graph_builder import (
     _build_graph_pp_overlap_graphs,
     _build_stage_graphs,
@@ -151,6 +157,101 @@ def _trace_mask_mod_replay(mask0: Any, mask1: Any) -> tuple[bool, bool]:
 
 
 class GraphPipelineRuntimeTraceTest(unittest.TestCase):
+    def test_raf_false_deduplicates_before_bucketing_and_fsdp_split(
+        self,
+    ) -> None:
+        """GraphPP deduplicates after remat and before FSDP extraction."""
+        model = nn.Linear(4, 4)
+        x = torch.randn(2, 4, requires_grad=True)
+        stage = _make_test_stage(
+            model,
+            is_last=False,
+            output_grads=torch.empty_like(model(x)),
+            compile_config=GraphTrainerCompileConfig(enable_passes=True),
+        )
+        stage.model_config = types.SimpleNamespace(layers=[])
+        stage.parallelism = ParallelismConfig(fsdp_reshard_after_forward="never")
+        calls = mock.Mock()
+
+        with (
+            mock.patch(
+                "torchtitan.experiments.graph_trainer.graph_pp.graph_builder."
+                "deduplicate_fsdp_unshard_chains_pass",
+                wraps=deduplicate_fsdp_unshard_chains_pass,
+            ) as deduplicate,
+            mock.patch(
+                "torchtitan.experiments.graph_trainer.graph_pp.graph_builder."
+                "compile_time_passes",
+            ) as compile_passes,
+            mock.patch(
+                "torchtitan.experiments.graph_trainer.graph_pp.graph_builder."
+                "split_fsdp_unshard_collectives",
+                wraps=split_fsdp_unshard_collectives,
+            ) as split_unshard,
+        ):
+            deduplicate.__name__ = deduplicate_fsdp_unshard_chains_pass.__name__
+            calls.attach_mock(deduplicate, "deduplicate")
+            calls.attach_mock(compile_passes, "compile_passes")
+            calls.attach_mock(split_unshard, "split_unshard")
+            compile_passes.side_effect = lambda *args, **kwargs: (
+                [deduplicate] if kwargs["deduplicate_fsdp_before_bucketing"] else []
+            )
+            _build_test_stage_graphs(
+                stage,
+                (x,),
+                {},
+                None,
+                {},
+                compile_graphs=False,
+            )
+
+        call_names = [call[0] for call in calls.mock_calls]
+        deduplicate_index = call_names.index("deduplicate")
+        compile_passes_index = call_names.index("compile_passes")
+        split_index = call_names.index("split_unshard")
+        self.assertLess(compile_passes_index, deduplicate_index)
+        self.assertLess(deduplicate_index, split_index)
+        self.assertTrue(
+            compile_passes.call_args.kwargs["deduplicate_fsdp_before_bucketing"]
+        )
+        self.assertIs(
+            calls.mock_calls[deduplicate_index].args[0],
+            calls.mock_calls[split_index].args[0],
+        )
+
+    def test_raf_true_keeps_fsdp_collectives_inside_microbatch_graphs(self) -> None:
+        """GraphPP does not canonicalize or extract RAF=true collectives."""
+        model = nn.Linear(4, 4)
+        x = torch.randn(2, 4, requires_grad=True)
+        stage = _make_test_stage(
+            model,
+            is_last=False,
+            output_grads=torch.empty_like(model(x)),
+        )
+        stage.parallelism = ParallelismConfig(fsdp_reshard_after_forward="always")
+
+        with (
+            mock.patch(
+                "torchtitan.experiments.graph_trainer.graph_pp.graph_builder."
+                "deduplicate_fsdp_unshard_chains_pass"
+            ) as deduplicate,
+            mock.patch(
+                "torchtitan.experiments.graph_trainer.graph_pp.graph_builder."
+                "split_fsdp_unshard_collectives"
+            ) as split_unshard,
+        ):
+            _build_test_stage_graphs(
+                stage,
+                (x,),
+                {},
+                None,
+                {},
+                compile_graphs=False,
+            )
+
+        deduplicate.assert_not_called()
+        split_unshard.assert_not_called()
+
     def test_non_last_graph_build_does_not_run_real_pretrace_forward(self) -> None:
         from torch._subclasses.fake_tensor import FakeTensor
 
@@ -453,22 +554,13 @@ class GraphPipelineRuntimeTraceTest(unittest.TestCase):
             parallelism=ParallelismConfig(pipeline_parallel_schedule="Interleaved1F1B"),
         )
 
-    def test_graph_pp_accepts_zero_two_fsdp_reshard_policies(self) -> None:
-        for policy in ("default", "never"):
+    def test_graph_pp_accepts_all_fsdp_reshard_policies(self) -> None:
+        for policy in ("default", "never", "always"):
             _validate_graph_pp_config(
                 compile_config=GraphTrainerCompileConfig(),
                 parallelism=ParallelismConfig(
                     pipeline_parallel_schedule="Interleaved1F1B",
                     fsdp_reshard_after_forward=policy,
-                ),
-            )
-
-        with self.assertRaisesRegex(ValueError, "fsdp_reshard_after_forward"):
-            _validate_graph_pp_config(
-                compile_config=GraphTrainerCompileConfig(),
-                parallelism=ParallelismConfig(
-                    pipeline_parallel_schedule="Interleaved1F1B",
-                    fsdp_reshard_after_forward="always",
                 ),
             )
 
@@ -504,10 +596,32 @@ class GraphPipelineRuntimeTraceTest(unittest.TestCase):
         self.assertIs(compiled, gm)
         final_inductor_passes.assert_called_once_with(
             compile_config,
-            use_cudagraph=False,
             boxed_codegen=True,
         )
         apply_graph_passes.assert_called_once()
+
+    def test_graph_pp_no_inductor_uses_boxed_fx(self) -> None:
+        """The explicit no-Inductor mode keeps transformed graphs executable."""
+        gm = torch.fx.symbolic_trace(lambda x: x + 1)
+        compile_config = GraphTrainerCompileConfig(
+            enable=True,
+            enable_passes=True,
+            inductor_compilation="none",
+        )
+
+        with mock.patch(
+            "torchtitan.experiments.graph_trainer.graph_pp.graph_builder."
+            "apply_graph_passes"
+        ) as apply_graph_passes:
+            compiled = _compile_graph_pp_module(
+                gm,
+                compile_config=compile_config,
+                graph_name="test_graph",
+            )
+
+        self.assertIs(compiled, gm)
+        self.assertTrue(gm.meta["graph_trainer_boxed_codegen"])
+        apply_graph_passes.assert_not_called()
 
     def test_graph_pp_graph_execution_uses_mutable_boxed_args(self) -> None:
         gm = torch.fx.symbolic_trace(lambda x, y: x + y)

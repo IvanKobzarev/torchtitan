@@ -34,6 +34,8 @@ def compute_config_fingerprint(
     model: torch.nn.Module,
     compile_config: GraphTrainerCompileConfig,
     parallel_dims: ParallelDims,
+    *,
+    mixed_precision_reduce: str | None = None,
 ) -> ConfigFingerprint:
     """
     Compute a fingerprint that captures everything affecting the compiled output:
@@ -50,6 +52,9 @@ def compute_config_fingerprint(
     for f in dataclasses.fields(parallel_dims):
         if not f.name.startswith("_"):
             h.update(f"parallel:{f.name}:{getattr(parallel_dims, f.name)}\n".encode())
+
+    if mixed_precision_reduce is not None:
+        h.update(f"training:mixed_precision_reduce:{mixed_precision_reduce}\n".encode())
 
     h.update(f"compile:mode:{compile_config.mode}\n".encode())
     h.update(f"compile:backend:{compile_config.backend}\n".encode())
@@ -181,6 +186,8 @@ class PrecompiledFxTraceArtifact:
     # HOPs (AOTCompiledArtifact) baked into serialized_gm. The spec
     # is only used for optional runtime validation in run_traced().
     config_fingerprint: ConfigFingerprint = ConfigFingerprint("")
+    # Retained separately because user_inputs_spec is not serialized.
+    num_optimizer_state_inputs: int = 0
 
     @classmethod
     def from_traced_result(
@@ -196,6 +203,16 @@ class PrecompiledFxTraceArtifact:
         (e.g. the embedding vocab offset from
         _runtime_compute_coordinate_on_dim).
         """
+        if (
+            traced_result.graph_state_fqns
+            or traced_result.graph_state_output_indices
+            or traced_result.grad_sink_active
+        ):
+            raise ValueError(
+                "Precompiled FX artifacts do not yet support graph-owned "
+                "gradient state"
+            )
+
         from torch.fx._graph_pickler import GraphPickler, Options
 
         from torchtitan.experiments.graph_trainer.inductor_passes import (
@@ -220,6 +237,7 @@ class PrecompiledFxTraceArtifact:
             output_spec=traced_result.output_spec,
             tensor_input_indices=traced_result.tensor_input_indices,
             config_fingerprint=config_fingerprint or ConfigFingerprint(""),
+            num_optimizer_state_inputs=traced_result.num_optimizer_state_inputs,
         )
 
     def to_traced_result(self) -> TracedResult:
@@ -257,6 +275,11 @@ class PrecompiledFxTraceArtifact:
             output_subclass_layouts=self.output_subclass_layouts,
             output_spec=self.output_spec,
             state_fqns=self.state_fqns,
+            graph_state_fqns=[],
+            graph_state_input_indices=(),
+            graph_state_output_indices=(),
+            grad_sink_active=False,
+            num_optimizer_state_inputs=getattr(self, "num_optimizer_state_inputs", 0),
         )
 
 

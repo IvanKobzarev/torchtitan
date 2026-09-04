@@ -70,6 +70,7 @@ import copy
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
+import torch
 import torch.fx as fx
 from torch._functorch.partitioners import (
     _extract_fwd_bwd_outputs,
@@ -78,6 +79,7 @@ from torch._functorch.partitioners import (
 from torch.fx._lazy_graph_module import _make_graph_module
 
 from torchtitan.experiments.graph_trainer.graph_pp.utils import (
+    allow_fx_graph_extraction_of_side_effectful_ops,
     base_tensor_for_mutation_target,
     is_getitem_node,
     is_mutation_node,
@@ -441,6 +443,7 @@ def partition_joint_graph(
     *,
     num_fwd_outputs: int,
     backward_only_input_indices: tuple[int, ...] = (),
+    flat_input_indices: tuple[int, ...] | None = None,
 ) -> tuple[fx.GraphModule, fx.GraphModule, GraphMeta]:
     """Partition a post-pass GraphTrainer joint graph into GraphPP callables.
 
@@ -457,6 +460,10 @@ def partition_joint_graph(
         backward_only_input_indices (tuple[int, ...]): Flat input indices for
             values supplied only during backward by the PP schedule. These
             inputs are excluded from the forward graph.
+        flat_input_indices (tuple[int, ...] | None): Original traced flat input
+            index for each current joint-graph placeholder. This is required
+            when an earlier pass has replaced parameter shards with extracted
+            unsharded values. ``None`` preserves the current placeholder order.
 
     Returns:
         tuple[fx.GraphModule, fx.GraphModule, GraphMeta]: Forward graph,
@@ -473,9 +480,20 @@ def partition_joint_graph(
     joint = copy.deepcopy(traced.gm)
     trace_graph_pp_graph("graph_pp_partition_joint", joint)
     placeholders = list(joint.graph.find_nodes(op="placeholder"))
-    placeholder_index_by_name = {
-        node.name: index for index, node in enumerate(placeholders)
-    }
+    if flat_input_indices is None:
+        flat_input_indices = tuple(range(len(placeholders)))
+    if len(flat_input_indices) != len(placeholders):
+        raise ValueError(
+            "flat_input_indices must map every joint-graph placeholder: "
+            f"{len(flat_input_indices)} != {len(placeholders)}"
+        )
+    placeholder_index_by_name = dict(
+        zip(
+            (node.name for node in placeholders),
+            flat_input_indices,
+            strict=True,
+        )
+    )
     _validate_backward_only_input_indices(
         backward_only_input_indices,
         num_placeholders=len(placeholders),
@@ -563,22 +581,32 @@ def partition_joint_graph(
     )
     bw_inputs = saved_values + backward_grad_inputs
 
-    fw_graph = _extract_graph_with_inputs_outputs(
-        joint.graph,
-        fw_inputs,
-        fw_outputs,
-        fw_output_descs,
-        "forward",
-        ignore_must_be_in_fw_bw=True,
-    )
-    bw_graph = _extract_graph_with_inputs_outputs(
-        joint.graph,
-        bw_inputs,
-        bwd_outputs,
-        bwd_output_descs,
-        "backward",
-        ignore_must_be_in_fw_bw=True,
-    )
+    # wait_tensor is stateful only to enforce collective completion. Treat it
+    # as an ordinary dependency during extraction so forward and backward keep
+    # only their own FSDP unshard chains. Other effectful operations retain the
+    # explicit mutation-preservation rules above.
+    with allow_fx_graph_extraction_of_side_effectful_ops(
+        {
+            torch.ops._c10d_functional.wait_tensor,
+            torch.ops._c10d_functional.wait_tensor.default,
+        }
+    ):
+        fw_graph = _extract_graph_with_inputs_outputs(
+            joint.graph,
+            fw_inputs,
+            fw_outputs,
+            fw_output_descs,
+            "forward",
+            ignore_must_be_in_fw_bw=True,
+        )
+        bw_graph = _extract_graph_with_inputs_outputs(
+            joint.graph,
+            bw_inputs,
+            bwd_outputs,
+            bwd_output_descs,
+            "backward",
+            ignore_must_be_in_fw_bw=True,
+        )
     fw_module = _make_graph_module(joint, fw_graph)
     bw_module = _make_graph_module(joint, bw_graph)
     fw_module.graph.lint()

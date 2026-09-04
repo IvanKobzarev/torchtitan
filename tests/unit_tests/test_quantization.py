@@ -3,6 +3,9 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
+import weakref
+from types import SimpleNamespace
+
 import pytest
 import spmd_types as spmd
 import torch
@@ -376,6 +379,331 @@ def test_quantized_grouped_experts():
     assert issubclass(float8_cls, GptOssGroupedExperts)
     assert hasattr(mxfp8_cls.Config, "swiglu_limit")
     assert hasattr(float8_cls.Config, "swiglu_limit")
+
+
+def test_mxfp8_fsdp_configuration_preserves_parameter_identity():
+    """Prepared weights preserve parameter identity and checkpoint loading."""
+    pytest.importorskip("torchao")
+    from torchtitan.components.quantization.mx import MXFP8Linear
+
+    if MXFP8Linear is None:
+        pytest.skip("torchao MXFP8 training prototype not available")
+    module = MXFP8Linear.Config(in_features=64, out_features=64).build()
+    weight = module.weight
+
+    module.configure_fsdp()
+
+    assert module.weight is weight
+    assert weight in set(module.parameters())
+    expected = torch.randn_like(module.weight)
+    module.load_state_dict({"weight": expected})
+    assert torch.equal(module.weight._tensor, expected)
+
+
+def test_mxfp8_prepared_weight_tensor_flatten_round_trip():
+    """Prepared-state serialization preserves logical metadata and operands."""
+    pytest.importorskip("torchao")
+    from torchtitan.components.quantization.mx import (
+        _MXFP8FSDPWeight,
+        _MXFP8PreparedWeight,
+    )
+
+    qdata = torch.empty(64, 64, dtype=torch.float8_e4m3fn)
+    fprop_scale = torch.empty(4, dtype=torch.float8_e8m0fnu)
+    dgrad_scale = torch.empty(4, dtype=torch.float8_e8m0fnu)
+    prepared = _MXFP8PreparedWeight(qdata, fprop_scale, dgrad_scale)
+    weight = _MXFP8FSDPWeight(
+        qdata,
+        prepared,
+        _logical_size=(64, 64),
+        _logical_stride=(64, 1),
+        _logical_dtype=torch.bfloat16,
+    )
+
+    names, metadata = weight.__tensor_flatten__()
+    restored = weight.__tensor_unflatten__(
+        {name: getattr(weight, name) for name in names},
+        metadata,
+        weight.size(),
+        weight.stride(),
+    )
+
+    assert restored.size() == weight.size()
+    assert restored.stride() == weight.stride()
+    assert restored.dtype == torch.bfloat16
+    restored_prepared = restored.prepared_operands()
+    assert restored_prepared is not None
+    assert restored_prepared.qdata is qdata
+    assert restored_prepared.fprop_scale is fprop_scale
+    assert restored_prepared.dgrad_scale is dgrad_scale
+
+
+def test_mxfp8_weight_gather_rejects_unimplemented_format():
+    """Configuration must not silently treat MXFP8 parameter gather as BF16."""
+    pytest.importorskip("torchao")
+    from torchtitan.components.quantization.mx import MXFP8Linear
+
+    if MXFP8Linear is None:
+        pytest.skip("torchao MXFP8 training prototype not available")
+    with pytest.raises(ValueError, match="parameter all-gather is not implemented"):
+        MXFP8Linear.Config(
+            in_features=64,
+            out_features=64,
+            weight_gather="mxfp8",
+        ).build()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
+    reason="MXFP8 scaled GEMM requires SM100 or later",
+)
+def test_explicit_mxfp8_linear_matches_mxtensor_operands_bitwise():
+    """Explicit qdata/scales must preserve the previous GEMM bytes."""
+    from torchao.prototype.mx_formats.kernels import (
+        mxfp8_quantize_cuda,
+        triton_to_mxfp8_32x32_swizzle_dim0_and_dim1,
+        triton_to_mxfp8_dim0,
+    )
+    from torchao.prototype.mx_formats.mx_tensor import MXTensor
+    from torchao.quantization.quantize_.common.kernel_preference import KernelPreference
+    from torchtitan.components.quantization.mx import _MXFP8LinearFunction
+
+    torch.manual_seed(0)
+    input_hp = torch.randn(
+        64,
+        256,
+        dtype=torch.bfloat16,
+        device="cuda",
+        requires_grad=True,
+    )
+    weight_hp = torch.randn(
+        512,
+        256,
+        dtype=torch.bfloat16,
+        device="cuda",
+        requires_grad=True,
+    )
+    grad_output = torch.randn(64, 512, dtype=torch.bfloat16, device="cuda")
+    (
+        weight_qdata,
+        weight_fprop_scale,
+        weight_dgrad_scale,
+    ) = triton_to_mxfp8_32x32_swizzle_dim0_and_dim1(weight_hp.detach())
+
+    output = _MXFP8LinearFunction.apply(
+        input_hp,
+        weight_hp,
+        weight_qdata,
+        weight_fprop_scale,
+        weight_dgrad_scale,
+        None,
+        False,
+    )
+    output.backward(grad_output)
+
+    input_row, input_col, input_row_scale, input_col_scale = mxfp8_quantize_cuda(
+        input_hp.detach(),
+        rowwise=True,
+        colwise=True,
+        scaling_mode="rceil",
+    )
+    grad_row, grad_row_scale = triton_to_mxfp8_dim0(
+        grad_output,
+        scaling_mode="rceil",
+    )
+    _, grad_col, _, grad_col_scale = mxfp8_quantize_cuda(
+        grad_output,
+        rowwise=False,
+        colwise=True,
+        scaling_mode="rceil",
+    )
+    common = (
+        torch.float8_e4m3fn,
+        32,
+        torch.bfloat16,
+        KernelPreference.AUTO,
+        None,
+    )
+    input_fprop = MXTensor(input_row, input_row_scale, *common, False)
+    input_wgrad = MXTensor(input_col.t(), input_col_scale, *common, False)
+    grad_dgrad = MXTensor(grad_row, grad_row_scale, *common, False)
+    grad_wgrad = MXTensor(grad_col.t(), grad_col_scale, *common, False)
+    weight_fprop = MXTensor(
+        weight_qdata,
+        weight_fprop_scale.flatten(),
+        *common,
+        True,
+    )
+    weight_dgrad = MXTensor(
+        weight_qdata.t().contiguous(),
+        weight_dgrad_scale.flatten(),
+        *common,
+        True,
+    )
+
+    expected_output = torch.mm(input_fprop, weight_fprop.t())
+    expected_dgrad = torch.mm(grad_dgrad, weight_dgrad.t())
+    expected_wgrad = torch.mm(grad_wgrad, input_wgrad.t())
+    assert torch.equal(output, expected_output)
+    assert torch.equal(input_hp.grad, expected_dgrad)
+    assert torch.equal(weight_hp.grad, expected_wgrad)
+
+
+def test_explicit_mxfp8_linear_fake_forward_backward():
+    """FakeTensor must trace the explicit FPROP, DGRAD, and WGRAD contract."""
+    pytest.importorskip("torchao")
+    from torch._subclasses.fake_tensor import FakeTensorMode
+    from torchao.prototype.mx_formats.kernels import (
+        triton_to_mxfp8_32x32_swizzle_dim0_and_dim1,
+    )
+    from torchtitan.components.quantization.mx import _MXFP8LinearFunction
+
+    with FakeTensorMode():
+        input_hp = torch.empty(
+            64,
+            256,
+            dtype=torch.bfloat16,
+            device="cuda",
+            requires_grad=True,
+        )
+        weight_hp = torch.empty(
+            512,
+            256,
+            dtype=torch.bfloat16,
+            device="cuda",
+            requires_grad=True,
+        )
+        prepared = triton_to_mxfp8_32x32_swizzle_dim0_and_dim1(weight_hp.detach())
+        output = _MXFP8LinearFunction.apply(
+            input_hp,
+            weight_hp,
+            *prepared,
+            None,
+            False,
+        )
+        grad_input, grad_weight = torch.autograd.grad(
+            output.sum(),
+            (input_hp, weight_hp),
+        )
+
+    assert output.shape == (64, 512)
+    assert grad_input.shape == input_hp.shape
+    assert grad_weight.shape == weight_hp.shape
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
+    reason="MXFP8 scaled GEMM requires SM100 or later",
+)
+def test_explicit_mxfp8_linear_accumulates_wgrad_in_parameter_storage():
+    """Fused WGRAD accumulation reuses the autograd-owned gradient buffer."""
+    from torchao.prototype.mx_formats.kernels import (
+        triton_to_mxfp8_32x32_swizzle_dim0_and_dim1,
+    )
+    from torchtitan.components.quantization.mx import _MXFP8LinearFunction
+
+    torch.manual_seed(0)
+    weight = torch.nn.Parameter(
+        torch.randn(256, 256, device="cuda", dtype=torch.bfloat16)
+    )
+    prepared = triton_to_mxfp8_32x32_swizzle_dim0_and_dim1(weight.detach())
+    inputs = [
+        torch.randn(64, 256, device="cuda", dtype=torch.bfloat16) for _ in range(3)
+    ]
+    output_grads = [
+        torch.randn(64, 256, device="cuda", dtype=torch.bfloat16) for _ in range(3)
+    ]
+
+    reference = torch.nn.Parameter(weight.detach().clone())
+    for input_hp, grad_output in zip(inputs, output_grads, strict=True):
+        output = _MXFP8LinearFunction.apply(
+            input_hp,
+            reference,
+            *prepared,
+            None,
+            False,
+        )
+        output.backward(grad_output)
+
+    pointers = []
+    for input_hp, grad_output in zip(inputs, output_grads, strict=True):
+        output = _MXFP8LinearFunction.apply(
+            input_hp,
+            weight,
+            *prepared,
+            weakref.ref(weight),
+            True,
+        )
+        output.backward(grad_output)
+        assert weight.grad is not None
+        pointers.append(weight.grad.data_ptr())
+
+    assert len(set(pointers)) == 1
+    torch.testing.assert_close(weight.grad, reference.grad, rtol=1e-2, atol=2e-3)
+
+
+def test_prepared_weight_uses_padded_shard_and_logical_gather_view():
+    """Uneven FSDP shards communicate padding but never prepare padded rows."""
+    from torchtitan.distributed._prepared_weight import _FSDPPreparedWeight
+
+    class CopyPreparedWeight(_FSDPPreparedWeight):
+        """Test carrier whose prepared representation is an owned clone."""
+
+        def _new(self, tensor, prepared, **logical_metadata):
+            """Construct a carrier with the requested lifecycle state."""
+            return CopyPreparedWeight(tensor, prepared, **logical_metadata)
+
+        def _prepare(self, weight, out=None):
+            """Clone or refill the logical unsharded value."""
+            if out is None:
+                return weight.clone()
+            out.copy_(weight)
+            return out
+
+        def _prepared_tensors(self, prepared):
+            """Return the single owned prepared tensor."""
+            return (prepared,)
+
+    padded_storage = torch.zeros(3, 2, dtype=torch.bfloat16)
+    padded_storage[:2].copy_(torch.arange(4).reshape(2, 2))
+    wrapper = CopyPreparedWeight(padded_storage[:2])
+    mesh = SimpleNamespace(size=lambda: 2)
+    policy = SimpleNamespace(param_dtype=torch.bfloat16)
+
+    (all_gather_input,), metadata = wrapper.fsdp_pre_all_gather(
+        mesh,
+        torch.Size((5, 2)),
+        (2, 1),
+        None,
+        policy,
+    )
+    assert all_gather_input.shape == (3, 2)
+    assert torch.equal(all_gather_input[-1], torch.zeros(2, dtype=torch.bfloat16))
+
+    gathered = torch.arange(12, dtype=torch.bfloat16).reshape(6, 2)
+    prepared_wrapper, prepared_tensors, release = wrapper.fsdp_post_all_gather(
+        (gathered,),
+        metadata,
+        torch.bfloat16,
+    )
+    assert prepared_wrapper.shape == (5, 2)
+    assert prepared_tensors[0].shape == (5, 2)
+    assert torch.equal(prepared_tensors[0], gathered[:5])
+    assert release
+
+    prepared_storage = prepared_tensors[0]
+    updated = gathered.add(10)
+    assert (
+        wrapper.fsdp_post_all_gather(
+            (updated,),
+            metadata,
+            torch.bfloat16,
+            out=prepared_wrapper,
+        )
+        is None
+    )
+    assert prepared_wrapper.prepared_state() is prepared_storage
+    assert torch.equal(prepared_storage, updated[:5])
 
 
 @pytest.mark.parametrize("parent_cls", [GroupedExperts, GptOssGroupedExperts])

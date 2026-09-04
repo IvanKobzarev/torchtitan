@@ -19,6 +19,7 @@ from torch.utils._pytree import register_constant, register_pytree_node, tree_ma
 
 from torchtitan.config import TORCH_DTYPE_MAP, TrainingConfig
 from torchtitan.distributed import ParallelDims
+from torchtitan.distributed.fsdp import _configure_fsdp_modules
 from torchtitan.experiments.graph_trainer.simple_fsdp import (
     data_parallel,
     MixedPrecisionPolicy,
@@ -160,6 +161,7 @@ def ensure_boxed_graph_module(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
 
 
 _MODULE_FQN = "module_fqn"
+_RECOMPUTE_MUTATIONS = "recompute_mutations"
 _EP_TOKEN_COUNT_EXCHANGE = "EP_token_count_exchange"
 _EP_TOKEN_COUNT_SYNC = "EP_token_count_sync"
 _EP_TOKEN_EXCHANGE = "EP_token_exchange"
@@ -190,14 +192,26 @@ def compute_annotated_loss(
 def accumulate_param_grads_(
     params: Iterable[torch.Tensor],
     grads: Iterable[torch.Tensor | None],
+    *,
+    outputs_are_replay_owned: bool = False,
 ) -> None:
-    """Accumulate explicit graph-produced gradients into live parameters."""
+    """Accumulate explicit graph-produced gradients into live parameters.
+
+    Args:
+        params: Parameters that receive the explicit gradients.
+        grads: Gradients returned by the traced forward-backward graph.
+        outputs_are_replay_owned: Whether a later replay can overwrite the
+            gradient tensors.
+    """
     for param, grad in zip(params, grads, strict=True):
         if grad is None:
             continue
         grad = _maybe_materialize_grad_for_param_layout(param, grad)
         if param.grad is None:
-            param.grad = grad
+            # TODO: Accumulate into static grad buffers owned by the training
+            # step so CUDA graph replay does not require both replay output and
+            # persistent ``param.grad`` storage.
+            param.grad = grad.clone() if outputs_are_replay_owned else grad
         else:
             param.grad += grad
 
@@ -388,35 +402,74 @@ def get_default_transformer_block_buckets(
     ]
 
 
-def get_transformer_block_buckets(model) -> list[list[str] | str]:
-    """Get transformer block buckets for manual bucketing passes.
+def get_transformer_block_buckets(
+    model: nn.Module,
+    *,
+    parallel_dims: ParallelDims | None = None,
+    chunked_loss_enabled: bool = False,
+) -> list[list[str] | str]:
+    """Derive FSDP buckets from the modules that own model parameters.
 
-    Works for any model with tok_embeddings, layers (OrderedDict), norm, and output
-    attributes (e.g., Llama3, DeepSeekV3).
+    Args:
+        model: Decoder-like model with embeddings, layers, norm, and lm_head.
+        parallel_dims: Parallel mesh. Expert buckets are split when eFSDP has
+            more than one rank.
+        chunked_loss_enabled: Whether the final bucket must include ``loss``.
+
+    Returns:
+        Ordered module FQNs passed to FSDP bucketing.
+
+    Raises:
+        ValueError: If an expected module is not registered under ``model``.
     """
-    # [TODO](ruisizhang123) add EP support for transformer block bucketing
-    module_list = [
-        model.tok_embeddings,
-        [model.norm, model.lm_head],
+    module_to_fqn = {module: fqn for fqn, module in model.named_modules()}
+
+    def get_fqn(module: nn.Module, description: str) -> str:
+        fqn = module_to_fqn.get(module)
+        if not fqn:
+            raise ValueError(
+                f"Cannot build FSDP bucket plan: {description} is not a "
+                "registered model submodule."
+            )
+        return fqn
+
+    efsdp_mesh = (
+        parallel_dims.get_optional_mesh("efsdp") if parallel_dims is not None else None
+    )
+    split_expert_buckets = efsdp_mesh is not None and efsdp_mesh.size() > 1
+    layer_buckets: list[list[str] | str] = []
+    for layer_id, block in model.layers.items():
+        moe = getattr(block, "moe", None)
+        if moe is None or not split_expert_buckets:
+            layer_buckets.append(get_fqn(block, f"layer {layer_id}"))
+            continue
+
+        routed_experts = moe.routed_experts
+        dense_modules = [block.attention_norm, block.attention, block.ffn_norm]
+        dense_modules.extend(
+            child for child in moe.children() if child is not routed_experts
+        )
+        layer_buckets.append(
+            [
+                get_fqn(module, f"layer {layer_id} dense component")
+                for module in dense_modules
+            ]
+        )
+        expert_parameters = get_expert_parameter_owner(routed_experts)
+        expert_fqn = get_fqn(expert_parameters, f"layer {layer_id} expert owner")
+        layer_buckets.append(expert_fqn)
+
+    final_bucket = [
+        get_fqn(model.norm, "final norm"),
+        get_fqn(model.lm_head, "language-model head"),
     ]
-    for layer_id, transformer_block in model.layers.items():
-        module_list.append(transformer_block)
-
-    def convert_modules_to_fqns(modules, module_to_fqn_mapping):
-        """Convert a (possibly nested) list of modules to FQN strings."""
-        result = []
-        for m in modules:
-            if isinstance(m, list):
-                if fqn_list := convert_modules_to_fqns(m, module_to_fqn_mapping):
-                    result.append(fqn_list)
-            else:
-                if fqn := module_to_fqn_mapping.get(m):
-                    result.append(fqn)
-        return result
-
-    module_to_name = {m: n for n, m in model.named_modules()}
-    module_fqns = convert_modules_to_fqns(module_list, module_to_name)
-    return module_fqns
+    if chunked_loss_enabled:
+        final_bucket.append("loss")
+    return [
+        get_fqn(model.tok_embeddings, "token embeddings"),
+        *layer_buckets,
+        final_bucket,
+    ]
 
 
 def apply_simple_fsdp(
@@ -427,10 +480,12 @@ def apply_simple_fsdp(
 ) -> nn.Module:
     """Wrap the model (and any MoE experts) with graph_trainer's simple_fsdp.
 
-    For MoE-enabled models, the ``moe.routed_experts.inner_experts`` submodules
-    (the routed-expert weights) are separately wrapped on the EDP mesh when expert
-    parallelism is enabled.
+    For MoE-enabled models, the module returned by
+    ``routed_experts.expert_parameters_module()`` is separately wrapped on the
+    EDP mesh when expert parallelism is enabled.
     """
+    _configure_fsdp_modules(model)
+
     if parallel_dims.dp_replicate_enabled:
         if parallel_dims.dp_shard_enabled or parallel_dims.cp_enabled:
             dp_mesh_dim_names = ["dp_replicate", "fsdp"]
@@ -466,10 +521,7 @@ def apply_simple_fsdp(
             routed_experts = moe.routed_experts
             expert_parameters = get_expert_parameter_owner(routed_experts)
             experts_shard_dim = 0
-            if (
-                edp_mesh["efsdp"].size() * parallel_dims.ep
-                > routed_experts.num_experts
-            ):
+            if edp_mesh["efsdp"].size() * parallel_dims.ep > routed_experts.num_experts:
                 experts_shard_dim = 1
 
             data_parallel(

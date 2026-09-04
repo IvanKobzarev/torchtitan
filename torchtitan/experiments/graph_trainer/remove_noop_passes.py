@@ -22,6 +22,7 @@ import sys
 import torch
 from torch.fx.experimental.symbolic_shapes import guard_or_false
 
+from torchtitan.experiments.graph_trainer.make_fx_tracer import _GRAPH_STATE_OUTPUT_META
 from torchtitan.tools.logging import logger
 
 # Op overloads that are registered side-effectful but that we want DCE to treat
@@ -32,6 +33,20 @@ _FORCE_PURE_TARGETS = (
     torch.ops.aten._assert_async.msg,
     torch.ops.aten._assert_async.default,
 )
+
+
+def _replace_all_uses_preserving_graph_state_output(
+    node: torch.fx.Node,
+    replacement: torch.fx.Node,
+) -> None:
+    mappings = node.meta.get(_GRAPH_STATE_OUTPUT_META)
+    if mappings:
+        replacement_mappings = list(replacement.meta.get(_GRAPH_STATE_OUTPUT_META, ()))
+        replacement_mappings.extend(
+            mapping for mapping in mappings if mapping not in replacement_mappings
+        )
+        replacement.meta[_GRAPH_STATE_OUTPUT_META] = tuple(replacement_mappings)
+    node.replace_all_uses_with(replacement)
 
 
 def _is_impure_for_dce(node: torch.fx.Node) -> bool:
@@ -120,7 +135,7 @@ def remove_detach_pass(
     count = 0
     for node in list(gm.graph.nodes):
         if node.op == "call_function" and node.target is torch.ops.aten.detach.default:
-            node.replace_all_uses_with(node.args[0])
+            _replace_all_uses_preserving_graph_state_output(node, node.args[0])
             gm.graph.erase_node(node)
             count += 1
 
@@ -178,7 +193,7 @@ def remove_identity_view_pass(
             continue
 
         if _same_shape(inp_val.shape, out_val.shape):
-            node.replace_all_uses_with(inp)
+            _replace_all_uses_preserving_graph_state_output(node, inp)
             gm.graph.erase_node(node)
             count += 1
 
@@ -216,7 +231,7 @@ def remove_b2b_transpose_pass(
         inp = node.args[0]
         if isinstance(inp, torch.fx.Node) and inp.target is torch.ops.aten.t.default:
             original = inp.args[0]
-            node.replace_all_uses_with(original)
+            _replace_all_uses_preserving_graph_state_output(node, original)
             gm.graph.erase_node(node)
             count += 1
             # The inner transpose may still feed other consumers; only erase
@@ -285,7 +300,7 @@ def remove_identity_slice_pass(
         dim_size = shape[dim]
 
         if guard_or_false(end >= dim_size):
-            node.replace_all_uses_with(input_node)
+            _replace_all_uses_preserving_graph_state_output(node, input_node)
             gm.graph.erase_node(node)
             count += 1
 

@@ -5,11 +5,21 @@
 # LICENSE file in the root directory of this source tree.
 
 import unittest
+import weakref
 from collections import Counter
+from contextlib import nullcontext
 from copy import deepcopy
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 import torch.nn as nn
+from torch._inductor.fx_passes.bucketing import (
+    _register_fsdp_symmetric_buffer,
+    has_preallocated_fsdp_symmetric_memory_buffers,
+    release_preallocated_fsdp_symmetric_memory_buffers,
+)
+from torch.distributed.tensor import DTensor
 from torch.optim import swap_in_optimizer_params_and_state
 from torch.testing._internal.common_fsdp import FSDPTest
 
@@ -18,18 +28,40 @@ from torchtitan.experiments.graph_trainer.chunked_loss import (
 )
 from torchtitan.experiments.graph_trainer.common_utils import (
     _maybe_materialize_grad_for_param_layout,
+    accumulate_param_grads_,
     maybe_register_blockmask_pytree_node,
 )
+from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConfig
+from torchtitan.experiments.graph_trainer.cudagraph import (
+    cudagraph_pass,
+    CUDAGraphWrapper,
+)
+from torchtitan.experiments.graph_trainer.deferred_fsdp import (
+    bind_deferred_fsdp_graph,
+    build_deferred_fsdp_graph,
+)
+from torchtitan.experiments.graph_trainer.gradient_accumulation import (
+    _accumulation_leaf_offsets,
+    _validate_device_mesh_leaf,
+    finalize_graph_gradient_accumulation,
+    GraphGradientState,
+)
+from torchtitan.experiments.graph_trainer.graph_pp.utils import flatten_graph_values
 from torchtitan.experiments.graph_trainer.make_fx_tracer import (
     _copy_fwd_metadata_to_bw_nodes,
+    bind_traced,
     extract_module_state,
     minimal_fx_tracer,
     run_traced,
+    SubclassLayout,
+    SubclassMeta,
     TracedResult,
 )
 from torchtitan.experiments.graph_trainer.passes import (
     annotate_flex_attention_for_regional_inductor_pass,
 )
+from torchtitan.experiments.graph_trainer.trainer import GraphTrainer
+from torchtitan.trainer import Trainer
 
 
 def get_loss(logits, labels):
@@ -106,6 +138,154 @@ def _graph_fake_mode(fake_inputs):
     )
 
 
+class TestGraphTrainerSymmetricMemoryTeardown(unittest.TestCase):
+    def _identity_graph(self):
+        graph = torch.fx.Graph()
+        value = graph.placeholder("value")
+        graph.output(value)
+        return torch.fx.GraphModule(nn.Module(), graph)
+
+    def _trainer_with_static_slabs(self):
+        normal = self._identity_graph()
+        child = self._identity_graph()
+        with patch.object(
+            torch._C._distributed_c10d._SymmetricMemory,
+            "empty_strided_p2p",
+            side_effect=lambda *args, **kwargs: torch.empty(4),
+        ):
+            _register_fsdp_symmetric_buffer(normal, 4, torch.empty(1), 0)
+            _register_fsdp_symmetric_buffer(child, 4, torch.empty(1), 0)
+
+        root = nn.Module()
+        root.add_module("child", child)
+        graph = torch.fx.Graph()
+        value = graph.placeholder("value")
+        result = graph.call_module("child", args=(value,))
+        graph.output(result)
+        deferred = torch.fx.GraphModule(root, graph)
+
+        trainer = object.__new__(GraphTrainer)
+        trainer._pinned_pool_ctx = None
+        trainer._traced_step = SimpleNamespace(gm=normal)
+        trainer._bound_traced_step = object()
+        trainer._deferred_fsdp_graph = SimpleNamespace(gm=deferred)
+        trainer._bound_deferred_fsdp_graph = object()
+        return trainer, normal, deferred
+
+    def test_close_releases_normal_and_deferred_slabs_before_base_close(self):
+        trainer, normal, deferred = self._trainer_with_static_slabs()
+        buffer_refs = [
+            weakref.ref(buffer)
+            for gm in (normal, deferred)
+            for _, buffer in gm.named_buffers()
+        ]
+        events = []
+
+        def release(gm):
+            events.append("release")
+            return release_preallocated_fsdp_symmetric_memory_buffers(gm)
+
+        with (
+            patch(
+                "torchtitan.experiments.graph_trainer.trainer.cudagraph_teardown",
+                side_effect=lambda: events.append("cudagraph_teardown"),
+            ),
+            patch.object(
+                torch.cuda,
+                "synchronize",
+                side_effect=lambda: events.append("synchronize"),
+            ),
+            patch.object(torch.cuda, "current_device", return_value=0),
+            patch.object(torch.distributed, "is_initialized", return_value=True),
+            patch.object(
+                torch.distributed,
+                "get_backend",
+                return_value=torch.distributed.Backend.NCCL,
+            ),
+            patch.object(
+                torch.distributed,
+                "barrier",
+                side_effect=lambda **kwargs: events.append("barrier"),
+            ),
+            patch(
+                "torchtitan.experiments.graph_trainer.trainer."
+                "release_preallocated_fsdp_symmetric_memory_buffers",
+                side_effect=release,
+            ),
+            patch.object(
+                Trainer,
+                "close",
+                autospec=True,
+                side_effect=lambda _: events.append("base_close"),
+            ),
+        ):
+            trainer.close()
+            self.assertEqual(
+                events,
+                [
+                    "cudagraph_teardown",
+                    "synchronize",
+                    "barrier",
+                    "release",
+                    "release",
+                    "synchronize",
+                    "barrier",
+                    "base_close",
+                ],
+            )
+            events.clear()
+            trainer.close()
+            self.assertEqual(events, ["cudagraph_teardown", "base_close"])
+
+        self.assertFalse(has_preallocated_fsdp_symmetric_memory_buffers(normal))
+        self.assertFalse(has_preallocated_fsdp_symmetric_memory_buffers(deferred))
+        self.assertTrue(all(buffer_ref() is None for buffer_ref in buffer_refs))
+        self.assertIsNone(trainer._traced_step)
+        self.assertIsNone(trainer._bound_traced_step)
+        self.assertIsNone(trainer._deferred_fsdp_graph)
+        self.assertIsNone(trainer._bound_deferred_fsdp_graph)
+
+    def test_release_skips_barriers_without_real_process_group(self):
+        for initialized, backend in (
+            (False, None),
+            (True, torch.distributed.Backend.FAKE),
+        ):
+            with self.subTest(initialized=initialized, backend=backend):
+                trainer, normal, _ = self._trainer_with_static_slabs()
+                with (
+                    patch.object(
+                        torch.distributed,
+                        "is_initialized",
+                        return_value=initialized,
+                    ),
+                    patch.object(
+                        torch.distributed,
+                        "get_backend",
+                        return_value=backend,
+                    ),
+                    patch.object(torch.distributed, "barrier") as barrier,
+                    patch.object(torch.cuda, "synchronize") as synchronize,
+                ):
+                    trainer._release_fsdp_symmetric_memory_buffers()
+                barrier.assert_not_called()
+                synchronize.assert_not_called()
+                self.assertFalse(has_preallocated_fsdp_symmetric_memory_buffers(normal))
+
+    def test_release_skips_barriers_without_static_slabs(self):
+        trainer = object.__new__(GraphTrainer)
+        trainer._traced_step = SimpleNamespace(gm=self._identity_graph())
+        trainer._deferred_fsdp_graph = None
+        with (
+            patch.object(torch.distributed, "is_initialized") as initialized,
+            patch.object(torch.distributed, "barrier") as barrier,
+            patch.object(torch.cuda, "synchronize") as synchronize,
+        ):
+            trainer._release_fsdp_symmetric_memory_buffers()
+        initialized.assert_not_called()
+        barrier.assert_not_called()
+        synchronize.assert_not_called()
+
+
 class SimpleMLP(nn.Module):
     def __init__(self, dim=64, hidden=128, vocab_size=256):
         super().__init__()
@@ -147,6 +327,1039 @@ class _TraceableWrapper(torch.Tensor):
     @staticmethod
     def __tensor_unflatten__(inner_tensors, metadata, outer_size, outer_stride):
         return _TraceableWrapper(inner_tensors["elem"])
+
+
+class TestBoundTracedRunner(unittest.TestCase):
+    def test_observes_in_place_parameter_updates_without_resampling_state(self):
+        class CountingLinear(nn.Linear):
+            def __init__(self):
+                super().__init__(3, 2, dtype=torch.float64)
+                self.named_parameters_calls = 0
+
+            def named_parameters(self, *args, **kwargs):
+                self.named_parameters_calls += 1
+                return super().named_parameters(*args, **kwargs)
+
+        torch.manual_seed(42)
+        model = CountingLinear()
+        inputs = torch.randn(4, 3, dtype=torch.float64)
+
+        def forward(value):
+            return model(value)
+
+        traced = minimal_fx_tracer(forward, module=model)(inputs)
+        run = bind_traced(traced, module=model)
+        calls_after_bind = model.named_parameters_calls
+        initial_output = run(inputs)
+
+        with torch.no_grad():
+            model.weight.add_(0.25)
+            model.bias.sub_(0.5)
+
+        expected = model(inputs)
+        actual = run(inputs)
+
+        self.assertFalse(torch.equal(initial_output, expected))
+        self.assertTrue(torch.equal(expected, actual))
+        self.assertEqual(calls_after_bind, model.named_parameters_calls)
+
+    def test_rejects_incompatible_module_at_bind_time(self):
+        model = nn.Linear(3, 2)
+        inputs = torch.randn(4, 3)
+
+        def forward(value):
+            return model(value)
+
+        traced = minimal_fx_tracer(forward, module=model)(inputs)
+        incompatible_model = nn.Sequential(nn.Linear(3, 2))
+
+        with self.assertRaisesRegex(ValueError, "parameter/buffer names"):
+            bind_traced(traced, module=incompatible_model)
+
+    def test_validation_rejects_parameter_and_storage_replacement(self):
+        model = nn.Linear(3, 2)
+        inputs = torch.randn(4, 3)
+
+        def forward(value):
+            return model(value)
+
+        traced = minimal_fx_tracer(forward, module=model)(inputs)
+        run = bind_traced(traced, module=model)
+        original_weight = model.weight
+        model.weight = nn.Parameter(model.weight.detach().clone())
+        with self.assertRaisesRegex(RuntimeError, "state objects changed"):
+            run.validate_state(module=model, graph_state=None)
+
+        model.weight = original_weight
+        run = bind_traced(traced, module=model)
+        with torch.no_grad():
+            model.weight.set_(model.weight.detach().clone())
+        with self.assertRaisesRegex(RuntimeError, "state storage changed"):
+            run.validate_state(module=model, graph_state=None)
+
+    def test_validation_allows_in_place_buffer_updates(self):
+        class BufferedModule(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("offset", torch.ones(3))
+
+            def forward(self, value):
+                return value + self.offset
+
+        model = BufferedModule()
+        inputs = torch.randn(4, 3)
+        traced = minimal_fx_tracer(model.forward, module=model)(inputs)
+        run = bind_traced(traced, module=model)
+
+        model.offset.add_(2)
+        run.validate_state(module=model, graph_state=None)
+        self.assertTrue(torch.equal(model(inputs), run(inputs)))
+
+        model.offset = model.offset.clone()
+        with self.assertRaisesRegex(RuntimeError, "state objects changed"):
+            run.validate_state(module=model, graph_state=None)
+
+    def test_validation_rejects_graph_state_replacement(self):
+        graph_state = {"accumulator": torch.zeros(3)}
+        inputs = torch.randn(4, 3)
+
+        def forward(value):
+            return value.sin()
+
+        traced = minimal_fx_tracer(forward, graph_state=graph_state)(inputs)
+        run = bind_traced(traced, graph_state=graph_state)
+        graph_state["accumulator"] = torch.ones(3)
+
+        with self.assertRaisesRegex(RuntimeError, "state objects changed"):
+            run.validate_state(module=None, graph_state=graph_state)
+
+    def test_rejects_traced_optimizer_state(self):
+        model = nn.Linear(3, 2)
+        optimizer = torch.optim.AdamW(model.parameters())
+        inputs = torch.randn(4, 3)
+        model(inputs).sum().backward()
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=False)
+
+        def forward(value):
+            return model(value)
+
+        traced = minimal_fx_tracer(
+            forward,
+            module=model,
+            optimizer=optimizer,
+        )(inputs)
+
+        with self.assertRaisesRegex(ValueError, "optimizer state"):
+            bind_traced(traced, module=model)
+
+
+class TestGraphGradientAccumulation(unittest.TestCase):
+    class _OptimizerCollection:
+        def __init__(self, optimizer):
+            self.optimizers = [optimizer]
+
+        def __iter__(self):
+            return iter(self.optimizers)
+
+        def zero_grad(self, *, set_to_none):
+            for optimizer in self.optimizers:
+                optimizer.zero_grad(set_to_none=set_to_none)
+
+        def step(self):
+            for optimizer in self.optimizers:
+                optimizer.step()
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_cuda_graph_accumulates_each_call_exactly_once(self):
+        torch.manual_seed(42)
+        device = torch.device("cuda:0")
+        model_ref = nn.Linear(3, 2, device=device)
+        model_test = deepcopy(model_ref)
+        optimizer = torch.optim.SGD(model_test.parameters(), lr=0.1)
+        gradient_state = GraphGradientState.create(model_test, [optimizer])
+
+        def train_step(inputs, targets):
+            loss = torch.nn.functional.mse_loss(
+                model_test(inputs),
+                targets,
+                reduction="sum",
+            )
+            grads = torch.autograd.grad(loss, tuple(model_test.parameters()))
+            return [loss, *grads]
+
+        microbatches = [
+            (
+                torch.randn(4, 3, device=device),
+                torch.randn(4, 2, device=device),
+            )
+            for _ in range(3)
+        ]
+        traced = minimal_fx_tracer(
+            train_step,
+            module=model_test,
+            graph_state=gradient_state.graph_state,
+            graph_state_output_indices=(1, 2),
+        )(*microbatches[0])
+        traced.gm = finalize_graph_gradient_accumulation(
+            traced.gm,
+            traced_result=traced,
+        )
+        traced.gm = cudagraph_pass(
+            traced.gm,
+            traced.example_inputs,
+            static_input_indices=list(range(traced.num_static_inputs)),
+            tensor_input_indices=traced.tensor_input_indices,
+            require=True,
+        )
+        self.assertIsInstance(traced.gm.forward, CUDAGraphWrapper)
+        run = bind_traced(
+            traced,
+            module=model_test,
+            graph_state=gradient_state.graph_state,
+        )
+
+        for inputs, targets in microbatches:
+            loss_ref = torch.nn.functional.mse_loss(
+                model_ref(inputs),
+                targets,
+                reduction="sum",
+            )
+            loss_ref.backward()
+            outputs = run(inputs, targets)
+            torch.cuda.synchronize()
+
+            self.assertEqual(len(outputs), 1)
+            torch.testing.assert_close(outputs[0], loss_ref)
+            for parameter_ref, buffer in zip(
+                model_ref.parameters(), gradient_state.buffers, strict=True
+            ):
+                torch.testing.assert_close(buffer, parameter_ref.grad)
+
+        traced.gm.forward.teardown()
+
+    def test_terminal_sink_accumulates_and_preserves_optimizer_grad_buffers(self):
+        torch.manual_seed(42)
+        model_ref = nn.Linear(3, 2, dtype=torch.float64)
+        model_test = deepcopy(model_ref)
+        optimizer_ref = torch.optim.SGD(model_ref.parameters(), lr=0.05)
+        optimizer_test = torch.optim.SGD(model_test.parameters(), lr=0.05)
+        gradient_state = GraphGradientState.create(model_test, [optimizer_test])
+
+        def train_step(inputs, targets):
+            predictions = model_test(inputs)
+            loss = torch.nn.functional.mse_loss(
+                predictions,
+                targets,
+                reduction="sum",
+            )
+            grads = torch.autograd.grad(loss, tuple(model_test.parameters()))
+            return [loss, *grads]
+
+        microbatches = [
+            (
+                torch.tensor(
+                    [[1.0, -2.0, 0.5], [0.25, 1.5, -1.0]],
+                    dtype=torch.float64,
+                ),
+                torch.tensor([[0.5, -1.0], [2.0, 0.25]], dtype=torch.float64),
+            ),
+            (
+                torch.tensor(
+                    [[-0.5, 1.0, 2.0], [1.25, -0.75, 0.5]],
+                    dtype=torch.float64,
+                ),
+                torch.tensor([[-0.25, 1.5], [0.75, -2.0]], dtype=torch.float64),
+            ),
+            (
+                torch.tensor(
+                    [[2.0, 0.5, -1.5], [-1.0, 0.75, 1.25]],
+                    dtype=torch.float64,
+                ),
+                torch.tensor([[1.0, 0.0], [-0.5, 2.5]], dtype=torch.float64),
+            ),
+            (
+                torch.tensor(
+                    [[0.75, -1.25, 1.0], [-2.0, 0.5, 0.25]],
+                    dtype=torch.float64,
+                ),
+                torch.tensor([[1.25, -0.75], [0.5, 1.0]], dtype=torch.float64),
+            ),
+        ]
+        traced = minimal_fx_tracer(
+            train_step,
+            module=model_test,
+            graph_state=gradient_state.graph_state,
+            graph_state_output_indices=tuple(range(1, len(gradient_state.buffers) + 1)),
+        )(*microbatches[0])
+        traced.gm = finalize_graph_gradient_accumulation(
+            traced.gm,
+            traced_result=traced,
+        )
+        run = bind_traced(
+            traced,
+            module=model_test,
+            graph_state=gradient_state.graph_state,
+        )
+
+        parameters_test = tuple(model_test.parameters())
+        grad_ids = tuple(id(parameter.grad) for parameter in parameters_test)
+        grad_data_ptrs = tuple(
+            parameter.grad.data_ptr() for parameter in parameters_test
+        )
+        self.assertTrue(traced.grad_sink_active)
+        self.assertTrue(
+            all(torch.count_nonzero(buffer) == 0 for buffer in gradient_state.buffers)
+        )
+        self.assertEqual(
+            len(
+                [
+                    node
+                    for node in traced.gm.graph.nodes
+                    if "graph_gradient_fqn" in node.meta
+                ]
+            ),
+            len(parameters_test),
+        )
+
+        for inputs, targets in microbatches[:3]:
+            loss_ref = torch.nn.functional.mse_loss(
+                model_ref(inputs),
+                targets,
+                reduction="sum",
+            )
+            loss_ref.backward()
+            outputs = run(inputs, targets)
+
+            self.assertEqual(len(outputs), 1)
+            torch.testing.assert_close(outputs[0], loss_ref)
+            for parameter_ref, parameter_test, buffer in zip(
+                model_ref.parameters(),
+                parameters_test,
+                gradient_state.buffers,
+                strict=True,
+            ):
+                self.assertIs(parameter_test.grad, buffer)
+                torch.testing.assert_close(parameter_test.grad, parameter_ref.grad)
+            self.assertEqual(
+                tuple(id(parameter.grad) for parameter in parameters_test),
+                grad_ids,
+            )
+            self.assertEqual(
+                tuple(parameter.grad.data_ptr() for parameter in parameters_test),
+                grad_data_ptrs,
+            )
+
+        optimizer_ref.step()
+        optimizer_test.step()
+        for parameter_ref, parameter_test in zip(
+            model_ref.parameters(), model_test.parameters(), strict=True
+        ):
+            torch.testing.assert_close(parameter_test, parameter_ref)
+
+        optimizer_ref.zero_grad(set_to_none=False)
+        optimizer_test.zero_grad(set_to_none=False)
+        self.assertTrue(
+            all(torch.count_nonzero(buffer) == 0 for buffer in gradient_state.buffers)
+        )
+        self.assertEqual(
+            tuple(id(parameter.grad) for parameter in parameters_test),
+            grad_ids,
+        )
+        self.assertEqual(
+            tuple(parameter.grad.data_ptr() for parameter in parameters_test),
+            grad_data_ptrs,
+        )
+
+        inputs, targets = microbatches[3]
+        loss_ref = torch.nn.functional.mse_loss(
+            model_ref(inputs),
+            targets,
+            reduction="sum",
+        )
+        loss_ref.backward()
+        outputs = run(inputs, targets)
+        self.assertEqual(len(outputs), 1)
+        torch.testing.assert_close(outputs[0], loss_ref)
+        for parameter_ref, parameter_test, buffer in zip(
+            model_ref.parameters(),
+            parameters_test,
+            gradient_state.buffers,
+            strict=True,
+        ):
+            self.assertIs(parameter_test.grad, buffer)
+            torch.testing.assert_close(parameter_test.grad, parameter_ref.grad)
+        self.assertEqual(
+            tuple(parameter.grad.data_ptr() for parameter in parameters_test),
+            grad_data_ptrs,
+        )
+
+        optimizer_ref.step()
+        optimizer_test.step()
+        for parameter_ref, parameter_test in zip(
+            model_ref.parameters(), model_test.parameters(), strict=True
+        ):
+            torch.testing.assert_close(parameter_test, parameter_ref)
+
+    def test_trainer_accumulates_three_microbatches_across_optimizer_steps(self):
+        torch.manual_seed(42)
+        model_ref = nn.Linear(3, 2, dtype=torch.float64)
+        model_test = deepcopy(model_ref)
+        optimizer_ref = torch.optim.SGD(model_ref.parameters(), lr=0.05)
+        optimizer_test = torch.optim.SGD(model_test.parameters(), lr=0.05)
+        optimizers = self._OptimizerCollection(optimizer_test)
+
+        trainer = object.__new__(GraphTrainer)
+        trainer.config = SimpleNamespace(
+            compile=GraphTrainerCompileConfig(
+                enable_graph_gradient_accumulation=True,
+                enable_passes=False,
+                inductor_compilation="none",
+            ),
+            training=SimpleNamespace(
+                disable_cuda_graphs=True,
+                max_norm=float("inf"),
+            ),
+        )
+        trainer.parallel_dims = SimpleNamespace(
+            pp_enabled=False,
+            dp_enabled=False,
+            ep_enabled=False,
+            get_optional_mesh=lambda _axis: None,
+        )
+        trainer.model_parts = [model_test]
+        trainer.optimizers = optimizers
+        trainer.lr_schedulers = SimpleNamespace(
+            get_metrics=lambda: {},
+            step=lambda: None,
+        )
+        trainer.metrics_processor = SimpleNamespace(should_log=lambda _step: False)
+        trainer.checkpointer = SimpleNamespace(maybe_wait_for_staging=lambda: None)
+        trainer.device = torch.device("cpu")
+        trainer.step = 1
+        trainer.gradient_accumulation_steps = 3
+        trainer.num_pp_microbatches = 1
+        trainer._traced_step = None
+        trainer._bound_traced_step = None
+        trainer._trainable_params = None
+        trainer._graph_gradient_state = None
+        trainer.loss_fn = lambda prediction, target, global_valid_tokens: (
+            torch.nn.functional.mse_loss(prediction, target, reduction="sum")
+            / global_valid_tokens
+        )
+        trainer.train_context = nullcontext
+        trainer.post_dataloading_process = lambda input_dict, labels: (
+            input_dict["input"],
+            labels,
+            {},
+        )
+
+        grad_ids = None
+        grad_data_ptrs = None
+        for _ in range(2):
+            microbatches = [
+                (
+                    {"input": torch.randn(4, 3, dtype=torch.float64)},
+                    torch.randn(4, 2, dtype=torch.float64),
+                )
+                for _ in range(3)
+            ]
+            optimizer_ref.zero_grad(set_to_none=False)
+            global_valid_tokens = sum(labels.numel() for _, labels in microbatches)
+            for input_dict, labels in microbatches:
+                loss_ref = torch.nn.functional.mse_loss(
+                    model_ref(input_dict["input"]),
+                    labels,
+                    reduction="sum",
+                )
+                (loss_ref / global_valid_tokens).backward()
+            optimizer_ref.step()
+
+            trainer.train_step(iter(microbatches))
+
+            self.assertIsNotNone(trainer._graph_gradient_state)
+            self.assertIsNotNone(trainer._traced_step)
+            assert trainer._graph_gradient_state is not None
+            assert trainer._traced_step is not None
+            self.assertTrue(trainer._traced_step.grad_sink_active)
+            for parameter_ref, parameter_test in zip(
+                model_ref.parameters(), model_test.parameters(), strict=True
+            ):
+                torch.testing.assert_close(parameter_test.grad, parameter_ref.grad)
+                torch.testing.assert_close(parameter_test, parameter_ref)
+
+            current_grad_ids = tuple(
+                id(parameter.grad) for parameter in model_test.parameters()
+            )
+            current_grad_data_ptrs = tuple(
+                parameter.grad.data_ptr() for parameter in model_test.parameters()
+            )
+            if grad_ids is None:
+                grad_ids = current_grad_ids
+                grad_data_ptrs = current_grad_data_ptrs
+            else:
+                self.assertEqual(current_grad_ids, grad_ids)
+                self.assertEqual(current_grad_data_ptrs, grad_data_ptrs)
+
+        self.assertEqual(
+            len(
+                [
+                    node
+                    for node in trainer._traced_step.gm.graph.nodes
+                    if "graph_gradient_fqn" in node.meta
+                ]
+            ),
+            len(tuple(model_test.parameters())),
+        )
+
+    def test_graph_gradient_state_rejects_tied_parameters(self):
+        class TiedModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = nn.Parameter(torch.ones(2, 2))
+                self.tied_weight = self.weight
+
+        model = TiedModel()
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+
+        with self.assertRaisesRegex(ValueError, "tied parameter"):
+            GraphGradientState.create(model, [optimizer])
+
+    def test_graph_gradient_state_binding_failure_is_atomic(self):
+        model = nn.Linear(3, 2)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        parameters = tuple(model.parameters())
+        parameters[1].grad = torch.ones_like(parameters[1])
+
+        with self.assertRaisesRegex(RuntimeError, "already has a gradient"):
+            GraphGradientState.create(model, [optimizer])
+
+        self.assertIsNone(parameters[0].grad)
+
+    def test_graph_gradient_state_rejects_inplace_wgrad_modules_before_binding(self):
+        class InplaceWgradModel(nn.Module):
+            def __init__(self, *, nested_policy):
+                super().__init__()
+                self.projection = nn.Linear(3, 2)
+                if nested_policy:
+                    self.projection._runtime_policy = SimpleNamespace(
+                        inplace_wgrad_accum=True
+                    )
+                else:
+                    self.projection.inplace_wgrad_accum = True
+
+        for nested_policy in (False, True):
+            with self.subTest(nested_policy=nested_policy):
+                model = InplaceWgradModel(nested_policy=nested_policy)
+                optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "projection.*enables inplace_wgrad_accum",
+                ):
+                    GraphGradientState.create(model, [optimizer])
+
+                self.assertTrue(
+                    all(parameter.grad is None for parameter in model.parameters())
+                )
+
+    def test_graph_gradient_state_rejects_shared_parameter_storage(self):
+        class AliasedModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                storage = torch.ones(8)
+                self.first = nn.Parameter(storage[:4])
+                self.second = nn.Parameter(storage[4:])
+
+        model = AliasedModel()
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+
+        with self.assertRaisesRegex(ValueError, "sharing storage"):
+            GraphGradientState.create(model, [optimizer])
+
+    def test_graph_gradient_state_rejects_other_wrapper_subclasses(self):
+        parameter = _TraceableWrapper(torch.ones(2, 2, requires_grad=True))
+
+        class WrappedModel(nn.Module):
+            def named_parameters(self, *args, **kwargs):
+                return iter((("weight", parameter),))
+
+        optimizer = SimpleNamespace(param_groups=[{"params": [parameter]}])
+
+        with self.assertRaisesRegex(
+            NotImplementedError,
+            "only supports plain tensors and DTensor parameters",
+        ):
+            GraphGradientState.create(WrappedModel(), [optimizer])
+
+    def test_terminal_sink_rejects_nested_dtensor_local_wrapper(self):
+        nested_meta = SubclassMeta(
+            cls=_TraceableWrapper,
+            attrs=["elem"],
+            ctx=None,
+            inner_metas={"elem": (1, None)},
+            outer_size=torch.Size((2, 2)),
+            outer_stride=(2, 1),
+        )
+        dtensor_meta = SubclassMeta(
+            cls=DTensor,
+            attrs=["_local_tensor", "device_mesh"],
+            ctx=None,
+            inner_metas={
+                "_local_tensor": (1, nested_meta),
+                "device_mesh": (1, None),
+            },
+            outer_size=torch.Size((2, 2)),
+            outer_stride=(2, 1),
+        )
+        layout = SubclassLayout(num_tensors=2, meta=dtensor_meta)
+
+        with self.assertRaisesRegex(
+            NotImplementedError,
+            "requires plain DTensor local tensors",
+        ):
+            _accumulation_leaf_offsets("weight", layout, layout)
+
+    def test_terminal_sink_allows_only_dtensor_stride_mismatch(self):
+        from torch.distributed.tensor import Replicate, Shard
+        from torch.distributed.tensor._dtensor_spec import TensorMeta
+
+        shape = torch.Size((16, 2, 8))
+
+        def layout(
+            *,
+            stride,
+            placements=(Shard(0),),
+            dtype=torch.float32,
+            shard_order=("shard-order",),
+            requires_grad=False,
+        ):
+            return SubclassLayout(
+                num_tensors=2,
+                meta=SubclassMeta(
+                    cls=DTensor,
+                    attrs=["_local_tensor", "device_mesh"],
+                    ctx=(
+                        placements,
+                        TensorMeta(shape=shape, stride=stride, dtype=dtype),
+                        shard_order,
+                        requires_grad,
+                    ),
+                    inner_metas={
+                        "_local_tensor": (1, None),
+                        "device_mesh": (1, None),
+                    },
+                    outer_size=shape,
+                    outer_stride=stride,
+                ),
+            )
+
+        buffer_layout = layout(stride=(16, 8, 1))
+        gradient_layout = layout(stride=(2, 1, 32))
+        self.assertEqual(
+            _accumulation_leaf_offsets(
+                "weight",
+                buffer_layout,
+                gradient_layout,
+            ),
+            (0,),
+        )
+
+        mismatches = {
+            "placement": layout(
+                stride=(2, 1, 32),
+                placements=(Replicate(),),
+            ),
+            "dtype": layout(stride=(2, 1, 32), dtype=torch.bfloat16),
+            "shard order": layout(
+                stride=(2, 1, 32),
+                shard_order=("different-order",),
+            ),
+            "requires grad": layout(stride=(2, 1, 32), requires_grad=True),
+        }
+        for mismatch, mismatched_layout in mismatches.items():
+            with self.subTest(mismatch=mismatch), self.assertRaisesRegex(
+                ValueError,
+                "metadata does not match",
+            ):
+                _accumulation_leaf_offsets(
+                    "weight",
+                    buffer_layout,
+                    mismatched_layout,
+                )
+
+    def test_graph_gradient_state_rejects_parameter_storage_replacement(self):
+        model = nn.Linear(3, 2)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        gradient_state = GraphGradientState.create(model, [optimizer])
+        parameters = tuple(model.parameters())
+
+        with torch.no_grad():
+            parameters[0].set_(parameters[0].detach().clone())
+
+        with self.assertRaisesRegex(RuntimeError, "parameter storage"):
+            gradient_state.validate_parameters(parameters)
+
+    def test_graph_gradient_state_rejects_graph_state_replacement(self):
+        model = nn.Linear(3, 2)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        gradient_state = GraphGradientState.create(model, [optimizer])
+        gradient_state.graph_state["weight"] = torch.zeros_like(model.weight)
+
+        with self.assertRaisesRegex(RuntimeError, "mapping value was replaced"):
+            gradient_state.validate_bindings()
+
+    def test_trainer_zero_grad_revalidates_optimizer_membership(self):
+        model = nn.Linear(3, 2)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        optimizers = self._OptimizerCollection(optimizer)
+        gradient_state = GraphGradientState.create(model, optimizers)
+        for buffer in gradient_state.buffers:
+            buffer.fill_(1)
+        buffer_ids = tuple(id(buffer) for buffer in gradient_state.buffers)
+
+        trainer = object.__new__(GraphTrainer)
+        trainer._graph_gradient_state = gradient_state
+        trainer._graph_gradient_state_prepared_for_step = False
+        trainer.model_parts = [model]
+        trainer.optimizers = optimizers
+        trainer._zero_grad()
+
+        self.assertEqual(
+            tuple(id(parameter.grad) for parameter in model.parameters()),
+            buffer_ids,
+        )
+        self.assertTrue(
+            all(torch.count_nonzero(buffer) == 0 for buffer in gradient_state.buffers)
+        )
+
+        optimizer.param_groups[0]["params"].pop()
+        with self.assertRaisesRegex(ValueError, "do not match"):
+            trainer._zero_grad()
+
+    def test_trainer_rejects_unsupported_execution_modes(self):
+        cases = (
+            ("jit", False, "compile.mode='aot_fx_trace'"),
+            ("aot_fx_trace", True, "pipeline parallelism"),
+        )
+        for mode, pp_enabled, error in cases:
+            with self.subTest(mode=mode, pp_enabled=pp_enabled):
+                trainer = object.__new__(GraphTrainer)
+                trainer.config = SimpleNamespace(
+                    compile=GraphTrainerCompileConfig(
+                        mode=mode,
+                        enable_graph_gradient_accumulation=True,
+                    )
+                )
+                trainer.parallel_dims = SimpleNamespace(pp_enabled=pp_enabled)
+
+                with self.assertRaisesRegex(ValueError, error):
+                    trainer._validate_graph_gradient_accumulation_config()
+
+    def test_deferred_fsdp_rejects_contradictory_cuda_graph_config(self):
+        trainer = object.__new__(GraphTrainer)
+        trainer.config = SimpleNamespace(
+            compile=GraphTrainerCompileConfig(
+                mode="aot_fx_trace",
+                enable_graph_gradient_accumulation=True,
+                enable_deferred_fsdp_gradient_sync=True,
+                require_cudagraph=True,
+            ),
+            parallelism=SimpleNamespace(fsdp_reshard_after_forward="never"),
+            training=SimpleNamespace(disable_cuda_graphs=True),
+        )
+        trainer.parallel_dims = SimpleNamespace(pp_enabled=False)
+        trainer.gradient_accumulation_steps = 2
+
+        with self.assertRaisesRegex(ValueError, "CUDA graphs are disabled"):
+            trainer._validate_graph_gradient_accumulation_config()
+
+    def test_fsdp_symmetric_memory_rejects_unsupported_graph_modes(self):
+        cases = (
+            ({"mode": "jit"}, False, "compile.mode='aot_fx_trace'"),
+            ({"enable_passes": False}, False, "compile.enable_passes"),
+            (
+                {"precompile_artifact_dir": "/tmp/precompiled"},
+                False,
+                "precompiled artifacts",
+            ),
+            ({}, True, "SPMD only"),
+        )
+        for compile_overrides, pp_enabled, error in cases:
+            with self.subTest(
+                compile_overrides=compile_overrides,
+                pp_enabled=pp_enabled,
+            ):
+                compile_kwargs = {
+                    "mode": "aot_fx_trace",
+                    "enable_passes": True,
+                }
+                compile_kwargs.update(compile_overrides)
+                compile_config = GraphTrainerCompileConfig(**compile_kwargs)
+                trainer = object.__new__(GraphTrainer)
+                trainer.config = SimpleNamespace(
+                    compile=compile_config,
+                    parallelism=SimpleNamespace(
+                        enable_fsdp_symm_mem=True,
+                        fsdp_symm_mem_policy="widest",
+                    ),
+                )
+                trainer.parallel_dims = SimpleNamespace(pp_enabled=pp_enabled)
+
+                with self.assertRaisesRegex(ValueError, error):
+                    trainer._validate_fsdp_symmetric_memory_config()
+
+    def test_fsdp_symmetric_memory_rejects_unknown_policy(self):
+        trainer = object.__new__(GraphTrainer)
+        trainer.config = SimpleNamespace(
+            compile=GraphTrainerCompileConfig(),
+            parallelism=SimpleNamespace(
+                enable_fsdp_symm_mem=True,
+                fsdp_symm_mem_policy="dense",
+            ),
+        )
+        trainer.parallel_dims = SimpleNamespace(pp_enabled=False)
+
+        with self.assertRaisesRegex(ValueError, "must be 'all' or 'widest'"):
+            trainer._validate_fsdp_symmetric_memory_config()
+
+    def test_fsdp_symmetric_memory_selects_backend_before_pg_init(self):
+        trainer = object.__new__(GraphTrainer)
+        trainer.config = SimpleNamespace(
+            compile=GraphTrainerCompileConfig(),
+            parallelism=SimpleNamespace(
+                enable_fsdp_symm_mem=True,
+                fsdp_symm_mem_policy="widest",
+            ),
+        )
+        parallel_dims = SimpleNamespace(pp_enabled=False)
+        events = []
+
+        with (
+            patch.object(
+                Trainer,
+                "init_distributed",
+                side_effect=lambda: events.append("distributed") or parallel_dims,
+            ),
+            patch(
+                "torchtitan.experiments.graph_trainer.trainer.torch.distributed.is_initialized",
+                return_value=False,
+            ),
+            patch(
+                "torchtitan.experiments.graph_trainer.trainer.torch.distributed.get_backend",
+                return_value=torch.distributed.Backend.NCCL,
+            ),
+            patch(
+                "torchtitan.experiments.graph_trainer.trainer.configure_fsdp_symmetric_memory_backend",
+                side_effect=lambda: events.append("backend"),
+            ),
+        ):
+            result = trainer.init_distributed()
+
+        self.assertIs(result, parallel_dims)
+        self.assertEqual(events, ["backend", "distributed"])
+
+    def test_fsdp_symmetric_memory_does_not_select_backend_for_fake_pg(self):
+        trainer = object.__new__(GraphTrainer)
+        trainer.config = SimpleNamespace(
+            compile=GraphTrainerCompileConfig(),
+            parallelism=SimpleNamespace(
+                enable_fsdp_symm_mem=True,
+                fsdp_symm_mem_policy="widest",
+            ),
+        )
+        parallel_dims = SimpleNamespace(pp_enabled=False)
+
+        with (
+            patch.object(
+                Trainer,
+                "init_distributed",
+                return_value=parallel_dims,
+            ),
+            patch(
+                "torchtitan.experiments.graph_trainer.trainer.torch.distributed.is_initialized",
+                return_value=True,
+            ),
+            patch(
+                "torchtitan.experiments.graph_trainer.trainer.torch.distributed.get_backend",
+                return_value=torch.distributed.Backend.FAKE,
+            ),
+            patch(
+                "torchtitan.experiments.graph_trainer.trainer.configure_fsdp_symmetric_memory_backend"
+            ) as configure_backend,
+        ):
+            trainer.init_distributed()
+
+        configure_backend.assert_not_called()
+
+    def test_fsdp_symmetric_memory_skips_early_backend_for_fake_comm_modes(self):
+        for comm_mode in (
+            "fake_backend",
+            "local_tensor",
+            "real_pp_fake_spmd_backend",
+        ):
+            with self.subTest(comm_mode=comm_mode):
+                trainer = object.__new__(GraphTrainer)
+                trainer.config = SimpleNamespace(
+                    comm=SimpleNamespace(mode=comm_mode),
+                    compile=GraphTrainerCompileConfig(),
+                    parallelism=SimpleNamespace(
+                        enable_fsdp_symm_mem=True,
+                        fsdp_symm_mem_policy="widest",
+                    ),
+                )
+                parallel_dims = SimpleNamespace(pp_enabled=False)
+
+                with (
+                    patch.object(
+                        Trainer,
+                        "init_distributed",
+                        return_value=parallel_dims,
+                    ),
+                    patch(
+                        "torchtitan.experiments.graph_trainer.trainer."
+                        "torch.distributed.is_initialized",
+                        return_value=False,
+                    ),
+                    patch(
+                        "torchtitan.experiments.graph_trainer.trainer."
+                        "configure_fsdp_symmetric_memory_backend"
+                    ) as configure_backend,
+                ):
+                    trainer.init_distributed()
+
+                configure_backend.assert_not_called()
+
+    def test_disabled_fsdp_symmetric_memory_does_not_touch_backend(self):
+        trainer = object.__new__(GraphTrainer)
+        trainer.config = SimpleNamespace(
+            compile=GraphTrainerCompileConfig(),
+            parallelism=SimpleNamespace(
+                enable_fsdp_symm_mem=False,
+                fsdp_symm_mem_policy="widest",
+            ),
+        )
+        parallel_dims = SimpleNamespace(pp_enabled=False)
+
+        with (
+            patch.object(
+                Trainer,
+                "init_distributed",
+                return_value=parallel_dims,
+            ),
+            patch(
+                "torchtitan.experiments.graph_trainer.trainer.torch.distributed.get_backend"
+            ) as get_backend,
+            patch(
+                "torchtitan.experiments.graph_trainer.trainer.configure_fsdp_symmetric_memory_backend"
+            ) as configure_backend,
+        ):
+            trainer.init_distributed()
+
+        get_backend.assert_not_called()
+        configure_backend.assert_not_called()
+
+    def test_terminal_sink_rejects_reordered_gradient_outputs(self):
+        model = nn.Linear(3, 2, dtype=torch.float64)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        gradient_state = GraphGradientState.create(model, [optimizer])
+
+        def train_step(inputs, targets):
+            loss = torch.nn.functional.mse_loss(
+                model(inputs),
+                targets,
+                reduction="sum",
+            )
+            grads = torch.autograd.grad(loss, tuple(model.parameters()))
+            return [loss, *grads]
+
+        inputs = torch.randn(2, 3, dtype=torch.float64)
+        targets = torch.randn(2, 2, dtype=torch.float64)
+        traced = minimal_fx_tracer(
+            train_step,
+            module=model,
+            graph_state=gradient_state.graph_state,
+            graph_state_output_indices=(1, 2),
+        )(inputs, targets)
+        output = next(node for node in traced.gm.graph.nodes if node.op == "output")
+        output_values = list(output.args[0])
+        output_values[1], output_values[2] = output_values[2], output_values[1]
+        output.args = (output_values,)
+
+        with self.assertRaisesRegex(ValueError, "gradient-output mapping"):
+            finalize_graph_gradient_accumulation(
+                traced.gm,
+                traced_result=traced,
+            )
+
+    def test_terminal_sink_rejects_incompatible_gradient_buffer(self):
+        model = nn.Linear(3, 2, dtype=torch.float64)
+
+        def train_step(inputs, targets):
+            loss = torch.nn.functional.mse_loss(
+                model(inputs),
+                targets,
+                reduction="sum",
+            )
+            grads = torch.autograd.grad(loss, tuple(model.parameters()))
+            return [loss, *grads]
+
+        graph_state = {
+            name: torch.zeros_like(parameter, dtype=torch.float32)
+            for name, parameter in model.named_parameters()
+        }
+        traced = minimal_fx_tracer(
+            train_step,
+            module=model,
+            graph_state=graph_state,
+            graph_state_output_indices=(1, 2),
+        )(
+            torch.randn(2, 3, dtype=torch.float64),
+            torch.randn(2, 2, dtype=torch.float64),
+        )
+
+        with self.assertRaisesRegex(ValueError, "shape, dtype, and device"):
+            finalize_graph_gradient_accumulation(
+                traced.gm,
+                traced_result=traced,
+            )
+
+    def test_terminal_sink_does_not_alias_mutable_gradient_metadata(self):
+        model = nn.Linear(3, 2)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        gradient_state = GraphGradientState.create(model, [optimizer])
+
+        def train_step(inputs, targets):
+            loss = torch.nn.functional.mse_loss(
+                model(inputs),
+                targets,
+                reduction="sum",
+            )
+            grads = torch.autograd.grad(loss, tuple(model.parameters()))
+            return [loss, *grads]
+
+        traced = minimal_fx_tracer(
+            train_step,
+            module=model,
+            graph_state=gradient_state.graph_state,
+            graph_state_output_indices=(1, 2),
+        )(torch.randn(2, 3), torch.randn(2, 2))
+        output = next(node for node in traced.gm.graph.nodes if node.op == "output")
+        gradient = output.args[0][1]
+        gradient.meta["custom"] = {"owner": "gradient"}
+        gradient.meta["unbacked_bindings"] = {"symbol": "gradient"}
+
+        finalize_graph_gradient_accumulation(traced.gm, traced_result=traced)
+        sink = next(
+            node
+            for node in traced.gm.graph.nodes
+            if node.meta.get("graph_gradient_fqn") == "weight"
+        )
+        gradient.meta["custom"]["late_annotation"] = True
+        gradient.meta["unbacked_bindings"]["late_symbol"] = True
+
+        self.assertNotIn("late_annotation", sink.meta["custom"])
+        self.assertNotIn("late_symbol", sink.meta["unbacked_bindings"])
 
 
 class TestMinimalFXTracerDynamicShapes(unittest.TestCase):
@@ -362,6 +1575,17 @@ class TestMinimalFXTracerDynamicShapes(unittest.TestCase):
             _maybe_materialize_grad_for_param_layout(param, materialized),
             materialized,
         )
+
+    def test_accumulate_param_grads_owns_first_graph_output(self):
+        param = nn.Parameter(torch.zeros(2))
+        graph_grad = torch.tensor([1.0, 2.0])
+
+        accumulate_param_grads_([param], [graph_grad], outputs_are_replay_owned=True)
+        graph_grad.fill_(3.0)
+
+        self.assertTrue(torch.equal(param.grad, torch.tensor([1.0, 2.0])))
+        accumulate_param_grads_([param], [graph_grad], outputs_are_replay_owned=True)
+        self.assertTrue(torch.equal(param.grad, torch.tensor([4.0, 5.0])))
 
     def test_mark_unbacked_mixed_with_static_input_replay(self):
         from torch._dynamo.decorators import mark_unbacked
@@ -1829,6 +3053,605 @@ class TestTraceFSDP(FSDPTest):
             spmd_backend="partial_dtensor",
         )
 
+    def test_graph_gradient_accumulation_preserves_fsdp_layout(self):
+        from torch.distributed.tensor import DTensor
+
+        from torchtitan.experiments.graph_trainer.simple_fsdp import data_parallel
+
+        torch.manual_seed(42)
+        self._setup()
+        fsdp_mesh = self.parallel_dims.get_mesh("fsdp")
+        model_ref = nn.Linear(8, 4, device="cuda")
+        model_test = nn.Linear(8, 4, device="cuda")
+        model_test.load_state_dict(model_ref.state_dict())
+        model_ref = data_parallel(model_ref, device_mesh=fsdp_mesh, mode="fully_shard")
+        model_test = data_parallel(
+            model_test,
+            device_mesh=fsdp_mesh,
+            mode="fully_shard",
+        )
+        optimizer_ref = torch.optim.SGD(model_ref.parameters(), lr=0.1)
+        optimizer_test = torch.optim.SGD(model_test.parameters(), lr=0.1)
+        gradient_state = GraphGradientState.create(model_test, [optimizer_test])
+
+        def train_step(inputs, targets):
+            loss = torch.nn.functional.mse_loss(
+                model_test(inputs),
+                targets,
+                reduction="sum",
+            )
+            grads = torch.autograd.grad(loss, tuple(model_test.parameters()))
+            return [loss, *grads]
+
+        microbatches = [
+            (
+                torch.randn(3, 8, device="cuda"),
+                torch.randn(3, 4, device="cuda"),
+            )
+            for _ in range(2)
+        ]
+        traced = minimal_fx_tracer(
+            train_step,
+            module=model_test,
+            graph_state=gradient_state.graph_state,
+            graph_state_output_indices=tuple(range(1, len(gradient_state.buffers) + 1)),
+        )(*microbatches[0])
+        traced.gm = finalize_graph_gradient_accumulation(
+            traced.gm,
+            traced_result=traced,
+        )
+        run = run_traced(
+            traced,
+            module=model_test,
+            graph_state=gradient_state.graph_state,
+        )
+
+        for inputs, targets in microbatches:
+            loss_ref = torch.nn.functional.mse_loss(
+                model_ref(inputs),
+                targets,
+                reduction="sum",
+            )
+            loss_ref.backward()
+            outputs = run(inputs, targets)
+
+            self.assertEqual(len(outputs), 1)
+            torch.testing.assert_close(outputs[0], loss_ref)
+            for parameter_ref, parameter_test, buffer in zip(
+                model_ref.parameters(),
+                model_test.parameters(),
+                gradient_state.buffers,
+                strict=True,
+            ):
+                self.assertIs(parameter_test.grad, buffer)
+                self.assertIsInstance(buffer, DTensor)
+                self.assertEqual(buffer.placements, parameter_test.placements)
+                torch.testing.assert_close(
+                    buffer.to_local(),
+                    parameter_ref.grad.to_local(),
+                )
+
+        optimizer_ref.step()
+        optimizer_test.step()
+        for parameter_ref, parameter_test in zip(
+            model_ref.parameters(), model_test.parameters(), strict=True
+        ):
+            torch.testing.assert_close(
+                parameter_test.to_local(),
+                parameter_ref.to_local(),
+            )
+
+    def _run_deferred_fsdp_gradient_sync_case(
+        self,
+        *,
+        enable_cudagraph: bool,
+    ) -> None:
+        from torchtitan.experiments.graph_trainer.simple_fsdp import data_parallel
+
+        torch.manual_seed(42)
+        self._setup()
+        fsdp_mesh = self.parallel_dims.get_mesh("fsdp")
+        model_ref = data_parallel(
+            nn.Linear(8, 4, device="cuda"),
+            device_mesh=fsdp_mesh,
+            mode="fully_shard",
+        )
+        model_test = data_parallel(
+            nn.Linear(8, 4, device="cuda"),
+            device_mesh=fsdp_mesh,
+            mode="fully_shard",
+        )
+        model_test.load_state_dict(model_ref.state_dict())
+        optimizer_ref = torch.optim.SGD(model_ref.parameters(), lr=0.1)
+        optimizer_test = torch.optim.SGD(model_test.parameters(), lr=0.1)
+        gradient_state = GraphGradientState.create(model_test, [optimizer_test])
+
+        def train_step(inputs, targets, global_valid_tokens, extra_kwargs):
+            del extra_kwargs
+            loss = (
+                torch.nn.functional.mse_loss(
+                    model_test(inputs),
+                    targets,
+                    reduction="sum",
+                )
+                / global_valid_tokens
+            )
+            grads = torch.autograd.grad(loss, tuple(model_test.parameters()))
+            return [loss, *grads]
+
+        microbatch_steps = [
+            [
+                (
+                    torch.randn(3, 8, device="cuda"),
+                    torch.randn(3, 4, device="cuda"),
+                    {},
+                )
+                for _ in range(3)
+            ]
+            for _ in range(3)
+        ]
+        microbatches = microbatch_steps[0]
+        global_valid_tokens = torch.tensor(
+            sum(target.numel() for _, target, _ in microbatches),
+            device="cuda",
+        )
+        traced = minimal_fx_tracer(
+            train_step,
+            module=model_test,
+            graph_state=gradient_state.graph_state,
+            graph_state_output_indices=(1, 2),
+        )(
+            *microbatches[0][:2],
+            global_valid_tokens,
+            microbatches[0][2],
+        )
+        num_flat_parameters = len(flatten_graph_values(list(model_test.parameters())))
+        deferred = build_deferred_fsdp_graph(
+            traced,
+            num_flat_parameters=num_flat_parameters,
+            num_microbatches=len(microbatches),
+            compile_config=GraphTrainerCompileConfig(
+                enable_passes=False,
+                inductor_compilation="none",
+                disable_passes=[] if enable_cudagraph else ["cudagraph_pass"],
+                require_cudagraph=enable_cudagraph,
+            ),
+            enable_cudagraph=enable_cudagraph,
+        )
+        run = bind_deferred_fsdp_graph(
+            deferred,
+            module=model_test,
+            gradient_state=gradient_state,
+        )
+
+        for microbatches in microbatch_steps:
+            optimizer_ref.zero_grad(set_to_none=False)
+            optimizer_test.zero_grad(set_to_none=False)
+            loss_ref = torch.zeros((), device="cuda")
+            for inputs, targets, _ in microbatches:
+                loss = (
+                    torch.nn.functional.mse_loss(
+                        model_ref(inputs),
+                        targets,
+                        reduction="sum",
+                    )
+                    / global_valid_tokens
+                )
+                loss.backward()
+                loss_ref += loss.detach()
+            loss_test = run(microbatches, global_valid_tokens)
+            torch.cuda.synchronize()
+
+            torch.testing.assert_close(loss_test, loss_ref)
+            for parameter_ref, parameter_test in zip(
+                model_ref.parameters(), model_test.parameters(), strict=True
+            ):
+                torch.testing.assert_close(
+                    parameter_test.grad.to_local(),
+                    parameter_ref.grad.to_local(),
+                )
+            optimizer_ref.step()
+            optimizer_test.step()
+            for parameter_ref, parameter_test in zip(
+                model_ref.parameters(), model_test.parameters(), strict=True
+            ):
+                torch.testing.assert_close(
+                    parameter_test.to_local(),
+                    parameter_ref.to_local(),
+                )
+        self.assertGreater(deferred.num_all_gathers, 0)
+        self.assertGreater(deferred.num_gradient_collectives, 0)
+        if enable_cudagraph:
+            self.assertIsInstance(deferred.gm.forward, CUDAGraphWrapper)
+            deferred.gm.forward.teardown()
+
+    def test_deferred_fsdp_gradient_sync_matches_per_microbatch_sync(self):
+        self._run_deferred_fsdp_gradient_sync_case(enable_cudagraph=False)
+
+    def test_deferred_fsdp_gradient_sync_cuda_graph_replays_exactly_once(self):
+        self._run_deferred_fsdp_gradient_sync_case(enable_cudagraph=True)
+
+    def test_mxfp8_fsdp_gradient_state_uses_plain_local_leaves(self):
+        import torchtitan.components.quantization.mx as mx
+
+        from torchtitan.experiments.graph_trainer.simple_fsdp import (
+            data_parallel,
+            MixedPrecisionPolicy,
+        )
+
+        if mx.MXFP8Linear is None:
+            raise unittest.SkipTest("MXFP8 dependencies are unavailable")
+
+        self._setup()
+        fsdp_mesh = self.parallel_dims.get_mesh("fsdp")
+        model = mx.MXFP8Linear(
+            mx.MXFP8Linear.Config(in_features=64, out_features=64, bias=False)
+        ).to(device="cuda", dtype=torch.bfloat16)
+        model.configure_fsdp()
+        model = data_parallel(
+            model,
+            device_mesh=fsdp_mesh,
+            mode="fully_shard",
+            mp_policy=MixedPrecisionPolicy(
+                param_dtype=torch.bfloat16,
+                reduce_dtype=torch.bfloat16,
+            ),
+        )
+        parameter = next(model.parameters())
+        self.assertIsInstance(parameter, DTensor)
+        self.assertIsInstance(parameter.to_local(), mx._MXFP8FSDPWeight)
+
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        gradient_state = GraphGradientState.create(model, [optimizer])
+        buffer = gradient_state.buffers[0]
+        self.assertIsInstance(buffer, DTensor)
+        self.assertIs(type(buffer.to_local()), torch.Tensor)
+        self.assertEqual(buffer.placements, parameter.placements)
+        self.assertIs(parameter.grad, buffer)
+
+        class SyntheticMXFP8Use(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, weight):
+                ctx.weight_shape = weight.shape
+                return torch.ones((), dtype=weight.dtype, device=weight.device)
+
+            @staticmethod
+            def backward(ctx, grad_output):
+                return grad_output.new_ones(ctx.weight_shape) * grad_output
+
+        def train_step():
+            traced_parameter = next(model.parameters())
+            loss = SyntheticMXFP8Use.apply(model.weight)
+            gradient = torch.autograd.grad(loss, (traced_parameter,))[0]
+            return [loss, gradient]
+
+        traced = minimal_fx_tracer(
+            train_step,
+            module=model,
+            graph_state=gradient_state.graph_state,
+            graph_state_output_indices=(1,),
+        )()
+        gradient_layout = traced.output_subclass_layouts[1]
+        assert gradient_layout.meta is not None
+        self.assertIs(gradient_layout.meta.cls, DTensor)
+        num_local_leaves, local_meta = gradient_layout.meta.inner_metas["_local_tensor"]
+        self.assertEqual(num_local_leaves, 1)
+        self.assertIsNone(local_meta)
+
+        finalize_graph_gradient_accumulation(
+            traced.gm,
+            traced_result=traced,
+        )
+        sinks = [
+            node
+            for node in traced.gm.graph.nodes
+            if node.meta.get("graph_gradient_fqn") == "weight"
+        ]
+        self.assertTrue(traced.grad_sink_active)
+        self.assertEqual(len(sinks), 1)
+
+    def _run_deferred_mxfp8_wgrad_fusion_case(
+        self,
+        *,
+        enable_cudagraph: bool,
+    ) -> None:
+        import torchtitan.components.quantization.mx as mx
+
+        from torchtitan.experiments.graph_trainer.fsdp_passes import (
+            deduplicate_fsdp_unshard_chains_pass,
+        )
+        from torchtitan.experiments.graph_trainer.simple_fsdp import (
+            data_parallel,
+            MixedPrecisionPolicy,
+        )
+
+        if mx.MXFP8Linear is None:
+            raise unittest.SkipTest("MXFP8 dependencies are unavailable")
+        if torch.cuda.get_device_capability() < (10, 0):
+            raise unittest.SkipTest("MXFP8 WGrad accumulation requires SM100")
+
+        torch.manual_seed(42)
+        self._setup()
+        fsdp_mesh = self.parallel_dims.get_mesh("fsdp")
+        model_ref = mx.MXFP8Linear(
+            mx.MXFP8Linear.Config(
+                in_features=64,
+                out_features=64,
+                bias=False,
+            )
+        ).to(device="cuda", dtype=torch.bfloat16)
+        model_test = deepcopy(model_ref)
+        for model in (model_ref, model_test):
+            model.configure_fsdp()
+        mp_policy = MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.bfloat16,
+        )
+        model_ref = data_parallel(
+            model_ref,
+            device_mesh=fsdp_mesh,
+            mode="fully_shard",
+            mp_policy=mp_policy,
+        )
+        model_test = data_parallel(
+            model_test,
+            device_mesh=fsdp_mesh,
+            mode="fully_shard",
+            mp_policy=mp_policy,
+        )
+        optimizer_ref = torch.optim.SGD(model_ref.parameters(), lr=0.1)
+        optimizer_test = torch.optim.SGD(model_test.parameters(), lr=0.1)
+        gradient_state_ref = GraphGradientState.create(model_ref, [optimizer_ref])
+        gradient_state_test = GraphGradientState.create(model_test, [optimizer_test])
+        microbatches = [
+            (
+                torch.randn(32, 64, device="cuda", dtype=torch.bfloat16),
+                torch.randn(32, 64, device="cuda", dtype=torch.bfloat16),
+                {},
+            )
+            for _ in range(3)
+        ]
+        global_valid_tokens = torch.tensor(
+            sum(target.numel() for _, target, _ in microbatches),
+            device="cuda",
+        )
+
+        def build(
+            model: nn.Module,
+            gradient_state: GraphGradientState,
+            *,
+            fuse_wgrad: bool,
+        ):
+            def train_step(inputs, targets, valid_tokens, extra_kwargs):
+                del extra_kwargs
+                loss = (
+                    torch.nn.functional.mse_loss(
+                        model(inputs).float(),
+                        targets.float(),
+                        reduction="sum",
+                    )
+                    / valid_tokens
+                )
+                gradients = torch.autograd.grad(loss, tuple(model.parameters()))
+                return [loss, *gradients]
+
+            traced = minimal_fx_tracer(
+                train_step,
+                module=model,
+                graph_state=gradient_state.graph_state,
+                graph_state_output_indices=(1,),
+            )(
+                *microbatches[0][:2],
+                global_valid_tokens,
+                microbatches[0][2],
+            )
+            deduplicate_fsdp_unshard_chains_pass(traced.gm, traced.example_inputs)
+            deferred = build_deferred_fsdp_graph(
+                traced,
+                num_flat_parameters=len(flatten_graph_values(list(model.parameters()))),
+                num_microbatches=len(microbatches),
+                compile_config=GraphTrainerCompileConfig(
+                    enable_passes=True,
+                    inductor_compilation="none",
+                    numerics_changing_optim=fuse_wgrad,
+                    disable_passes=([] if enable_cudagraph else ["cudagraph_pass"]),
+                    require_cudagraph=enable_cudagraph,
+                ),
+                enable_cudagraph=enable_cudagraph,
+            )
+            return deferred, bind_deferred_fsdp_graph(
+                deferred,
+                module=model,
+                gradient_state=gradient_state,
+            )
+
+        deferred_ref, run_ref = build(
+            model_ref,
+            gradient_state_ref,
+            fuse_wgrad=False,
+        )
+        deferred_test, run_test = build(
+            model_test,
+            gradient_state_test,
+            fuse_wgrad=True,
+        )
+        scaled_mm = torch.ops.aten._scaled_mm.default
+        scaled_addmm = torch.ops.aten._scaled_addmm_.default
+        self.assertGreater(
+            sum(
+                node.target == scaled_mm for node in deferred_test.gm.first.graph.nodes
+            ),
+            0,
+        )
+        self.assertEqual(
+            sum(
+                node.target == scaled_addmm
+                for node in deferred_test.gm.first.graph.nodes
+            ),
+            0,
+        )
+        for name in ("middle", "final"):
+            reference_child = getattr(deferred_ref.gm, name)
+            fused_child = getattr(deferred_test.gm, name)
+            self.assertEqual(
+                sum(
+                    node.target == scaled_addmm for node in reference_child.graph.nodes
+                ),
+                0,
+            )
+            self.assertEqual(
+                sum(node.target == scaled_addmm for node in fused_child.graph.nodes),
+                1,
+            )
+
+        num_steps = 3 if enable_cudagraph else 2
+        for _ in range(num_steps):
+            optimizer_ref.zero_grad(set_to_none=False)
+            optimizer_test.zero_grad(set_to_none=False)
+            loss_ref = run_ref(microbatches, global_valid_tokens)
+            loss_test = run_test(microbatches, global_valid_tokens)
+            torch.cuda.synchronize()
+            torch.testing.assert_close(loss_test, loss_ref)
+            for parameter_ref, parameter_test in zip(
+                model_ref.parameters(), model_test.parameters(), strict=True
+            ):
+                torch.testing.assert_close(
+                    parameter_test.grad.to_local(),
+                    parameter_ref.grad.to_local(),
+                    rtol=2e-2,
+                    atol=2e-2,
+                )
+            optimizer_ref.step()
+            optimizer_test.step()
+            for parameter_ref, parameter_test in zip(
+                model_ref.parameters(), model_test.parameters(), strict=True
+            ):
+                torch.testing.assert_close(
+                    parameter_test.to_local(),
+                    parameter_ref.to_local(),
+                    rtol=2e-2,
+                    atol=2e-2,
+                )
+        if enable_cudagraph:
+            self.assertIsNotNone(deferred_test.gm.forward._cudagraph)
+            deferred_ref.gm.forward.teardown()
+            deferred_test.gm.forward.teardown()
+
+    def test_deferred_mxfp8_wgrad_fusion_runs_without_cuda_graph(self) -> None:
+        self._run_deferred_mxfp8_wgrad_fusion_case(enable_cudagraph=False)
+
+    def test_deferred_mxfp8_wgrad_fusion_runs_with_cuda_graph(self) -> None:
+        self._run_deferred_mxfp8_wgrad_fusion_case(enable_cudagraph=True)
+
+    def test_fused_wgrad_stride_accumulates_in_graph(self):
+        from torchtitan.experiments.graph_trainer.simple_fsdp import (
+            data_parallel,
+            MixedPrecisionPolicy,
+        )
+
+        class FusedProjection(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.w13 = nn.Parameter(torch.randn(64, 2, 32, device="cuda"))
+
+            def forward(self, x):
+                return torch.einsum("...d,hgd->...hg", x, self.w13)
+
+        torch.manual_seed(42)
+        self._setup()
+        model = data_parallel(
+            FusedProjection(),
+            device_mesh=self.parallel_dims.get_mesh("fsdp"),
+            mode="fully_shard",
+            mp_policy=MixedPrecisionPolicy(
+                param_dtype=torch.bfloat16,
+                reduce_dtype=torch.bfloat16,
+            ),
+        )
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        gradient_state = GraphGradientState.create(model, [optimizer])
+
+        def train_step(inputs):
+            loss = model(inputs).float().sum()
+            gradient = torch.autograd.grad(loss, tuple(model.parameters()))[0]
+            return [loss, gradient]
+
+        microbatches = [
+            torch.randn(4, 32, device="cuda", dtype=torch.bfloat16) for _ in range(2)
+        ]
+        traced = minimal_fx_tracer(
+            train_step,
+            module=model,
+            graph_state=gradient_state.graph_state,
+            graph_state_output_indices=(1,),
+        )(microbatches[0])
+        buffer_meta = traced.input_subclass_layouts[len(traced.state_fqns)].meta
+        gradient_meta = traced.output_subclass_layouts[1].meta
+        assert buffer_meta is not None
+        assert gradient_meta is not None
+        self.assertEqual(buffer_meta.outer_size, torch.Size((64, 2, 32)))
+        self.assertEqual(gradient_meta.outer_size, buffer_meta.outer_size)
+        self.assertNotEqual(gradient_meta.outer_stride, buffer_meta.outer_stride)
+
+        traced.gm = finalize_graph_gradient_accumulation(
+            traced.gm,
+            traced_result=traced,
+        )
+        run = bind_traced(
+            traced,
+            module=model,
+            graph_state=gradient_state.graph_state,
+        )
+        run.validate_state(
+            module=model,
+            graph_state=gradient_state.graph_state,
+        )
+        expected_gradient = torch.zeros_like(gradient_state.buffers[0].to_local())
+        for inputs in microbatches:
+            expected_loss, gradient = train_step(inputs)
+            expected_gradient.add_(gradient.to_local())
+            outputs = run(inputs)
+            self.assertEqual(len(outputs), 1)
+            torch.testing.assert_close(outputs[0], expected_loss)
+            self.assertTrue(
+                torch.equal(
+                    gradient_state.buffers[0].to_local(),
+                    expected_gradient,
+                )
+            )
+
+    def test_terminal_sink_validates_dtensor_device_mesh(self):
+        from torch.distributed.device_mesh import DeviceMesh
+
+        self._setup()
+        mesh = self.parallel_dims.get_mesh("fsdp")
+        equal_mesh = DeviceMesh(
+            mesh.device_type,
+            mesh.mesh.clone(),
+            mesh_dim_names=mesh.mesh_dim_names,
+            _init_backend=False,
+        )
+        different_mesh = DeviceMesh(
+            mesh.device_type,
+            mesh.mesh.clone(),
+            mesh_dim_names=("different",),
+            _init_backend=False,
+        )
+        graph = torch.fx.Graph()
+        buffer = graph.placeholder("buffer_mesh")
+        gradient = graph.placeholder("gradient_mesh")
+        buffer.meta["val"] = mesh
+        gradient.meta["val"] = equal_mesh
+        _validate_device_mesh_leaf("weight", buffer, gradient)
+
+        gradient.meta["val"] = different_mesh
+        with self.assertRaisesRegex(ValueError, "device mesh does not match"):
+            _validate_device_mesh_leaf("weight", buffer, gradient)
+
+        gradient.meta.pop("val")
+        with self.assertRaisesRegex(ValueError, "device mesh does not match"):
+            _validate_device_mesh_leaf("weight", buffer, gradient)
+
     def _run_fsdp_model_test(
         self,
         config_cls,
@@ -1928,6 +3751,126 @@ class TestTraceFSDP(FSDPTest):
             )
             for gr, gt in zip(grads_ref, grads_tr, strict=True):
                 self.assertTrue(torch.equal(gr, gt), f"Step {step}: grad mismatch")
+
+    def test_chunked_lm_head_uses_one_bf16_gradient_reduction(self):
+        self._run_chunked_lm_head_gradient_reduction(torch.bfloat16)
+
+    def test_chunked_lm_head_uses_one_fp32_gradient_reduction(self):
+        self._run_chunked_lm_head_gradient_reduction(torch.float32)
+
+    def _run_chunked_lm_head_gradient_reduction(
+        self,
+        reduce_dtype: torch.dtype,
+    ) -> None:
+        from torch.distributed.fsdp import (
+            fully_shard,
+            MixedPrecisionPolicy as FSDPMixedPrecisionPolicy,
+        )
+
+        from torchtitan.components.loss import ChunkedLossWrapper
+        from torchtitan.distributed.fsdp import disable_fsdp_gradient_division
+        from torchtitan.experiments.graph_trainer.simple_fsdp import (
+            data_parallel,
+            MixedPrecisionPolicy,
+        )
+
+        torch.manual_seed(42)
+        torch.cuda.manual_seed(42)
+        self._setup()
+        fsdp_mesh = self.parallel_dims.get_mesh("fsdp")
+        dim, vocab_size, num_chunks = 32, 64, 8
+
+        reference_head = nn.Linear(dim, vocab_size, bias=False, device="cuda")
+        traced_head = nn.Linear(dim, vocab_size, bias=False, device="cuda")
+        traced_head.load_state_dict(reference_head.state_dict())
+        fully_shard(
+            reference_head,
+            mesh=fsdp_mesh,
+            mp_policy=FSDPMixedPrecisionPolicy(
+                param_dtype=torch.bfloat16,
+                reduce_dtype=reduce_dtype,
+            ),
+        )
+        disable_fsdp_gradient_division(reference_head)
+        traced_head = data_parallel(
+            traced_head,
+            device_mesh=fsdp_mesh,
+            mode="fully_shard",
+            mp_policy=MixedPrecisionPolicy(
+                param_dtype=torch.bfloat16,
+                reduce_dtype=reduce_dtype,
+            ),
+        )
+
+        hidden_states = torch.randn(
+            2,
+            16,
+            dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        labels = torch.randint(0, vocab_size, (2, 16), device="cuda")
+
+        reference_hidden = hidden_states.detach().clone().requires_grad_(True)
+        reference_loss_fn = ChunkedLossWrapper(
+            ChunkedLossWrapper.Config(num_chunks=num_chunks)
+        )
+        reference_loss_fn.set_lm_head(reference_head)
+        reference_loss, _ = reference_loss_fn(reference_hidden, labels)
+        reference_loss.backward()
+        reference_outputs = (
+            reference_loss,
+            reference_hidden.grad,
+            next(reference_head.parameters()).grad,
+        )
+
+        def train_step(hidden_states, labels):
+            loss_fn = ChunkedLossWrapperWithParamGrads(
+                ChunkedLossWrapperWithParamGrads.Config(num_chunks=num_chunks)
+            )
+            loss_fn.set_weight_gradient_reduce_dtype(reduce_dtype)
+            loss_fn.set_lm_head(traced_head)
+            loss, _ = loss_fn(hidden_states, labels)
+            hidden_grad, weight_grad = torch.autograd.grad(
+                loss,
+                (hidden_states, *traced_head.parameters()),
+            )
+            return loss, hidden_grad, weight_grad
+
+        eager_outputs = train_step(hidden_states, labels)
+        for reference, eager in zip(reference_outputs, eager_outputs, strict=True):
+            self.assertTrue(torch.equal(reference, eager))
+
+        traced = minimal_fx_tracer(train_step, module=traced_head)(
+            hidden_states,
+            labels,
+        )
+        all_gathers = [
+            node
+            for node in traced.gm.graph.nodes
+            if node.target is torch.ops._c10d_functional.all_gather_into_tensor.default
+        ]
+        reduce_scatters = [
+            node
+            for node in traced.gm.graph.nodes
+            if node.target is torch.ops._c10d_functional.reduce_scatter_tensor.default
+        ]
+        self.assertEqual(len(all_gathers), 1)
+        self.assertEqual(len(reduce_scatters), 1)
+        reduce_scatter_input = reduce_scatters[0].args[0]
+        self.assertIsInstance(reduce_scatter_input, torch.fx.Node)
+        self.assertEqual(reduce_scatter_input.meta["val"].dtype, reduce_dtype)
+        sharded_weight = next(traced_head.parameters())
+        self.assertEqual(eager_outputs[2].dtype, sharded_weight.dtype)
+        self.assertEqual(eager_outputs[2].placements, sharded_weight.placements)
+
+        replay_outputs = run_traced(traced, module=traced_head)(
+            hidden_states,
+            labels,
+        )
+        for eager, replay in zip(eager_outputs, replay_outputs, strict=True):
+            self.assertTrue(torch.equal(eager, replay))
 
     def test_llama3_fsdp(self):
         from torchtitan.models.llama3 import llama3_configs, Llama3Model

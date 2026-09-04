@@ -148,7 +148,11 @@ def test_autoparallel_graph_pass_selection_uses_regular_memory_policy():
         ),
     )
 
-    graph_passes = passes.construct_default_graph_passes(traced_result, config)
+    graph_passes = passes.construct_default_graph_passes(
+        traced_result,
+        config,
+        fsdp_bucket_plan=["tok_embeddings", "layers.0", ["norm", "lm_head"]],
+    )
     pass_fns = [getattr(pass_fn, "func", pass_fn) for pass_fn in graph_passes]
 
     assert passes.tag_with_memory_policy_pass in pass_fns

@@ -78,12 +78,11 @@ class TrainingConfig:
     """
     Disable CUDA graph capture and replay for the forward+backward step. CUDA
     graphs require fixed-shape inputs and no CPU<->GPU synchronization during
-    the captured region. Expert parallelism is supported only with HybridEP
-    when ``non_blocking_capacity_factor`` is set, or with MinimalAsyncEP. Other
-    EP backends synchronize with the host during dispatch. Pipeline parallelism
-    is not supported yet. CUDA graphs are independent of
-    ``torch.compile(mode="reduce-overhead")``, which performs its own CUDA graph
-    capture.
+    the captured region. Expert parallelism is supported by capture-compatible
+    routed experts, HybridEP when ``non_blocking_capacity_factor`` is set, and
+    MinimalAsyncEP. Pipeline parallelism is not supported yet. CUDA graphs are
+    independent of ``torch.compile(mode="reduce-overhead")``, which performs
+    its own CUDA graph capture.
     """
 
     dtype: Literal["bfloat16", "float32"] = "float32"
@@ -101,7 +100,7 @@ class TrainingConfig:
     and no other parallelism is enabled, i.e. under DDP or single-device training.
     """
 
-    mixed_precision_reduce: Literal["float32"] = "float32"
+    mixed_precision_reduce: Literal["bfloat16", "float32"] = "float32"
     """
     torch dtype to use for reductions when applying mixed precision via FSDP.
     This feature only takes effect when data_parallel_shard_degree > 1
@@ -161,8 +160,29 @@ class ParallelismConfig:
 
     enable_fsdp_symm_mem: bool = False
     """
-    Whether to enable FSDP2 symmetric-memory communication optimizations for
-    all FSDP modules after `fully_shard` has been applied.
+    Whether to enable symmetric-memory communication optimizations for FSDP.
+    Main Trainer applies this to FSDP2 parameter groups; GraphTrainer applies
+    it to bucketed SimpleFSDP collectives in the minimal FX graph.
+    """
+
+    fsdp_symm_mem_policy: Literal["all", "widest"] = "all"
+    """
+    Which FSDP parameter groups receive symmetric-memory buffers when
+    `enable_fsdp_symm_mem` is set. This only matters when the model has
+    parameter groups at more than one all-gather degree, which is the case
+    under expert parallelism: routed experts all-gather over `dp_mod_ep`
+    while dense parameters all-gather over the whole `dp_shard`.
+
+    - "all" enables symmetric memory on every FSDP parameter group.
+    - "widest" enables it only on the parameter groups whose all-gather
+      process group is at the largest degree in the model, leaving narrower
+      groups on the generic collectives.
+
+    Prefer "widest" when a narrow group fits inside a single NVLink domain.
+    NCCL's symmetric kernels split a collective into a network dimension and
+    an NVLink dimension; a group contained in one domain has no network
+    dimension to exploit, and its symmetric reduce-scatter is slower than the
+    generic ring kernel.
     """
 
     tensor_parallel_degree: int = 1

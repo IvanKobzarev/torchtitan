@@ -16,6 +16,7 @@ import torch._functorch.config
 import torch.nn as nn
 import tyro
 from torch._functorch.partitioners import get_default_op_list
+from torch._higher_order_ops.effects import has_effects
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper as ptd_checkpoint_wrapper,
 )
@@ -94,6 +95,29 @@ def _get_default_save_ops() -> set:
     return save_ops
 
 
+def _full_ac_policy(
+    _ctx,
+    op,
+    *_args,
+    **_kwargs,
+) -> CheckpointPolicy:
+    """Retain stateful operator results while recomputing pure operations.
+
+    Args:
+        _ctx: Selective-checkpoint context, unused by this policy.
+        op: Operator being classified.
+        *_args: Operator positional arguments, unused by this policy.
+        **_kwargs: Operator keyword arguments, unused by this policy.
+
+    Returns:
+        ``MUST_SAVE`` for effectful operators and ``PREFER_RECOMPUTE`` for
+        pure operators.
+    """
+    if has_effects(op):
+        return CheckpointPolicy.MUST_SAVE
+    return CheckpointPolicy.PREFER_RECOMPUTE
+
+
 def _disable_dynamo_lru_cache() -> None:
     # Disable dynamo LRU cache to workaround an interaction between SAC, PP, and Flex:
     #
@@ -164,7 +188,7 @@ class ActivationCheckpointing(Configurable):
 
 
 class FullAC(ActivationCheckpointing):
-    """Recompute the entire transformer block during the backward pass."""
+    """Recompute pure block operations while preserving stateful effects."""
 
     @dataclass(kw_only=True, slots=True)
     class Config(ActivationCheckpointing.Config):
@@ -175,6 +199,7 @@ class FullAC(ActivationCheckpointing):
     ) -> nn.Module:
         return ptd_checkpoint_wrapper(
             module,
+            context_fn=lambda: create_selective_checkpoint_contexts(_full_ac_policy),
             preserve_rng_state=self.config.preserve_rng_state,
             determinism_check=self.config.determinism_check,
             early_stop=False,

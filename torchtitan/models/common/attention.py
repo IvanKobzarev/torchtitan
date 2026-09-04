@@ -121,9 +121,24 @@ class VarlenAttention(Module):
               - (W, 0): Sliding window causal - attend to at most W previous tokens.
         """
 
+        max_num_documents: int | None = None
+        """Upper bound on packed documents used for CUDA graph replay."""
+
+        single_document_rows: bool = False
+        """Whether every packed row is exactly one document."""
+
+    dense_sdpa_backends: list[SDPBackend] = []
+
     def __init__(self, config: Config) -> None:
         super().__init__()
         self.window_size = config.window_size
+        self._single_document_rows = config.single_document_rows
+        self._dense_validated = False
+        if not self.dense_sdpa_backends:
+            self.dense_sdpa_backends = [
+                SDPBackend.CUDNN_ATTENTION,
+                SDPBackend.FLASH_ATTENTION,
+            ]
 
         from torchtitan.tools.utils import get_cuda_flash_attention_impl
 
@@ -133,6 +148,96 @@ class VarlenAttention(Module):
             and current_flash_attention_impl() != flash_attention_impl
         ):
             activate_flash_attention_impl(flash_attention_impl)
+
+    def _dense_shape(
+        self, attention_masks: VarlenMetadata, num_tokens: int
+    ) -> tuple[int, int] | None:
+        """Return the batch and sequence dimensions for dense attention."""
+        if not self._single_document_rows or tuple(self.window_size) != (-1, 0):
+            return None
+        if get_spmd_backend() == "spmd_types":
+            return None
+
+        batch = attention_masks.cu_seq_q.numel() - 1
+        if batch <= 0 or num_tokens % batch:
+            return None
+        seq_len = num_tokens // batch
+        expected = tuple(range(0, num_tokens + 1, seq_len))
+        host = attention_masks.cu_seq_q_host
+        if host is not None:
+            return (batch, seq_len) if tuple(host) == expected else None
+        if not self._dense_validated:
+            self._validate_single_document_rows(
+                attention_masks.cu_seq_q, batch, seq_len
+            )
+        return batch, seq_len
+
+    def _validate_single_document_rows(
+        self, cu_seq_q: torch.Tensor, batch: int, seq_len: int
+    ) -> None:
+        """Validate the single-document promise once before graph capture."""
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            return
+        expected = torch.arange(
+            0,
+            batch * seq_len + 1,
+            seq_len,
+            device=cu_seq_q.device,
+            dtype=cu_seq_q.dtype,
+        )
+        if cu_seq_q.numel() != expected.numel() or not torch.equal(cu_seq_q, expected):
+            raise ValueError(
+                "VarlenAttention.single_document_rows=True but cu_seq_q describes "
+                "more than one document per row"
+            )
+        self._dense_validated = True
+
+    def _dense_forward(
+        self,
+        q_TNH: torch.Tensor,
+        k_TNH: torch.Tensor,
+        v_TNH: torch.Tensor,
+        *,
+        batch: int,
+        seq_len: int,
+        scale: float | None,
+        out_transform: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None,
+        enable_gqa: bool,
+    ) -> torch.Tensor:
+        """Run dense causal SDPA for fixed-length single-document rows."""
+        q_BLNH = q_TNH.reshape(batch, seq_len, *q_TNH.shape[1:])
+        k_BLNH = k_TNH.reshape(batch, seq_len, *k_TNH.shape[1:])
+        v_BLNH = v_TNH.reshape(batch, seq_len, *v_TNH.shape[1:])
+        q_BNLH = q_BLNH.transpose(1, 2).to(torch.bfloat16)
+        k_BNLH = k_BLNH.transpose(1, 2).to(torch.bfloat16)
+        v_BNLH = v_BLNH.transpose(1, 2).to(torch.bfloat16)
+
+        if out_transform is None:
+            with sdpa_kernel(self.dense_sdpa_backends, set_priority=True):
+                out_BNLH = F.scaled_dot_product_attention(
+                    q_BNLH,
+                    k_BNLH,
+                    v_BNLH,
+                    is_causal=True,
+                    scale=scale,
+                    enable_gqa=enable_gqa,
+                )
+            return out_BNLH.transpose(1, 2).reshape_as(q_TNH).to(q_TNH.dtype)
+
+        out_BNLH, lse_BNL = torch.ops.aten._scaled_dot_product_cudnn_attention(
+            q_BNLH,
+            k_BNLH,
+            v_BNLH,
+            None,
+            True,
+            0.0,
+            True,
+            False,
+            scale=scale,
+        )[:2]
+        out_TNH = out_BNLH.transpose(1, 2).reshape_as(q_TNH).to(q_TNH.dtype)
+        lse_TN = lse_BNL.transpose(1, 2).reshape(q_TNH.shape[0], -1)
+        return out_transform(out_TNH, lse_TN)
 
     def forward(
         self,
@@ -155,6 +260,20 @@ class VarlenAttention(Module):
         cu_seq_k = attention_masks.cu_seq_k
         max_q = attention_masks.max_q
         max_k = attention_masks.max_k
+
+        dense_shape = self._dense_shape(attention_masks, q_TNH.shape[0])
+        if dense_shape is not None:
+            batch, seq_len = dense_shape
+            return self._dense_forward(
+                q_TNH,
+                k_TNH,
+                v_TNH,
+                batch=batch,
+                seq_len=seq_len,
+                scale=scale,
+                out_transform=out_transform,
+                enable_gqa=bool(kwargs.get("enable_gqa", False)),
+            )
 
         varlen_kwargs: dict[str, Any] = {}
 
@@ -577,6 +696,7 @@ def create_varlen_metadata_for_document(
     positions: torch.Tensor,
     *,
     include_host_offsets: bool = False,
+    max_num_documents: int | None = None,
 ) -> VarlenMetadata:
     """Creates cumulative sequence length indices needed for variable length attention.
 
@@ -588,6 +708,8 @@ def create_varlen_metadata_for_document(
             reset to 0 at each document start.
         include_host_offsets: Also materialize cumulative sequence offsets as
             host metadata for kernels that need it.
+        max_num_documents: Upper bound on packed documents. When set, return
+            fixed-shape device offsets without a host synchronization.
 
     Returns:
         VarlenMetadata containing cumulative sequence length indices for q, k,
@@ -595,6 +717,56 @@ def create_varlen_metadata_for_document(
     """
     num_tokens = positions.shape[0]
     device = positions.device
+    if max_num_documents is not None:
+        document_mask = positions.reshape(-1) == 0
+        document_slots = torch.cumsum(document_mask, 0) - 1
+        sentinel_slot = max_num_documents + 1
+        scatter_slots = torch.where(
+            document_mask & (document_slots < max_num_documents),
+            document_slots,
+            torch.full_like(document_slots, sentinel_slot),
+        )
+        packed_cu_seqlens = torch.full(
+            (sentinel_slot + 1,),
+            num_tokens,
+            dtype=torch.int32,
+            device=device,
+        )
+        packed_cu_seqlens.scatter_(
+            0,
+            scatter_slots,
+            torch.arange(num_tokens, dtype=torch.int32, device=device),
+        )
+        torch._assert_async(document_mask.sum() <= max_num_documents)
+        packed_cu_seqlens = packed_cu_seqlens[:sentinel_slot]
+
+        packed_cu_seqlens_host = None
+        max_seqlen = num_tokens
+        if include_host_offsets:
+            if num_tokens % max_num_documents:
+                raise ValueError(
+                    "single-document rows require the token count to divide "
+                    "evenly by max_num_documents"
+                )
+            seq_len = num_tokens // max_num_documents
+            expected_cu_seqlens = torch.arange(
+                0,
+                num_tokens + 1,
+                seq_len,
+                dtype=torch.int32,
+                device=device,
+            )
+            torch._assert_async(torch.all(packed_cu_seqlens == expected_cu_seqlens))
+            packed_cu_seqlens_host = tuple(range(0, num_tokens + 1, seq_len))
+            max_seqlen = seq_len
+        return VarlenMetadata(
+            cu_seq_q=packed_cu_seqlens,
+            cu_seq_k=packed_cu_seqlens,
+            max_q=max_seqlen,
+            max_k=max_seqlen,
+            cu_seq_q_host=packed_cu_seqlens_host,
+        )
+
     doc_starts = (positions == 0).nonzero(as_tuple=True)[0].to(torch.int32)
     packed_cu_seqlens = torch.cat(
         [

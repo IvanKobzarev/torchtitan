@@ -175,15 +175,30 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                     "Set --training.disable_cuda_graphs."
                 )
 
-            if self.parallelism.expert_parallel_degree == 1 or self.model_spec is None:
+            if self.model_spec is None:
+                return
+
+            for fqn, attention, _, _ in self.model_spec.model.traverse(
+                VarlenAttention.Config
+            ):
+                assert isinstance(attention, VarlenAttention.Config)
+                if attention.max_num_documents is None:
+                    raise ValueError(
+                        "CUDA graphs require fixed-shape varlen document "
+                        f"metadata, but {fqn}.max_num_documents is unset. Set "
+                        "it to an upper bound on documents per local batch, or "
+                        "set --training.disable_cuda_graphs."
+                    )
+
+            if self.parallelism.expert_parallel_degree == 1:
                 return
 
             for _, experts_config, _, _ in self.model_spec.model.traverse(
                 RoutedExperts.Config
             ):
-                if experts_config.supports_cuda_graphs:
+                if getattr(experts_config, "supports_cuda_graphs", False):
                     continue
-                dispatcher_config = experts_config.token_dispatcher
+                dispatcher_config = getattr(experts_config, "token_dispatcher", None)
                 if isinstance(
                     dispatcher_config, MinimalAsyncEPTokenDispatcher.Config
                 ) or (
@@ -193,8 +208,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                     continue
 
                 raise ValueError(
-                    "CUDA graphs support only expert parallel token dispatcher "
-                    "configurations without CPU synchronization. "
+                    "CUDA graphs support only routed-expert configurations "
+                    "without CPU synchronization or dynamic shapes. "
                     "Set HybridEP non_blocking_capacity_factor, or use "
                     "MinimalAsyncEP, or set --training.disable_cuda_graphs. "
                     "Unsupported token "
@@ -461,9 +476,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 # model_parts is used instead
                 del model
 
-                post_parallelize_fn = getattr(
-                    model_spec, "post_parallelize_fn", None
-                )
+                post_parallelize_fn = getattr(model_spec, "post_parallelize_fn", None)
                 if post_parallelize_fn is not None:
                     post_parallelize_fn(
                         config=config,
@@ -501,9 +514,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                     )
 
                 self.model_parts = [model]
-                post_parallelize_fn = getattr(
-                    model_spec, "post_parallelize_fn", None
-                )
+                post_parallelize_fn = getattr(model_spec, "post_parallelize_fn", None)
                 if post_parallelize_fn is not None:
                     post_parallelize_fn(
                         config=config,
@@ -862,41 +873,19 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             return torch.sum(torch.stack(losses)).to(self.device)
         return torch.tensor([-1.0], device=self.device)
 
-    def train_step(
-        self, data_iterator: Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]
-    ):
+    def _zero_grad(self) -> None:
+        """Clear parameter gradients before one optimizer step."""
         self.optimizers.zero_grad(set_to_none=self.config.training.disable_cuda_graphs)
-        # Save per-optimizer-group learning rates for logging
-        lr_metrics = self.lr_schedulers.get_metrics()
-        should_log = self.metrics_processor.should_log(self.step)
 
-        # Keep these variables local to shorten the code as these are
-        # the major variables that are used in the training loop.
+    def _run_microbatch_groups(
+        self,
+        microbatch_groups: list[list[tuple[dict[str, torch.Tensor], torch.Tensor]]],
+        global_valid_tokens: torch.Tensor,
+        *,
+        should_log: bool,
+    ) -> torch.Tensor | None:
+        """Run all gradient-accumulation groups for one optimizer step."""
         parallel_dims = self.parallel_dims
-        # All groups form one optimizer step; each group feeds one fwd-bwd call.
-        microbatch_groups: list[list[tuple[dict[str, torch.Tensor], torch.Tensor]]] = []
-        local_valid_tokens = torch.tensor(0, dtype=torch.int64)
-        for _ in range(self.gradient_accumulation_steps):
-            microbatches = []
-            for _ in range(self.num_pp_microbatches):
-                with sl.log_trace_span("fetching_batch"):
-                    input_dict, labels = next(data_iterator)
-                local_valid_tokens += (labels != IGNORE_INDEX).sum()
-                microbatches.append((input_dict, labels))
-            microbatch_groups.append(microbatches)
-        sl.log_trace_scalar({"local_valid_tokens": int(local_valid_tokens)})
-
-        # Keep the global token count on device so loss normalization does not
-        # introduce a CPU synchronization in the training path.
-        if parallel_dims.dp_enabled:
-            dp_mesh = parallel_dims.get_mesh("batch")
-            global_valid_tokens = dist_utils.dist_sum_tensor(
-                local_valid_tokens.to(self.device), dp_mesh
-            )
-        else:
-            global_valid_tokens = local_valid_tokens.to(self.device)
-
-        # Process each gradient accumulation step, then free its inputs.
         accumulated_loss: torch.Tensor | None = None
         # int32 is supported by NCCL reductions, unlike bool.
         loss_is_finite = torch.ones((), dtype=torch.int32, device=self.device)
@@ -937,6 +926,51 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                     accumulated_loss = detached_loss.clone()
                 else:
                     accumulated_loss.add_(detached_loss)
+
+        self._loss_is_finite_for_step = loss_is_finite
+        return accumulated_loss
+
+    def train_step(
+        self, data_iterator: Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]
+    ):
+        self._zero_grad()
+        # Save per-optimizer-group learning rates for logging
+        lr_metrics = self.lr_schedulers.get_metrics()
+        should_log = self.metrics_processor.should_log(self.step)
+
+        # Keep these variables local to shorten the code as these are
+        # the major variables that are used in the training loop.
+        parallel_dims = self.parallel_dims
+        # All groups form one optimizer step; each group feeds one fwd-bwd call.
+        microbatch_groups: list[list[tuple[dict[str, torch.Tensor], torch.Tensor]]] = []
+        local_valid_tokens = torch.tensor(0, dtype=torch.int64)
+        for _ in range(self.gradient_accumulation_steps):
+            microbatches = []
+            for _ in range(self.num_pp_microbatches):
+                with sl.log_trace_span("fetching_batch"):
+                    input_dict, labels = next(data_iterator)
+                local_valid_tokens += (labels != IGNORE_INDEX).sum()
+                microbatches.append((input_dict, labels))
+            microbatch_groups.append(microbatches)
+        sl.log_trace_scalar({"local_valid_tokens": int(local_valid_tokens)})
+
+        # Keep the global token count on device so loss normalization does not
+        # introduce a CPU synchronization in the training path.
+        if parallel_dims.dp_enabled:
+            dp_mesh = parallel_dims.get_mesh("batch")
+            global_valid_tokens = dist_utils.dist_sum_tensor(
+                local_valid_tokens.to(self.device), dp_mesh
+            )
+        else:
+            global_valid_tokens = local_valid_tokens.to(self.device)
+
+        # Process each gradient accumulation step, then free its inputs.
+        accumulated_loss = self._run_microbatch_groups(
+            microbatch_groups,
+            global_valid_tokens,
+            should_log=should_log,
+        )
+        loss_is_finite = self._loss_is_finite_for_step
 
         with sl.log_trace_span("optim"):
             grad_norm = dist_utils.clip_grad_norm_(

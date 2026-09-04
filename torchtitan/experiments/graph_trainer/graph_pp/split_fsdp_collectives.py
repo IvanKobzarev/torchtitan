@@ -28,38 +28,25 @@ from torchtitan.experiments.graph_trainer.graph_pp.utils import (
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
-class GraphPPFSDPForwardSplit:
-    """Forward graph split around FSDP unshard collectives.
+class GraphPPFSDPUnshardSplit:
+    """Graph split around FSDP unshard collectives.
 
     Attributes:
         unshard_module (fx.GraphModule | None): Graph that turns flat
             parameter inputs into unsharded parameter values, or ``None`` when
-            the forward graph has no FSDP unshard collective.
-        fw_no_fsdp_module (fx.GraphModule): Forward graph with FSDP unshard
+            the input graph has no FSDP unshard collective.
+        compute_module (fx.GraphModule): Input graph with FSDP unshard
             collectives removed.
         unshard_flat_param_indices (tuple[int, ...]): Flat parameter indices
             consumed by ``unshard_module``.
-        unshard_output_names (tuple[str, ...]): ``unshard_module`` output
-            names.
-        fw_no_fsdp_input_names (tuple[str, ...]): ``fw_no_fsdp_module``
-            placeholder names.
-        fw_no_fsdp_flat_input_indices (tuple[int, ...]): Flat traced input
-            indices for non-parameter inputs still consumed by
-            ``fw_no_fsdp_module``.
-        num_fw_unsharded_param_inputs (int): Number of leading
-            ``fw_no_fsdp_module`` inputs supplied by ``unshard_module``.
-        fw_no_fsdp_output_names (tuple[str, ...]): ``fw_no_fsdp_module`` output
-            names.
+        compute_flat_input_indices (tuple[int, ...]): Original flat traced
+            input index for each ``compute_module`` placeholder.
     """
 
     unshard_module: fx.GraphModule | None
-    fw_no_fsdp_module: fx.GraphModule
+    compute_module: fx.GraphModule
     unshard_flat_param_indices: tuple[int, ...]
-    unshard_output_names: tuple[str, ...]
-    fw_no_fsdp_input_names: tuple[str, ...]
-    fw_no_fsdp_flat_input_indices: tuple[int, ...]
-    num_fw_unsharded_param_inputs: int
-    fw_no_fsdp_output_names: tuple[str, ...]
+    compute_flat_input_indices: tuple[int, ...]
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -85,78 +72,77 @@ class GraphPPFSDPBackwardSplit:
     reduce_grad_input_names: tuple[str, ...]
 
 
-def split_forward_fsdp_collectives(
-    fw_module: fx.GraphModule,
+def split_fsdp_unshard_collectives(
+    module: fx.GraphModule,
     *,
     num_params: int,
-    fwd_input_names: tuple[str, ...],
-    fwd_flat_input_indices: tuple[int, ...],
-) -> GraphPPFSDPForwardSplit:
-    """Split forward FSDP all-gather chains from a forward graph.
+    input_names: tuple[str, ...],
+    flat_input_indices: tuple[int, ...],
+) -> GraphPPFSDPUnshardSplit:
+    """Split FSDP all-gather and post-all-gather preparation from a graph.
 
     Contract:
       unshard(param_shards_and_replicated_params)
         -> unsharded_param_values
 
-      fw_no_fsdp(unsharded_param_values, remaining_forward_inputs)
-        -> original_forward_outputs
+      compute(unsharded_param_values, remaining_inputs)
+        -> original_outputs
 
     Flat traced inputs are ordered as params, buffers, then user inputs. Any
-    forward placeholder whose flat input index is less than ``num_params`` is a
+    placeholder whose flat input index is less than ``num_params`` is a
     parameter input. Inputs with an all-gather/wait/view chain become
     unsharded values. Replicated or otherwise non-sharded params pass through
-    the unshard graph so ``fw_no_fsdp`` still receives one value per original
-    parameter input. If no all-gather chain exists, the split is a no-op.
+    the unshard graph so the compute graph still receives one value per
+    original parameter input. If no all-gather chain exists, the split is a
+    no-op.
 
     Args:
-        fw_module (fx.GraphModule): Forward graph produced by GraphPP
-            partitioning.
+        module (fx.GraphModule): Joint graph to split.
         num_params (int): Number of flat traced inputs that are parameters.
-        fwd_input_names (tuple[str, ...]): Forward graph placeholder names from
-            partition metadata.
-        fwd_flat_input_indices (tuple[int, ...]): Flat traced input index for
-            each forward graph placeholder.
+        input_names (tuple[str, ...]): Graph placeholder names.
+        flat_input_indices (tuple[int, ...]): Original flat traced input
+            index for each graph placeholder.
 
     Returns:
-        GraphPPFSDPForwardSplit: Forward split modules and calling-convention
-        metadata.
+        GraphPPFSDPUnshardSplit: Split modules and calling-convention
+            metadata.
 
     Raises:
-        ValueError: If the provided forward input metadata does not match the
-            graph placeholders.
+        ValueError: If the provided input metadata does not match the graph
+            placeholders.
     """
     if num_params < 0:
         raise ValueError(f"num_params must be non-negative, got {num_params}")
 
-    graph = deepcopy(fw_module.graph)
+    graph = deepcopy(module.graph)
     placeholders = graph.find_nodes(op="placeholder")
-    if len(fwd_input_names) != len(placeholders):
+    if len(input_names) != len(placeholders):
         raise ValueError(
-            "Forward input names must match placeholder count: "
-            f"{len(fwd_input_names)} != {len(placeholders)}"
+            "Input names must match placeholder count: "
+            f"{len(input_names)} != {len(placeholders)}"
         )
-    if len(fwd_flat_input_indices) != len(placeholders):
+    if len(flat_input_indices) != len(placeholders):
         raise ValueError(
-            "Forward flat input indices must match placeholder count: "
-            f"{len(fwd_flat_input_indices)} != {len(placeholders)}"
+            "Flat input indices must match placeholder count: "
+            f"{len(flat_input_indices)} != {len(placeholders)}"
         )
-    if tuple(node.name for node in placeholders) != fwd_input_names:
+    if tuple(node.name for node in placeholders) != input_names:
         raise ValueError(
-            "Forward input names must match graph placeholders: "
+            "Input names must match graph placeholders: "
             f"expected {tuple(node.name for node in placeholders)}, "
-            f"got {fwd_input_names}"
+            f"got {input_names}"
         )
-    invalid_indices = sorted(index for index in fwd_flat_input_indices if index < 0)
+    invalid_indices = sorted(index for index in flat_input_indices if index < 0)
     if invalid_indices:
         raise ValueError(
-            "Forward flat input indices must be non-negative: " f"{invalid_indices}"
+            "Flat input indices must be non-negative: " f"{invalid_indices}"
         )
 
     param_inputs: list[fx.Node] = []
     param_flat_indices: list[int] = []
     remaining_inputs: list[fx.Node] = []
     remaining_flat_input_indices: list[int] = []
-    for node, flat_index in zip(placeholders, fwd_flat_input_indices, strict=True):
+    for node, flat_index in zip(placeholders, flat_input_indices, strict=True):
         if flat_index < num_params:
             param_inputs.append(node)
             param_flat_indices.append(flat_index)
@@ -184,16 +170,12 @@ def split_forward_fsdp_collectives(
         unshard_outputs.append(unshard_output)
 
     if not found_collective:
-        trace_graph_pp_graph("graph_pp_fsdp_forward_no_fsdp", fw_module)
-        return GraphPPFSDPForwardSplit(
+        trace_graph_pp_graph("graph_pp_fsdp_compute_no_fsdp", module)
+        return GraphPPFSDPUnshardSplit(
             unshard_module=None,
-            fw_no_fsdp_module=fw_module,
+            compute_module=module,
             unshard_flat_param_indices=(),
-            unshard_output_names=(),
-            fw_no_fsdp_input_names=fwd_input_names,
-            fw_no_fsdp_flat_input_indices=fwd_flat_input_indices,
-            num_fw_unsharded_param_inputs=0,
-            fw_no_fsdp_output_names=output_names(fw_module),
+            compute_flat_input_indices=flat_input_indices,
         )
 
     all_outputs = graph_outputs(graph)
@@ -217,29 +199,26 @@ def split_forward_fsdp_collectives(
             "unshard",
             ignore_must_be_in_fw_bw=True,
         )
-        fw_no_fsdp_graph = _extract_graph_with_inputs_outputs(
+        compute_graph = _extract_graph_with_inputs_outputs(
             graph,
             unshard_outputs + remaining_inputs,
             list(all_outputs),
             graph_output_descs,
-            "fw_no_fsdp",
+            "compute_no_fsdp",
             ignore_must_be_in_fw_bw=True,
         )
 
-    unshard_module = _make_graph_module(fw_module, unshard_graph)
-    fw_no_fsdp_module = _make_graph_module(fw_module, fw_no_fsdp_graph)
+    unshard_module = _make_graph_module(module, unshard_graph)
+    compute_module = _make_graph_module(module, compute_graph)
     trace_graph_pp_graph("graph_pp_fsdp_unshard", unshard_module)
-    trace_graph_pp_graph("graph_pp_fsdp_forward_no_fsdp", fw_no_fsdp_module)
-    unshard_output_names = output_names(unshard_module)
-    return GraphPPFSDPForwardSplit(
+    trace_graph_pp_graph("graph_pp_fsdp_compute_no_fsdp", compute_module)
+    return GraphPPFSDPUnshardSplit(
         unshard_module=unshard_module,
-        fw_no_fsdp_module=fw_no_fsdp_module,
+        compute_module=compute_module,
         unshard_flat_param_indices=tuple(param_flat_indices),
-        unshard_output_names=unshard_output_names,
-        fw_no_fsdp_input_names=placeholder_names(fw_no_fsdp_module),
-        fw_no_fsdp_flat_input_indices=tuple(remaining_flat_input_indices),
-        num_fw_unsharded_param_inputs=len(unshard_output_names),
-        fw_no_fsdp_output_names=output_names(fw_no_fsdp_module),
+        compute_flat_input_indices=tuple(
+            param_flat_indices + remaining_flat_input_indices
+        ),
     )
 
 

@@ -214,6 +214,7 @@ def parallelize_hf_transformers(
         cpu_offload=training.enable_cpu_offload,
         reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
         enable_symm_mem=parallelism.enable_fsdp_symm_mem,
+        symm_mem_policy=parallelism.fsdp_symm_mem_policy,
         ep_degree=parallel_dims.ep,
         dp_mod_ep_mesh=edp_mesh,
     )
@@ -245,6 +246,7 @@ def apply_fsdp(
     dp_mod_ep_mesh: DeviceMesh | None = None,
     gradient_divide_factor: int | None = None,
     enable_symm_mem: bool = False,
+    symm_mem_policy: str = "all",
 ):
     """Apply data parallelism (via FSDP2) to the model.
 
@@ -373,7 +375,7 @@ def apply_fsdp(
     fully_shard(model, **fsdp_config)
 
     if enable_symm_mem:
-        enable_fsdp_symm_mem(model)
+        enable_fsdp_symm_mem(model, symm_mem_policy)
 
     # Disable FSDP's automatic gradient division for all FSDP modules
     disable_fsdp_gradient_division(model)

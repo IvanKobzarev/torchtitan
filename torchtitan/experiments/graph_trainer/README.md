@@ -42,6 +42,30 @@ MODULE=graph_trainer.llama3 CONFIG=graph_trainer_llama3_8b ./run_train.sh
 MODULE=graph_trainer.deepseek_v3 CONFIG=graph_trainer_deepseek_v3_16b ./run_train.sh
 ```
 
+#### Training DeepSeek-v3 with CuTe DistMoE
+
+The standalone DistMoE backend is available on Blackwell for the 16B and 671B
+model configurations:
+
+```bash
+MODULE=graph_trainer.deepseek_v3 CONFIG=graph_trainer_deepseek_v3_16b_dist_moe_bf16 ./run_train.sh
+MODULE=graph_trainer.deepseek_v3 CONFIG=graph_trainer_deepseek_v3_16b_dist_moe_mxfp8 ./run_train.sh
+MODULE=graph_trainer.deepseek_v3 CONFIG=graph_trainer_deepseek_v3_16b_dist_moe_mxfp8_mlperf ./run_train.sh
+MODULE=graph_trainer.deepseek_v3 CONFIG=graph_trainer_deepseek_v3_671b_dist_moe_bf16 ./run_train.sh
+MODULE=graph_trainer.deepseek_v3 CONFIG=graph_trainer_deepseek_v3_671b_dist_moe_mxfp8 ./run_train.sh
+MODULE=graph_trainer.deepseek_v3 CONFIG=graph_trainer_deepseek_v3_671b_dist_moe_mxfp8_mlperf ./run_train.sh
+NGPU=64 MODULE=graph_trainer.deepseek_v3 CONFIG=graph_trainer_deepseek_v3_671b_dist_moe_mxfp8_mlperf_64gpu ./run_train.sh
+```
+
+BF16 and MXFP8 support the default CUDA-graph pass. DistMoE derives a static
+receive capacity from the model configuration while routing keeps the actual
+receive counts and recompute choices on the GPU.
+
+The MXFP8 recipes match the Main trainer's dense/shared fused-SwiGLU policy and
+use the maximum-useful device-only DistMoE arena. The `*_mlperf` variants also
+use continuous-row packing, allowing dense cuDNN SDPA when the selected backend
+supports the attention shape.
+
 #### Training Qwen3-14B
 
 ```bash

@@ -30,6 +30,7 @@ from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.config import DebugConfig, ParallelismConfig, TrainingConfig
 from torchtitan.experiments.graph_trainer.common_utils import (
+    get_transformer_block_buckets,
     maybe_register_blockmask_pytree_node,
 )
 from torchtitan.experiments.graph_trainer.configs import (
@@ -291,7 +292,12 @@ class BitwiseDeterministicBase(unittest.TestCase):
                     fsdp_reshard_after_forward="default",
                 ),
             )
-            passes = compile_time_passes(traced_result, config)
+            fsdp_bucket_plan = get_transformer_block_buckets(model)
+            passes = compile_time_passes(
+                traced_result,
+                config,
+                fsdp_bucket_plan=fsdp_bucket_plan,
+            )
             traced_result.gm = apply_graph_passes(
                 traced_result.gm,
                 traced_result.example_inputs,
@@ -315,7 +321,11 @@ class BitwiseDeterministicBase(unittest.TestCase):
                     precompile_artifact_dir="precompiled",
                 ),
             )
-            passes = construct_default_graph_passes(loaded_result, load_config)
+            passes = construct_default_graph_passes(
+                loaded_result,
+                load_config,
+                fsdp_bucket_plan=fsdp_bucket_plan,
+            )
             loaded_result.gm = apply_graph_passes(
                 loaded_result.gm,
                 loaded_result.example_inputs,

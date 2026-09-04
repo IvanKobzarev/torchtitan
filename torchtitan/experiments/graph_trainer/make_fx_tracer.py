@@ -6,7 +6,7 @@
 
 import contextlib
 import copy
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 import torch.utils._pytree as pytree
 from torch._guards import tracing, TracingContext
-from torch._subclasses import FakeTensorMode
+from torch._subclasses import FakeTensor, FakeTensorMode
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.fx.traceback import preserve_node_meta
 from torch.nn.utils import stateless
@@ -290,6 +290,16 @@ class TracedResult:
         output_subclass_layouts: Subclass unwrap/rewrap metadata for outputs.
         output_spec: Original output pytree spec used during reconstruction.
         state_fqns: Trace-time module parameter/buffer FQNs.
+        graph_state_fqns: Names of trainer-owned tensor state threaded through
+            the graph separately from model and optimizer state.
+        graph_state_input_indices: Flat graph-input indices for each logical
+            graph-state tensor.
+        graph_state_output_indices: Logical graph-output index whose tensor
+            leaves contribute to each graph-state tensor. Empty for state that
+            is not an accumulated gradient destination.
+        grad_sink_active: Whether the graph writes parameter gradients into
+            graph state and no longer returns them.
+        num_optimizer_state_inputs: Number of logical optimizer-state inputs.
     """
 
     gm: torch.fx.GraphModule
@@ -308,6 +318,21 @@ class TracedResult:
 
     # state related
     state_fqns: list[str]
+    graph_state_fqns: list[str]
+    graph_state_input_indices: tuple[tuple[int, ...], ...]
+    graph_state_output_indices: tuple[int, ...]
+    grad_sink_active: bool
+    num_optimizer_state_inputs: int = 0
+
+    @property
+    def num_model_state_tensor_inputs(self) -> int:
+        """Number of leading graph inputs produced from model state."""
+        return sum(
+            self.input_subclass_layouts[i].num_tensors
+            if i in self.input_subclass_layouts
+            else 1
+            for i in range(len(self.state_fqns))
+        )
 
     @property
     def num_static_inputs(self) -> int:
@@ -322,7 +347,7 @@ class TracedResult:
         should be included since their addresses are also stable across steps,
         avoiding cudagraph re-copying them every step.
         """
-        num_state = len(self.state_fqns)
+        num_state = len(self.state_fqns) + len(self.graph_state_fqns)
         return sum(
             self.input_subclass_layouts[i].num_tensors
             if i in self.input_subclass_layouts
@@ -331,11 +356,115 @@ class TracedResult:
         )
 
 
+_GRAPH_STATE_OUTPUT_META = "graph_state_outputs"
+
+
+def _flat_tensor_ranges(
+    num_values: int,
+    layouts: dict[int, SubclassLayout],
+) -> tuple[tuple[int, ...], ...]:
+    ranges = []
+    flat_index = 0
+    for logical_index in range(num_values):
+        num_tensors = (
+            layouts[logical_index].num_tensors if logical_index in layouts else 1
+        )
+        ranges.append(tuple(range(flat_index, flat_index + num_tensors)))
+        flat_index += num_tensors
+    return tuple(ranges)
+
+
+def capture_graph_state_output_metadata(
+    gm: torch.fx.GraphModule,
+) -> tuple[tuple[tuple[str, int], ...], ...]:
+    """Capture gradient-state tags by flat output position."""
+    output = next((node for node in gm.graph.nodes if node.op == "output"), None)
+    if output is None:
+        raise ValueError("Traced graph has no output node")
+    return tuple(
+        tuple(leaf.meta.get(_GRAPH_STATE_OUTPUT_META, ()))
+        if isinstance(leaf, torch.fx.Node)
+        else ()
+        for leaf in pytree.tree_leaves(output.args[0])
+    )
+
+
+def restore_graph_state_output_metadata(
+    gm: torch.fx.GraphModule,
+    output_metadata: Sequence[tuple[tuple[str, int], ...]],
+) -> None:
+    """Restore tags after a pass that rebuilds output-producing nodes by position."""
+    output = next((node for node in gm.graph.nodes if node.op == "output"), None)
+    if output is None:
+        raise ValueError("Transformed graph has no output node")
+    output_leaves = pytree.tree_leaves(output.args[0])
+    if len(output_leaves) != len(output_metadata):
+        raise ValueError(
+            "Graph pass changed the number of outputs while preserving gradient "
+            "state metadata"
+        )
+    for leaf, mappings in zip(output_leaves, output_metadata, strict=True):
+        if not mappings:
+            continue
+        if not isinstance(leaf, torch.fx.Node):
+            raise ValueError("Graph pass replaced a gradient output with a non-tensor")
+        leaf.meta[_GRAPH_STATE_OUTPUT_META] = mappings
+
+
+def _tag_graph_state_outputs(
+    gm: torch.fx.GraphModule,
+    graph_state_fqns: Sequence[str],
+    graph_state_output_indices: Sequence[int],
+    num_flat_outputs: int,
+    output_subclass_layouts: dict[int, SubclassLayout],
+) -> None:
+    if len(set(graph_state_output_indices)) != len(graph_state_output_indices):
+        raise ValueError("graph_state_output_indices must be unique")
+
+    output_ranges = _flat_tensor_ranges(num_flat_outputs, output_subclass_layouts)
+    output = next((node for node in gm.graph.nodes if node.op == "output"), None)
+    if output is None:
+        raise ValueError("Traced graph has no output node")
+    output_leaves = pytree.tree_leaves(output.args[0])
+    expected_num_leaves = sum(len(indices) for indices in output_ranges)
+    if len(output_leaves) != expected_num_leaves:
+        raise ValueError(
+            "Traced graph output metadata does not match its FX output: "
+            f"expected {expected_num_leaves} tensor leaves, got "
+            f"{len(output_leaves)}"
+        )
+
+    for fqn, output_index in zip(
+        graph_state_fqns,
+        graph_state_output_indices,
+        strict=True,
+    ):
+        if output_index < 0 or output_index >= len(output_ranges):
+            raise ValueError(
+                f"Graph-state output index {output_index} for {fqn!r} is outside "
+                f"the {len(output_ranges)} traced outputs"
+            )
+        for leaf_index, flat_index in enumerate(output_ranges[output_index]):
+            leaf = output_leaves[flat_index]
+            if not isinstance(leaf, torch.fx.Node):
+                raise ValueError(
+                    f"Graph-state output {output_index} for {fqn!r} is not a tensor"
+                )
+            mappings = list(leaf.meta.get(_GRAPH_STATE_OUTPUT_META, ()))
+            mappings.append((fqn, leaf_index))
+            leaf.meta[_GRAPH_STATE_OUTPUT_META] = tuple(mappings)
+
+    gm.graph.lint()
+    gm.recompile()
+
+
 def minimal_fx_tracer(
     fn: Callable,
     module: nn.Module | None = None,
     optimizer: "torch.optim.Optimizer | None" = None,
     *,
+    graph_state: dict[str, torch.Tensor] | None = None,
+    graph_state_output_indices: Sequence[int] = (),
     prepare_inputs: Callable[[tuple[Any, ...], dict[str, Any]], None] | None = None,
     prepare_call_inputs: Callable[
         [tuple[Any, ...], dict[str, Any]],
@@ -364,6 +493,11 @@ def minimal_fx_tracer(
     ``fn`` should reference ``module`` and ``optimizer`` from its enclosing
     closure — passing them explicitly through ``args``/``kwargs`` is invalid
     because ``nn.Module`` and ``Optimizer`` instances are not pytree-able.
+    ``graph_state`` supplies additional named tensors as explicit, stable graph
+    inputs. The traced function does not receive them directly; graph passes may
+    consume their placeholders to add stateful operations.
+    ``graph_state_output_indices`` explicitly maps each graph-state tensor to a
+    logical output whose leaves will be accumulated into it.
 
     The trace-time ``args`` and ``kwargs`` must satisfy these constraints:
 
@@ -393,15 +527,34 @@ def minimal_fx_tracer(
 
         model_state, optim_state = extract_train_state(module, optimizer)
         state_fqns = list(model_state.keys())
+        graph_state_t = graph_state or {}
+        graph_state_fqns = list(graph_state_t.keys())
+        graph_output_indices = tuple(graph_state_output_indices)
+        if graph_output_indices and len(graph_output_indices) != len(graph_state_fqns):
+            raise ValueError(
+                "minimal_fx_tracer requires one graph_state_output_indices entry "
+                "per graph_state tensor"
+            )
 
-        state_tree = {"model": model_state, "optim": optim_state}
-        state_flat, state_spec = pytree.tree_flatten(state_tree)
-        num_state_inputs = len(state_flat)
+        model_state_flat, model_state_spec = pytree.tree_flatten(model_state)
+        graph_state_flat, graph_state_spec = pytree.tree_flatten(graph_state_t)
+        optim_state_flat, optim_state_spec = pytree.tree_flatten(optim_state)
+        num_model_state_inputs = len(model_state_flat)
+        num_graph_state_inputs = len(graph_state_flat)
+        num_optim_state_inputs = len(optim_state_flat)
+
+        if any(not isinstance(value, torch.Tensor) for value in graph_state_flat):
+            raise ValueError("minimal_fx_tracer graph_state values must be tensors")
 
         user_inputs_flat, user_inputs_spec = pytree.tree_flatten((args, kwargs))
 
         # Validate leaves.
-        for leaf in [*state_flat, *user_inputs_flat]:
+        for leaf in [
+            *model_state_flat,
+            *graph_state_flat,
+            *optim_state_flat,
+            *user_inputs_flat,
+        ]:
             if isinstance(leaf, nn.Module):
                 raise ValueError(
                     "minimal_fx_tracer requires explicit tensor state, not nn.Module "
@@ -417,8 +570,13 @@ def minimal_fx_tracer(
                     f"(pytree.register_constant), or captured in fn's closure."
                 )
 
-        # Combined flat input: [*state, *user_args] with subclasses unwrapped.
-        full_args = list(state_flat) + list(user_inputs_flat)
+        # Graph state follows model state so both form one static input prefix.
+        full_args = (
+            list(model_state_flat)
+            + list(graph_state_flat)
+            + list(optim_state_flat)
+            + list(user_inputs_flat)
+        )
         num_full_args = len(full_args)
         for arg in full_args:
             if not isinstance(arg, torch.Tensor):
@@ -441,6 +599,21 @@ def minimal_fx_tracer(
             for i, a in enumerate(unwrapped_args)
         )
 
+        graph_state_input_indices: list[tuple[int, ...]] = []
+        flat_index = 0
+        graph_state_start = num_model_state_inputs
+        graph_state_end = graph_state_start + num_graph_state_inputs
+        for logical_index in range(num_full_args):
+            num_tensors = (
+                input_layouts[logical_index].num_tensors
+                if logical_index in input_layouts
+                else 1
+            )
+            indices = tuple(range(flat_index, flat_index + num_tensors))
+            if graph_state_start <= logical_index < graph_state_end:
+                graph_state_input_indices.append(indices)
+            flat_index += num_tensors
+
         output_layouts: dict[int, SubclassLayout] = {}
         num_flat_outputs: int = 0
         output_spec: pytree.TreeSpec | None = None
@@ -450,12 +623,21 @@ def minimal_fx_tracer(
             output_layouts = {}
 
             wrapped = _wrap_subclasses(plain_args, num_full_args, input_layouts)
-            state_wrapped = wrapped[:num_state_inputs]
-            user_flat = wrapped[num_state_inputs:]
-
-            state_t = pytree.tree_unflatten(list(state_wrapped), state_spec)
-            model_state_t = state_t["model"]
-            optim_state_t = state_t["optim"]
+            model_state_end = num_model_state_inputs
+            graph_state_end = model_state_end + num_graph_state_inputs
+            optim_state_end = graph_state_end + num_optim_state_inputs
+            model_state_t = pytree.tree_unflatten(
+                list(wrapped[:model_state_end]), model_state_spec
+            )
+            # Graph-state inputs are consumed by post-trace graph transforms.
+            # Reconstruct them here to preserve their pytree input contract.
+            _ = pytree.tree_unflatten(
+                list(wrapped[model_state_end:graph_state_end]), graph_state_spec
+            )
+            optim_state_t = pytree.tree_unflatten(
+                list(wrapped[graph_state_end:optim_state_end]), optim_state_spec
+            )
+            user_flat = wrapped[optim_state_end:]
             user_args, user_kwargs = pytree.tree_unflatten(
                 list(user_flat), user_inputs_spec
             )
@@ -511,6 +693,14 @@ def minimal_fx_tracer(
             _insert_runtime_asserts_pass(traced, fake_mode)
 
         assert output_spec is not None
+        if graph_output_indices:
+            _tag_graph_state_outputs(
+                traced,
+                graph_state_fqns,
+                graph_output_indices,
+                num_flat_outputs,
+                output_layouts,
+            )
         return TracedResult(
             gm=traced,
             example_inputs=fake_args,
@@ -524,6 +714,11 @@ def minimal_fx_tracer(
             output_subclass_layouts=output_layouts,
             output_spec=output_spec,
             state_fqns=state_fqns,
+            graph_state_fqns=graph_state_fqns,
+            graph_state_input_indices=tuple(graph_state_input_indices),
+            graph_state_output_indices=graph_output_indices,
+            grad_sink_active=False,
+            num_optimizer_state_inputs=num_optim_state_inputs,
         )
 
     return _trace_with_args
@@ -534,6 +729,7 @@ def run_traced(
     *,
     module: nn.Module | None = None,
     optimizer: "torch.optim.Optimizer | None" = None,
+    graph_state: dict[str, torch.Tensor] | None = None,
     _validate_runtime: bool = False,
     interpreter_cls: type | None = None,
 ) -> Callable[..., Any]:
@@ -545,12 +741,12 @@ def run_traced(
         outputs = run_traced(traced, module=model, optimizer=opt)(*args, **kwargs)
 
     Mirrors :func:`minimal_fx_tracer`'s state extraction: parameters/buffers
-    are sampled from ``module`` and the optimizer state is sampled from
-    ``optimizer.state_dict()``. Runs under ``torch.no_grad()`` because the
-    graph already contains explicit backward ops (from ``torch.autograd.grad``
-    traced by make_fx). Without this, PyTorch would build a redundant autograd
-    graph on top, keeping all forward intermediates alive via ``grad_fn``
-    references.
+    are sampled from ``module``, ``graph_state`` supplies separately owned
+    persistent tensors, and optimizer state is sampled from
+    ``optimizer.state_dict()``. Runs under ``torch.no_grad()`` because the graph
+    already contains explicit backward ops (from ``torch.autograd.grad`` traced
+    by make_fx). Without this, PyTorch would build a redundant autograd graph on
+    top, keeping all forward intermediates alive via ``grad_fn`` references.
 
     With ``_validate_runtime=True``, runtime module parameter/buffer FQNs must match
     trace time and runtime ``(args, kwargs)`` must flatten to the same pytree
@@ -571,8 +767,16 @@ def run_traced(
                 f"  Traced: {traced_result.state_fqns}\n"
                 f"  Got:    {list(model_state.keys())}"
             )
-        state_tree = {"model": model_state, "optim": optim_state}
-        state_flat, _ = pytree.tree_flatten(state_tree)
+        graph_state_t = graph_state or {}
+        if list(graph_state_t.keys()) != traced_result.graph_state_fqns:
+            raise ValueError(
+                "graph state has different names than during tracing.\n"
+                f"  Traced: {traced_result.graph_state_fqns}\n"
+                f"  Got:    {list(graph_state_t.keys())}"
+            )
+        model_state_flat, _ = pytree.tree_flatten(model_state)
+        graph_state_flat, _ = pytree.tree_flatten(graph_state_t)
+        optim_state_flat, _ = pytree.tree_flatten(optim_state)
 
         user_inputs_flat, runtime_spec = pytree.tree_flatten((args, kwargs))
         # TODO: pytree's dict flatten preserves insertion order, so kwargs in a
@@ -586,13 +790,24 @@ def run_traced(
                 f"trace-time {traced_result.user_inputs_spec}"
             )
         if any(
-            isinstance(leaf, nn.Module) for leaf in [*state_flat, *user_inputs_flat]
+            isinstance(leaf, nn.Module)
+            for leaf in [
+                *model_state_flat,
+                *graph_state_flat,
+                *optim_state_flat,
+                *user_inputs_flat,
+            ]
         ):
             raise ValueError(
                 "run_traced requires explicit tensor state, not nn.Module instances. "
                 "Capture nn.Modules in fn's closure or pass them via the 'module' kwarg."
             )
-        all_args = list(state_flat) + list(user_inputs_flat)
+        all_args = (
+            list(model_state_flat)
+            + list(graph_state_flat)
+            + list(optim_state_flat)
+            + list(user_inputs_flat)
+        )
         flat_inputs, _ = _unwrap_subclasses(all_args)
 
         with torch.no_grad():
@@ -608,3 +823,208 @@ def run_traced(
         return pytree.tree_unflatten(wrapped, traced_result.output_spec)
 
     return _run
+
+
+def _bound_static_values(
+    traced_result: TracedResult,
+    module: nn.Module | None,
+    graph_state: dict[str, torch.Tensor] | None,
+) -> tuple[torch.Tensor, ...]:
+    model_state, _ = extract_train_state(module)
+    if list(model_state) != traced_result.state_fqns:
+        raise ValueError(
+            "module has different parameter/buffer names than during tracing.\n"
+            f"  Traced: {traced_result.state_fqns}\n"
+            f"  Got:    {list(model_state)}"
+        )
+    graph_state_t = graph_state or {}
+    if list(graph_state_t) != traced_result.graph_state_fqns:
+        raise ValueError(
+            "graph state has different names than during tracing.\n"
+            f"  Traced: {traced_result.graph_state_fqns}\n"
+            f"  Got:    {list(graph_state_t)}"
+        )
+    return tuple([*model_state.values(), *graph_state_t.values()])
+
+
+def _flat_input_metadata(value: Any) -> tuple[Any, ...]:
+    if not isinstance(value, torch.Tensor):
+        return (type(value),)
+    stride = value.stride() if value.layout == torch.strided else None
+    storage_offset = value.storage_offset() if value.layout == torch.strided else None
+    return (
+        value.dtype,
+        value.device,
+        value.layout,
+        value.size(),
+        stride,
+        storage_offset,
+        value.requires_grad,
+    )
+
+
+def _flat_input_binding(value: Any) -> tuple[Any, ...]:
+    storage_ptr = None
+    if (
+        isinstance(value, torch.Tensor)
+        and not isinstance(value, FakeTensor)
+        and value.device.type != "meta"
+        and value.layout == torch.strided
+    ):
+        storage_ptr = value.untyped_storage().data_ptr()
+    return (*_flat_input_metadata(value), storage_ptr)
+
+
+def _flatten_bound_state(
+    traced_result: TracedResult,
+    static_values: tuple[torch.Tensor, ...],
+) -> tuple[Any, ...]:
+    flat_inputs, layouts = _unwrap_subclasses(list(static_values))
+    expected_layouts = {
+        index: layout
+        for index, layout in traced_result.input_subclass_layouts.items()
+        if index < len(static_values)
+    }
+    if layouts != expected_layouts:
+        raise ValueError(
+            "bound state has a different tensor-subclass layout than during tracing"
+        )
+    if traced_result.example_inputs:
+        expected_inputs = traced_result.example_inputs[
+            : traced_result.num_static_inputs
+        ]
+    else:
+        # Serialized artifacts may omit placeholder values. Their configuration
+        # fingerprint validates model shapes, dtypes, and parallel dimensions.
+        expected_inputs = tuple(
+            node.meta.get("val")
+            for node in traced_result.gm.graph.nodes
+            if node.op == "placeholder"
+        )[: traced_result.num_static_inputs]
+    if traced_result.example_inputs and len(expected_inputs) != len(flat_inputs):
+        raise ValueError(
+            "bound state has a different flattened arity than during tracing"
+        )
+    metadata_available = len(expected_inputs) == len(flat_inputs) and all(
+        expected is not None for expected in expected_inputs
+    )
+    if metadata_available and any(
+        _flat_input_metadata(actual) != _flat_input_metadata(expected)
+        for actual, expected in zip(flat_inputs, expected_inputs, strict=True)
+    ):
+        raise ValueError(
+            "bound state has different tensor metadata than during tracing"
+        )
+    return tuple(flat_inputs)
+
+
+class BoundTracedRunner:
+    """Run a traced graph against lifetime-bound module and graph state."""
+
+    def __init__(
+        self,
+        traced_result: TracedResult,
+        *,
+        module: nn.Module | None,
+        graph_state: dict[str, torch.Tensor] | None,
+        validate_runtime: bool,
+        interpreter_cls: type | None,
+    ) -> None:
+        if traced_result.num_optimizer_state_inputs != 0:
+            raise ValueError("bind_traced does not support traced optimizer state")
+        self._traced_result = traced_result
+        self._static_values = _bound_static_values(traced_result, module, graph_state)
+        self._flat_static_inputs = _flatten_bound_state(
+            traced_result, self._static_values
+        )
+        self._flat_static_bindings = tuple(
+            _flat_input_binding(value) for value in self._flat_static_inputs
+        )
+        self._validate_runtime = validate_runtime
+        self._interpreter_cls = interpreter_cls
+
+    def validate_state(
+        self,
+        *,
+        module: nn.Module | None,
+        graph_state: dict[str, torch.Tensor] | None,
+    ) -> None:
+        """Fail if bound state objects, subclass leaves, or storage changed."""
+        try:
+            static_values = _bound_static_values(
+                self._traced_result, module, graph_state
+            )
+            flat_static_inputs = _flatten_bound_state(
+                self._traced_result, static_values
+            )
+        except ValueError as error:
+            raise RuntimeError("bound traced state changed after binding") from error
+        if any(
+            actual is not expected
+            for actual, expected in zip(static_values, self._static_values, strict=True)
+        ) or any(
+            actual is not expected
+            for actual, expected in zip(
+                flat_static_inputs, self._flat_static_inputs, strict=True
+            )
+        ):
+            raise RuntimeError("bound traced state objects changed after binding")
+        if tuple(_flat_input_binding(value) for value in flat_static_inputs) != (
+            self._flat_static_bindings
+        ):
+            raise RuntimeError("bound traced state storage changed after binding")
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        user_inputs_flat, runtime_spec = pytree.tree_flatten((args, kwargs))
+        if self._validate_runtime and runtime_spec != (
+            self._traced_result.user_inputs_spec
+        ):
+            raise ValueError(
+                f"input spec mismatch: runtime {runtime_spec} != "
+                f"trace-time {self._traced_result.user_inputs_spec}"
+            )
+        if any(isinstance(leaf, nn.Module) for leaf in user_inputs_flat):
+            raise ValueError(
+                "bind_traced requires explicit tensor inputs, not nn.Module "
+                "instances. Capture nn.Modules in fn's closure or bind them "
+                "through the 'module' kwarg."
+            )
+        flat_user_inputs, _ = _unwrap_subclasses(user_inputs_flat)
+        flat_inputs = [*self._flat_static_inputs, *flat_user_inputs]
+
+        with torch.no_grad():
+            if self._interpreter_cls is not None:
+                flat_outputs = self._interpreter_cls(self._traced_result.gm).run(
+                    *flat_inputs
+                )
+            else:
+                flat_outputs = self._traced_result.gm(*flat_inputs)
+        wrapped = _wrap_subclasses(
+            flat_outputs,
+            self._traced_result.num_flat_outputs,
+            self._traced_result.output_subclass_layouts,
+        )
+        return pytree.tree_unflatten(wrapped, self._traced_result.output_spec)
+
+
+def bind_traced(
+    traced_result: TracedResult,
+    *,
+    module: nn.Module | None = None,
+    graph_state: dict[str, torch.Tensor] | None = None,
+    _validate_runtime: bool = False,
+    interpreter_cls: type | None = None,
+) -> BoundTracedRunner:
+    """Bind stable module and graph state to a traced graph runner.
+
+    Optimizer updates remain visible because the binding retains references to
+    live tensor storage. Call :meth:`BoundTracedRunner.validate_state` at state
+    mutation boundaries, and create a new trace/binding after replacement.
+    """
+    return BoundTracedRunner(
+        traced_result,
+        module=module,
+        graph_state=graph_state,
+        validate_runtime=_validate_runtime,
+        interpreter_cls=interpreter_cls,
+    )

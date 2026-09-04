@@ -35,16 +35,18 @@ from torch.distributed.pipelining.schedules import (
 )
 
 from torchtitan.config import ParallelismConfig
+from torchtitan.distributed.fsdp import get_fsdp_reshard_after_forward_policy
 from torchtitan.experiments.graph_trainer.common_utils import (
     BOXED_CODEGEN_META,
     compute_annotated_loss,
     ensure_boxed_graph_module,
+    get_default_transformer_block_buckets,
     maybe_register_blockmask_pytree_node,
 )
 from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConfig
 from torchtitan.experiments.graph_trainer.graph_pp.split_fsdp_collectives import (
     split_backward_fsdp_collectives,
-    split_forward_fsdp_collectives,
+    split_fsdp_unshard_collectives,
 )
 from torchtitan.experiments.graph_trainer.graph_pp.graph_multiplex import (
     multiplex_fw_bw_graph,
@@ -68,7 +70,9 @@ from torchtitan.experiments.graph_trainer.graph_pp.utils import (
     GraphPPValueSpec,
     graph_pp_value_spec,
     normalize_graph_pp_microbatch_inputs,
+    output_names,
     overlap_fw_bw_sub_actions,
+    placeholder_names,
 )
 from torchtitan.experiments.graph_trainer.make_fx_tracer import (
     extract_module_state,
@@ -123,8 +127,8 @@ class _StageGraphMeta:
     convention:
 
     1. Forward: ``fwd_input_names`` and ``fwd_flat_input_indices`` select the
-       parameter, buffer, user-input, target, and loss-kwarg leaves consumed by
-       the forward graph.
+       materialized parameter, buffer, user-input, target, and loss-kwarg
+       leaves consumed by the forward graph.
     2. Saved values: ``num_saved_for_backward`` counts forward outputs that are
        hidden from PP users but fed to the backward graph.
     3. Backward: ``partition`` names saved values and output gradients from the
@@ -155,7 +159,6 @@ class _StageGraphMeta:
     bw_no_fsdp_output_names: tuple[str, ...] = ()
     reduce_grad_input_names: tuple[str, ...] = ()
     unshard_flat_param_indices: tuple[int, ...] = ()
-    num_fw_unsharded_param_inputs: int = 0
     is_last_stage: bool = False
 
 
@@ -199,21 +202,11 @@ class GraphTrainerStageGraphs(GraphPPStageGraphs):
     compiled: bool = False
 
     def __post_init__(self) -> None:
-        num_unsharded_inputs = self.meta.num_fw_unsharded_param_inputs
-        if num_unsharded_inputs > self.meta.num_flat_param_values:
+        if len(self.meta.fwd_input_names) != len(self.meta.fwd_flat_input_indices):
             raise ValueError(
-                "GraphPP forward graph needs more unsharded params than "
-                f"metadata has: {num_unsharded_inputs} > "
-                f"{self.meta.num_flat_param_values}"
-            )
-        if len(self.meta.fwd_input_names) != (
-            num_unsharded_inputs + len(self.meta.fwd_flat_input_indices)
-        ):
-            raise ValueError(
-                "GraphPP forward input metadata must be an unsharded-param "
-                "prefix followed by traced flat input indices: "
+                "GraphPP forward input metadata must map every placeholder "
+                "to one traced flat input index: "
                 f"names={self.meta.fwd_input_names}, "
-                f"num_unsharded={num_unsharded_inputs}, "
                 f"flat_indices={self.meta.fwd_flat_input_indices}"
             )
 
@@ -305,7 +298,6 @@ class GraphTrainerStageGraphs(GraphPPStageGraphs):
     ) -> list[Any]:
         """Pack the extracted forward graph inputs in placeholder order."""
 
-        num_unsharded_inputs = self.meta.num_fw_unsharded_param_inputs
         if (
             runtime_validate
             and len(unsharded_param_values) != self.meta.num_flat_param_values
@@ -326,12 +318,9 @@ class GraphTrainerStageGraphs(GraphPPStageGraphs):
             *flat_buffer_values,
             *flat_user_inputs,
         ]
-        # Forward placeholders are a prefix of unsharded parameter values
-        # followed by explicit indices into params, buffers, and user inputs.
-        fw_args = list(unsharded_param_values[:num_unsharded_inputs])
-        flat_input_names = self.meta.fwd_input_names[num_unsharded_inputs:]
+        fw_args = []
         for name, flat_index in zip(
-            flat_input_names,
+            self.meta.fwd_input_names,
             self.meta.fwd_flat_input_indices,
             strict=True,
         ):
@@ -664,7 +653,11 @@ def _compile_graph_pp_module(
     graph_name: str,
 ) -> fx.GraphModule:
     """Compile one extracted GraphPP callable with GraphTrainer Inductor passes."""
-    if not compile_config.enable or not compile_config.enable_passes:
+    if (
+        not compile_config.enable
+        or not compile_config.enable_passes
+        or compile_config.inductor_compilation == "none"
+    ):
         return ensure_boxed_graph_module(gm)
 
     example_inputs = example_inputs_from_placeholders(gm)
@@ -673,7 +666,6 @@ def _compile_graph_pp_module(
         example_inputs,
         final_inductor_compile_passes(
             compile_config,
-            use_cudagraph=False,
             boxed_codegen=True,
         ),
         compile_config=compile_config,
@@ -783,14 +775,16 @@ def _apply_graph_pp_pre_partition_passes(
     compile_config: GraphTrainerCompileConfig,
     model_config: BaseModel.Config | None,
     parallelism: ParallelismConfig | None,
+    reshard_after_forward: bool,
 ) -> None:
     """Apply the graph invariants GraphPP needs before partition.
 
     Required normalization is not controlled by ``enable_passes`` or
     ``disable_passes`` because partitioning assumes canonical FX structure:
-    dead code is gone, no-op patterns are collapsed, and every flat FSDP
-    parameter has at most one unshard chain. ``enable_passes`` only gates the
-    optional GraphTrainer optimization passes that run after normalization.
+    dead code is gone and no-op patterns are collapsed. RAF=false canonicalizes
+    duplicate FSDP unshards after activation rematerialization and before
+    bucketing; without optional passes, it canonicalizes immediately after
+    normalization. RAF=true preserves the distinct lifecycles.
     """
 
     traced.gm = apply_graph_passes(
@@ -799,19 +793,42 @@ def _apply_graph_pp_pre_partition_passes(
         [
             eliminate_dead_code_pass,
             canonicalize_graph_pass,
-            deduplicate_fsdp_unshard_chains_pass,
         ],
         compile_config=compile_config,
         respect_disable_passes=False,
     )
 
     if not compile_config.enable_passes:
+        if not reshard_after_forward:
+            deduplicate_fsdp_unshard_chains_pass(traced.gm)
         return
     if model_config is None or parallelism is None:
         raise ValueError(
             "GraphPP requires model_config and parallelism when compile passes "
             "are enabled before stage graph partitioning."
         )
+
+    dp_shard = max(1, parallelism.data_parallel_shard_degree)
+    ep_degree = max(1, parallelism.expert_parallel_degree)
+    efsdp_degree = max(
+        1,
+        (
+            dp_shard
+            * parallelism.context_parallel_degree
+            * parallelism.tensor_parallel_degree
+        )
+        // ep_degree,
+    )
+    moe_layer_ids = frozenset(
+        layer_id
+        for layer_id, layer_config in enumerate(model_config.layers)
+        if getattr(layer_config, "moe", None) is not None
+    )
+    fsdp_bucket_plan = get_default_transformer_block_buckets(
+        len(model_config.layers),
+        moe_layer_ids=moe_layer_ids,
+        split_moe_expert_buckets=efsdp_degree > 1,
+    )
 
     passes = compile_time_passes(
         traced,
@@ -820,9 +837,10 @@ def _apply_graph_pp_pre_partition_passes(
             parallelism=parallelism,
             model_spec=types.SimpleNamespace(model=model_config),
         ),
-        use_cudagraph=False,
+        fsdp_bucket_plan=fsdp_bucket_plan,
         include_inductor=False,
         include_mandatory_normalization=False,
+        deduplicate_fsdp_before_bucketing=not reshard_after_forward,
     )
     traced.gm = apply_graph_passes(
         traced.gm,
@@ -904,6 +922,28 @@ def _validate_stage_step_output_spec(
             f"stage inputs: expected {num_input_grad_leaves}, got "
             f"{input_grad_spec.num_leaves} for stage {stage_index}."
         )
+
+
+def _graph_pp_reshard_after_forward(
+    parallelism: ParallelismConfig | None,
+) -> bool:
+    """Resolve the stage-wide FSDP parameter lifetime used by GraphPP.
+
+    Args:
+        parallelism: TorchTitan parallelism policy, or ``None`` in focused
+            graph-construction tests without a full trainer configuration.
+
+    Returns:
+        ``True`` when each microbatch owns its forward/backward unshard
+        lifecycle. Tests without a policy preserve GraphPP's default PP
+        behavior and keep parameters unsharded across microbatches.
+    """
+    if parallelism is None:
+        return False
+    return get_fsdp_reshard_after_forward_policy(
+        parallelism.fsdp_reshard_after_forward,
+        pp_enabled=True,
+    )
 
 
 def _build_stage_graphs(
@@ -1044,13 +1084,17 @@ def _build_stage_graphs(
             f"structure: {len(output_grads)} metadata entries for "
             f"{num_fwd_output_leaves} output leaves"
         )
-    # 4. Apply metadata-preserving GraphTrainer passes before partitioning.
+    # 4. Select the FSDP lifetime before optional passes. RAF=false
+    # canonicalizes after rematerialization and before bucketing; RAF=true
+    # keeps both lifecycles in their per-microbatch graphs.
+    reshard_after_forward = _graph_pp_reshard_after_forward(parallelism)
     _apply_graph_pp_pre_partition_passes(
         stage,
         traced,
         compile_config=compile_config,
         model_config=model_config,
         parallelism=parallelism,
+        reshard_after_forward=reshard_after_forward,
     )
     fwd_output_values = graph_pp_value_spec(
         traced.output_subclass_layouts,
@@ -1071,25 +1115,66 @@ def _build_stage_graphs(
     num_fwd_output_values = fwd_output_values.num_flat_values
     num_param_grad_values = param_grad_values.num_flat_values
     num_input_grad_values = input_grad_values.num_flat_values
-    # 5. Extract the runtime graph pieces in schedule order: stage
-    # forward/backward, optional FSDP unshard/reduce-grad, optional dI/dW split.
+    # 5. RAF=false extracts one stage-level unshard, including post-all-gather
+    # weight preparation, so forward and backward reuse it across microbatches.
+    partition_traced = traced
+    partition_flat_input_indices: tuple[int, ...] | None = None
+    partition_backward_only_indices = backward_only_indices
+    unshard_module: fx.GraphModule | None = None
+    unshard_flat_param_indices: tuple[int, ...] = ()
+    if not reshard_after_forward:
+        joint_input_names = placeholder_names(traced.gm)
+        fsdp_unshard = split_fsdp_unshard_collectives(
+            traced.gm,
+            num_params=num_state_param_values,
+            input_names=joint_input_names,
+            flat_input_indices=tuple(range(len(joint_input_names))),
+        )
+        partition_traced = dataclasses.replace(
+            traced,
+            gm=fsdp_unshard.compute_module,
+        )
+        partition_flat_input_indices = fsdp_unshard.compute_flat_input_indices
+        backward_only_input_set = set(backward_only_indices)
+        partition_backward_only_indices = tuple(
+            index
+            for index, flat_index in enumerate(partition_flat_input_indices)
+            if flat_index in backward_only_input_set
+        )
+        if len(partition_backward_only_indices) != len(backward_only_indices):
+            raise ValueError(
+                "FSDP unshard extraction dropped a backward-only GraphPP input: "
+                f"before={backward_only_indices}, "
+                f"after={partition_backward_only_indices}"
+            )
+        unshard_module = fsdp_unshard.unshard_module
+        unshard_flat_param_indices = fsdp_unshard.unshard_flat_param_indices
+
+    # 6. Partition compute into forward/backward. Reduce-grad is extracted only
+    # for RAF=false; with RAF=true it remains part of each backward graph.
     fw_module, bw_module, partition_meta = partition_joint_graph(
-        traced,
+        partition_traced,
         num_fwd_outputs=num_fwd_output_values,
-        backward_only_input_indices=backward_only_indices,
+        backward_only_input_indices=partition_backward_only_indices,
+        flat_input_indices=partition_flat_input_indices,
     )
-    fsdp_fw = split_forward_fsdp_collectives(
-        fw_module,
-        num_params=num_state_param_values,
-        fwd_input_names=partition_meta.fwd_input_names,
-        fwd_flat_input_indices=partition_meta.fwd_flat_input_indices,
-    )
-    fsdp_bw = split_backward_fsdp_collectives(
-        bw_module,
-        num_param_grads=num_param_grad_values,
-    )
+    if reshard_after_forward:
+        bw_compute_module = bw_module
+        bw_compute_output_names = output_names(bw_module)
+        reduce_grad_module = None
+        reduce_grad_input_names: tuple[str, ...] = ()
+    else:
+        fsdp_bw = split_backward_fsdp_collectives(
+            bw_module,
+            num_param_grads=num_param_grad_values,
+        )
+        bw_compute_module = fsdp_bw.bw_no_fsdp_module
+        bw_compute_output_names = fsdp_bw.bw_no_fsdp_output_names
+        reduce_grad_module = fsdp_bw.reduce_grad_module
+        reduce_grad_input_names = fsdp_bw.reduce_grad_input_names
+
     didw_split: GraphPPDiDwSplit | None = split_di_dw_graph(
-        fsdp_bw.bw_no_fsdp_module,
+        bw_compute_module,
         num_param_grads=num_param_grad_values,
     )
     if didw_split is not None and didw_split.num_input_grads != num_input_grad_values:
@@ -1097,15 +1182,15 @@ def _build_stage_graphs(
             "GraphPP dI/dW split changed the raw input-gradient count: "
             f"expected {num_input_grad_values}, got {didw_split.num_input_grads}"
         )
-    # 6. Attach the callable container and the GraphTrainer-only metadata used
+    # 7. Attach the callable container and the GraphTrainer-only metadata used
     # to pack/unpack its flat graph inputs and outputs.
     graph_modules = _StageGraphModules(
-        fw=fsdp_fw.fw_no_fsdp_module,
-        full_bw=fsdp_bw.bw_no_fsdp_module,
+        fw=fw_module,
+        full_bw=bw_compute_module,
         bw_di=None if didw_split is None else didw_split.bw_di_module,
         bw_dw=None if didw_split is None else didw_split.bw_dw_module,
-        unshard=fsdp_fw.unshard_module,
-        reduce_grad=fsdp_bw.reduce_grad_module,
+        unshard=unshard_module,
+        reduce_grad=reduce_grad_module,
     )
     _annotate_graph_pp_modules(
         graph_modules,
@@ -1121,12 +1206,11 @@ def _build_stage_graphs(
         param_grad_values=param_grad_values,
         input_grad_values=input_grad_values,
         partition=partition_meta,
-        fwd_input_names=fsdp_fw.fw_no_fsdp_input_names,
-        fwd_flat_input_indices=fsdp_fw.fw_no_fsdp_flat_input_indices,
-        bw_no_fsdp_output_names=fsdp_bw.bw_no_fsdp_output_names,
-        reduce_grad_input_names=fsdp_bw.reduce_grad_input_names,
-        unshard_flat_param_indices=fsdp_fw.unshard_flat_param_indices,
-        num_fw_unsharded_param_inputs=fsdp_fw.num_fw_unsharded_param_inputs,
+        fwd_input_names=partition_meta.fwd_input_names,
+        fwd_flat_input_indices=partition_meta.fwd_flat_input_indices,
+        bw_no_fsdp_output_names=bw_compute_output_names,
+        reduce_grad_input_names=reduce_grad_input_names,
+        unshard_flat_param_indices=unshard_flat_param_indices,
         is_last_stage=stage.is_last,
     )
     stage.graphs = GraphTrainerStageGraphs(

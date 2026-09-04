@@ -29,7 +29,11 @@ import torch.distributed as dist
 from torchtitan.components.loss import ChunkedLossWrapper
 from torchtitan.config import ConfigManager, TORCH_DTYPE_MAP
 from torchtitan.distributed import ParallelDims, utils as dist_utils
+from torchtitan.experiments.graph_trainer.chunked_loss import (
+    ChunkedLossWrapperWithParamGrads,
+)
 from torchtitan.experiments.graph_trainer.common_utils import (
+    get_transformer_block_buckets,
     maybe_register_blockmask_pytree_node,
 )
 from torchtitan.experiments.graph_trainer.configs import trace_input_preparer_keys
@@ -179,7 +183,12 @@ def _common_setup(config):
     )
 
 
-def _prepare_loss_for_precompile(model, loss_fn) -> None:
+def _prepare_loss_for_precompile(
+    model,
+    loss_fn,
+    *,
+    weight_gradient_reduce_dtype: torch.dtype,
+) -> None:
     """Match Trainer's post-parallelization loss setup for precompile tracing."""
     if not isinstance(loss_fn, ChunkedLossWrapper):
         return
@@ -189,6 +198,8 @@ def _prepare_loss_for_precompile(model, loss_fn) -> None:
         raise ValueError("Model must have lm_head for ChunkedLossWrapper precompile")
 
     loss_fn.set_lm_head(lm_head)
+    if isinstance(loss_fn, ChunkedLossWrapperWithParamGrads):
+        loss_fn.set_weight_gradient_reduce_dtype(weight_gradient_reduce_dtype)
     model._skip_lm_head = True
 
 
@@ -235,7 +246,13 @@ def _precompile_aot_fx_trace(
     from torchtitan.experiments.graph_trainer.trainer import make_fwd_bwd_step
 
     loss_fn = config.loss.build(compile_config=compile_config)
-    _prepare_loss_for_precompile(model, loss_fn)
+    _prepare_loss_for_precompile(
+        model,
+        loss_fn,
+        weight_gradient_reduce_dtype=TORCH_DTYPE_MAP[
+            config.training.mixed_precision_reduce
+        ],
+    )
 
     fwd_bwd_fn = make_fwd_bwd_step(model, loss_fn)
 
@@ -329,7 +346,17 @@ def _precompile_aot_fx_trace(
         compile_time_passes,
     )
 
-    passes = compile_time_passes(traced_result, config, parallel_dims=parallel_dims)
+    fsdp_bucket_plan = get_transformer_block_buckets(
+        model,
+        parallel_dims=parallel_dims,
+        chunked_loss_enabled=isinstance(config.loss, ChunkedLossWrapper.Config),
+    )
+    passes = compile_time_passes(
+        traced_result,
+        config,
+        fsdp_bucket_plan=fsdp_bucket_plan,
+        parallel_dims=parallel_dims,
+    )
 
     traced_result.gm = apply_graph_passes(
         traced_result.gm, traced_result.example_inputs, passes
@@ -341,7 +368,10 @@ def _precompile_aot_fx_trace(
 
     storage = DiskStorageAdapter(compile_config.precompile_artifact_dir)
     config_fingerprint = compute_config_fingerprint(
-        model, compile_config, parallel_dims
+        model,
+        compile_config,
+        parallel_dims,
+        mixed_precision_reduce=config.training.mixed_precision_reduce,
     )
 
     precompile_fx_trace_save(

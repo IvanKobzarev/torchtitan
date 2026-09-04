@@ -14,6 +14,30 @@ from torchtitan.models.common.linear import Linear
 from torchtitan.protocols.module import Module, ModuleDict
 
 
+_ordered_effect_calls = 0
+
+
+@torch.library.custom_op(
+    "torchtitan_test::ordered_effect_identity",
+    mutates_args=(),
+)
+def _ordered_effect_identity(x: torch.Tensor) -> torch.Tensor:
+    """Count execution of a stateful identity operation.
+
+    Args:
+        x: Input tensor.
+
+    Returns:
+        A distinct tensor with the same value as ``x``.
+    """
+    global _ordered_effect_calls
+    _ordered_effect_calls += 1
+    return x.clone()
+
+
+_ordered_effect_identity.register_effect(torch.library.EffectType.ORDERED)
+
+
 class ToyModule(Module):
     def __init__(self):
         super().__init__()
@@ -43,7 +67,36 @@ class TransformerBlock(Module):
         return final_out.sum()
 
 
+class EffectfulTransformerBlock(Module):
+    """Transformer-block stand-in with one ordered custom operation."""
+
+    def forward(self, x):
+        """Apply an ordered effect before differentiable computation.
+
+        Args:
+            x: Differentiable input tensor.
+
+        Returns:
+            Scalar differentiable output.
+        """
+        _ordered_effect_identity(x)
+        return x.square().sum()
+
+
 class TestApplyAC(unittest.TestCase):
+    def test_full_ac_does_not_replay_ordered_effects(self):
+        """Full activation checkpointing executes ordered effects once."""
+        global _ordered_effect_calls
+        _ordered_effect_calls = 0
+        model = ToyModule()
+        model.layers["0"] = EffectfulTransformerBlock()
+        FullAC.Config().build().apply(model)
+
+        output = model(torch.randn(8, requires_grad=True))
+        self.assertEqual(_ordered_effect_calls, 1)
+        output.backward()
+        self.assertEqual(_ordered_effect_calls, 1)
+
     def test_flops(self):
         def get_bw_flops(model_fn):
             x = torch.randn(512, 512, requires_grad=True)

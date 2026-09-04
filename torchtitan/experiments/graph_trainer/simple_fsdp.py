@@ -247,7 +247,11 @@ class ReplicateComputation(Module):
             return x
 
         output = self.replicate_compute(x)
-        return output
+        source = x._local_tensor
+        prepare_unsharded = getattr(source, "prepare_unsharded", None)
+        if prepare_unsharded is None:
+            return output
+        return prepare_unsharded(output)
 
 
 def data_parallel(

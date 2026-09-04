@@ -7,7 +7,9 @@ import copy
 import dataclasses
 import math
 import os
+import weakref
 from collections.abc import Callable
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -36,6 +38,124 @@ from torchtitan.tools.logging import logger
 # pipeline_llm and pipeline_vlm are the public entrypoints for model-specific PP
 # setup. Helpers in this module are implementation details and stay private.
 __all__ = ["pipeline_llm", "pipeline_vlm"]
+
+
+_PIPELINE_MICROBATCH_CALLBACKS: weakref.WeakKeyDictionary[
+    nn.Module, Callable[[int], None]
+] = weakref.WeakKeyDictionary()
+
+
+def _register_pipeline_microbatch_callback(
+    model_part: nn.Module,
+    callback: Callable[[int], None],
+) -> None:
+    """Register stage-local state selection before pipeline compute.
+
+    Args:
+        model_part: Model chunk owned by one local pipeline stage.
+        callback: Function accepting the raw pipeline microbatch index.
+    """
+    _PIPELINE_MICROBATCH_CALLBACKS[model_part] = callback
+
+
+def _get_pipeline_microbatch_callback(
+    model_part: nn.Module,
+) -> Callable[[int], None] | None:
+    """Return the optional pipeline microbatch callback for a model part.
+
+    Args:
+        model_part: Model chunk owned by one local pipeline stage.
+
+    Returns:
+        Registered callback, or ``None`` when the model has no stage-local
+        microbatch state.
+    """
+    return _PIPELINE_MICROBATCH_CALLBACKS.get(model_part)
+
+
+def _set_pipeline_microbatch(model_part: nn.Module, microbatch_id: int) -> None:
+    """Select stage-local state before one pipeline compute action.
+
+    Args:
+        model_part: Model chunk about to execute.
+        microbatch_id: Raw pipeline microbatch index.
+    """
+    callback = _get_pipeline_microbatch_callback(model_part)
+    if callback is not None:
+        callback(microbatch_id)
+
+
+class _MicrobatchAwarePipelineStage(PipelineStage):
+    """Pipeline stage that selects backend state at compute boundaries."""
+
+    def forward_one_chunk(
+        self,
+        fwd_chunk_id: int,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any] | None = None,
+        save_forward_output: bool = True,
+    ):
+        """Select the forward microbatch before invoking the stage module.
+
+        Args:
+            fwd_chunk_id: Pipeline microbatch index.
+            args: Positional stage inputs.
+            kwargs: Optional keyword stage inputs.
+            save_forward_output: Whether to retain the stage output.
+
+        Returns:
+            Output from ``PipelineStage.forward_one_chunk``.
+        """
+        _set_pipeline_microbatch(self.submod, fwd_chunk_id)
+        return super().forward_one_chunk(
+            fwd_chunk_id,
+            args,
+            kwargs,
+            save_forward_output,
+        )
+
+    def backward_one_chunk(
+        self,
+        bwd_chunk_id: int,
+        loss=None,
+        full_backward: bool = True,
+        last_backward: bool = False,
+    ):
+        """Select the backward microbatch before invoking autograd.
+
+        Args:
+            bwd_chunk_id: Pipeline microbatch index.
+            loss: Optional final-stage loss.
+            full_backward: Whether to run input and weight gradients together.
+            last_backward: Whether this is the stage's final backward action.
+
+        Returns:
+            Result from ``PipelineStage.backward_one_chunk``.
+        """
+        _set_pipeline_microbatch(self.submod, bwd_chunk_id)
+        return super().backward_one_chunk(
+            bwd_chunk_id,
+            loss,
+            full_backward,
+            last_backward,
+        )
+
+    def backward_weight_one_chunk(
+        self,
+        bwd_chunk_id: int,
+        last_backward: bool = False,
+    ):
+        """Select the microbatch before a deferred weight backward.
+
+        Args:
+            bwd_chunk_id: Pipeline microbatch index.
+            last_backward: Whether this is the stage's final backward action.
+
+        Returns:
+            Result from ``PipelineStage.backward_weight_one_chunk``.
+        """
+        _set_pipeline_microbatch(self.submod, bwd_chunk_id)
+        return super().backward_weight_one_chunk(bwd_chunk_id, last_backward)
 
 
 def _build_get_mesh_callback(
@@ -622,7 +742,7 @@ def _pipeline_module_split(
     for stage_idx in pp_rank_to_stage_indices:
         module_names = module_names_per_stage[stage_idx]
         model_chunk = _split_module(whole_model, module_names)
-        stage = PipelineStage(
+        stage = _MicrobatchAwarePipelineStage(
             model_chunk,
             stage_idx,
             num_stages,

@@ -51,7 +51,6 @@ on load (a native ``w13`` key is still accepted for back-compat). See
 ``torchtitan/overrides/README.md`` "Checkpoint Compatibility".
 """
 
-from collections.abc import Callable
 from dataclasses import dataclass, replace
 
 import spmd_types as spmd
@@ -63,6 +62,7 @@ from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.experimental import local_map
 
 from torchtitan.config import derive, override
+from torchtitan.models.common._fused_weights import make_fused_gate_up_init
 from torchtitan.models.common.decoder_sharding import dense_param_placement
 from torchtitan.models.common.feed_forward import FeedForward
 from torchtitan.models.common.moe import GroupedExperts
@@ -102,7 +102,7 @@ def _silu_and_mul_forward_kernel(
     BLOCK_N: tl.constexpr,
 ) -> None:
     """Compute ``silu(gate) * up`` for optionally offset-limited rows."""
-    row_start = tl.program_id(0) * BLOCK_M
+    row_start = tl.program_id(0).to(tl.int64) * BLOCK_M
     row_limit = NUM_ROWS
     if HAS_OFFSETS:
         row_limit = tl.load(offsets + NUM_OFFSETS - 1)
@@ -157,7 +157,7 @@ def _silu_and_mul_backward_kernel(
     BLOCK_N: tl.constexpr,
 ) -> None:
     """Backward for ``_silu_and_mul_forward_kernel`` over defined rows."""
-    row_start = tl.program_id(0) * BLOCK_M
+    row_start = tl.program_id(0).to(tl.int64) * BLOCK_M
     row_limit = NUM_ROWS
     if HAS_OFFSETS:
         row_limit = tl.load(offsets + NUM_OFFSETS - 1)
@@ -364,33 +364,6 @@ silu_and_mul_op.register_autograd(
 )
 
 
-def _make_fused_gate_up_init(
-    gate_init: Callable,
-    up_init: Callable,
-    *,
-    gate_up_axis: int,
-) -> Callable:
-    """Build an initializer for a fused gate/up weight from per-half initializers.
-
-    The fused weight has a size-2 ``gate_up_axis`` (index 0 = gate / stock w1,
-    index 1 = up / stock w3). Each half is initialized with its own initializer
-    because the gate and up projections differ (e.g. up shares w2's depth-scaled
-    init), so initializing the whole tensor at once would mis-init the up half.
-    Shared by the dense FusedSwiGLU ``(hidden, 2, dim)`` (axis 1) and the grouped
-    FusedGroupedExperts ``(E, F, 2, D)`` (axis 2) overrides.
-    """
-
-    def _init(t: torch.Tensor) -> None:
-        gate_idx: list[int | slice] = [slice(None)] * t.ndim
-        up_idx: list[int | slice] = [slice(None)] * t.ndim
-        gate_idx[gate_up_axis] = 0
-        up_idx[gate_up_axis] = 1
-        gate_init(t[tuple(gate_idx)])  # gate (stock w1)
-        up_init(t[tuple(up_idx)])  # up (stock w3)
-
-    return _init
-
-
 def _fused_silu_and_mul(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     """``silu(gate) * up`` via the fused ``torchtitan::silu_and_mul`` op."""
     if isinstance(gate, DTensor):
@@ -493,7 +466,7 @@ def fused_swiglu(cfg: FeedForward.Config) -> FusedSwiGLU.Config:
     w3_init = (cfg.w3.param_init or {}).get("weight")
     param_init = None
     if w1_init is not None and w3_init is not None:
-        param_init = {"w13": _make_fused_gate_up_init(w1_init, w3_init, gate_up_axis=1)}
+        param_init = {"w13": make_fused_gate_up_init(w1_init, w3_init, gate_up_axis=1)}
 
     fused = derive(cfg, FusedSwiGLU.Config, param_init=param_init)
 
@@ -593,7 +566,7 @@ def _fuse_w13_grouped_experts_param_init(param_init: dict | None) -> dict | None
     w3_init = param_init.get("w3_EFD")
     fused = {k: v for k, v in param_init.items() if k not in ("w1_EFD", "w3_EFD")}
     if w1_init is not None and w3_init is not None:
-        fused["w13"] = _make_fused_gate_up_init(w1_init, w3_init, gate_up_axis=2)
+        fused["w13"] = make_fused_gate_up_init(w1_init, w3_init, gate_up_axis=2)
     return fused or None
 
 

@@ -97,6 +97,7 @@ from torchtitan.experiments.graph_trainer.ep_pass_utils import (
     tensor_meta,
     view_shape_arg_index,
 )
+from torchtitan.experiments.graph_trainer.make_fx_tracer import _GRAPH_STATE_OUTPUT_META
 from torchtitan.experiments.graph_trainer.registry import (
     register_trace_call_input_preparer,
     register_trace_input_preparer,
@@ -1969,6 +1970,16 @@ def _materialize_live_out(
         )
     materialized._rename(f"{live_out.name}_chunk_materialized")
     _set_synthetic_meta(materialized, region=plan.region, role="materialization")
+    graph_state_outputs = tuple(
+        dict.fromkeys(
+            (
+                *materialized.meta.get(_GRAPH_STATE_OUTPUT_META, ()),
+                *original_meta.get(_GRAPH_STATE_OUTPUT_META, ()),
+            )
+        )
+    )
+    if graph_state_outputs:
+        materialized.meta[_GRAPH_STATE_OUTPUT_META] = graph_state_outputs
     _validate_materialized(
         materialized,
         live_out,
@@ -2309,7 +2320,7 @@ def _transform_region(
 
 
 def _static_placeholders(gm: fx.GraphModule, num_static_inputs: int) -> set[fx.Node]:
-    """Return placeholders that represent static model state."""
+    """Return placeholders that represent static graph state."""
     return {
         node
         for idx, node in enumerate(n for n in gm.graph.nodes if n.op == "placeholder")

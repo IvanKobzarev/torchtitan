@@ -4,6 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from __future__ import annotations
+
 from typing import Any, TYPE_CHECKING
 
 import torch
@@ -28,6 +30,43 @@ if TYPE_CHECKING:
 
 _DENSE_STORAGE_AXES = ["dp_replicate", "dp_shard", "cp", "tp"]
 _SPARSE_STORAGE_AXES = ["dp_replicate", "efsdp", "ep"]
+
+
+def _configure_fsdp_modules(
+    modules: nn.Module | list[nn.Module],
+) -> None:
+    """Configure parameters whose compute layout follows an FSDP lifetime.
+
+    Args:
+        modules: FSDP unit root or roots.
+    """
+    roots = modules if isinstance(modules, list) else [modules]
+    for root in roots:
+        for module in root.modules():
+            configure_fsdp = getattr(module, "configure_fsdp", None)
+            if configure_fsdp is not None:
+                configure_fsdp()
+
+
+def _fully_shard_configured(
+    modules: nn.Module | list[nn.Module],
+    *,
+    reshard_after_forward: bool,
+    **kwargs: Any,
+) -> None:
+    """Configure alternate weight layouts and apply one FSDP unit.
+
+    Args:
+        modules: Module or module group passed to ``fully_shard``.
+        reshard_after_forward: Unsharded-parameter lifetime for this unit.
+        **kwargs: Remaining ``fully_shard`` arguments.
+    """
+    _configure_fsdp_modules(modules)
+    fully_shard(
+        modules,
+        reshard_after_forward=reshard_after_forward,
+        **kwargs,
+    )
 
 
 def resolve_fsdp_mesh(
@@ -100,14 +139,56 @@ def disable_fsdp_gradient_division(model: nn.Module) -> None:
             module.set_gradient_divide_factor(1.0)
 
 
-def enable_fsdp_symm_mem(model: nn.Module) -> None:
+def enable_fsdp_symm_mem(model: nn.Module, policy: str = "all") -> None:
     """
-    Enable symmetric-memory communication optimizations for all FSDP modules.
+    Enable symmetric-memory communication optimizations for FSDP modules.
+
+    Args:
+        model: The model whose FSDP modules should use symmetric memory.
+        policy: Which parameter groups receive symmetric-memory buffers.
+            "all" covers every FSDP module. "widest" covers only the groups
+            whose all-gather process group is at the largest degree in the
+            model, which under expert parallelism means the dense parameters
+            and not the routed experts. See ParallelismConfig for when to
+            prefer one over the other.
+
+    ``set_force_sum_reduction_for_comms`` is applied to every FSDP module
+    under both policies, so gradient scaling does not depend on the policy.
     """
+    if policy not in ("all", "widest"):
+        raise ValueError(
+            f"fsdp_symm_mem_policy must be 'all' or 'widest', got {policy!r}"
+        )
+
+    param_groups = []
     for module in model.modules():
-        if isinstance(module, FSDPModule):
-            module.set_force_sum_reduction_for_comms(True)
+        if not isinstance(module, FSDPModule):
+            continue
+        module.set_force_sum_reduction_for_comms(True)
+        if policy == "all":
             module.set_symm_mem_for_comm()
+        else:
+            param_groups.extend(module._get_fsdp_state()._fsdp_param_groups)
+
+    if policy == "all" or not param_groups:
+        return
+
+    # Selecting per parameter group rather than per module: a module can own
+    # several groups, and it is the group that carries the all-gather degree.
+    widths = [group._all_gather_process_group.size() for group in param_groups]
+    widest = max(widths)
+    for group, width in zip(param_groups, widths):
+        if width == widest:
+            group.set_symm_mem("NCCL")
+    if sorted(set(widths)) != [widest]:
+        logger.info(
+            "FSDP symmetric memory on %d/%d parameter groups at degree %d; "
+            "skipped degrees %s",
+            widths.count(widest),
+            len(widths),
+            widest,
+            sorted(w for w in set(widths) if w != widest),
+        )
 
 
 def get_fsdp_reshard_after_forward_policy(
@@ -157,7 +238,7 @@ def apply_fsdp_to_vision_encoder(
     reshard_after_forward = get_fsdp_reshard_after_forward_policy(
         reshard_after_forward_policy, pp_enabled=pp_enabled
     )
-    fully_shard(
+    _fully_shard_configured(
         vision_encoder,
         mesh=dp_mesh,
         mp_policy=mp_policy,
@@ -179,6 +260,7 @@ def apply_fsdp_to_decoder(
     dp_mesh_dims: "DataParallelMeshDims | None" = None,
     edp_mesh_dims: "DataParallelMeshDims | None" = None,
     enable_symm_mem: bool = False,
+    symm_mem_policy: str = "all",
 ):
     """
     Apply data parallelism (via FSDP2) to a decoder-style transformer model.
@@ -220,6 +302,8 @@ def apply_fsdp_to_decoder(
             used by routed experts. ``None`` under partial_dtensor.
         enable_symm_mem (bool): Whether to enable symmetric-memory FSDP
             communication.
+        symm_mem_policy (str): Which parameter groups get symmetric-memory
+            buffers when ``enable_symm_mem`` is set: "all" or "widest".
     """
     mp_policy = MixedPrecisionPolicy(
         param_dtype=param_dtype,
@@ -244,14 +328,14 @@ def apply_fsdp_to_decoder(
             for m in (model.tok_embeddings, model.norm, model.lm_head)
             if m is not None
         ]
-        fully_shard(
+        _fully_shard_configured(
             modules,
             **fsdp_config,
             reshard_after_forward=reshard_after_forward_policy == "always",
         )
     else:
         if model.tok_embeddings is not None:
-            fully_shard(
+            _fully_shard_configured(
                 model.tok_embeddings,
                 **fsdp_config,
                 reshard_after_forward=reshard_after_forward,
@@ -259,7 +343,7 @@ def apply_fsdp_to_decoder(
         # As an optimization, do not reshard_after_forward the last layers
         # by default since FSDP would prefetch them immediately.
         if model.norm is not None and model.lm_head is not None:
-            fully_shard(
+            _fully_shard_configured(
                 [model.norm, model.lm_head],
                 **fsdp_config,
                 reshard_after_forward=reshard_after_forward_policy == "always",
@@ -294,7 +378,7 @@ def apply_fsdp_to_decoder(
             # When ep_degree == 1 and no Shard(1) override needed, skip
             # shard_placement_fn entirely for simplicity
             if ep_degree == 1 and expert_shard_placement == Shard(0):
-                fully_shard(
+                _fully_shard_configured(
                     transformer_block,
                     **fsdp_config,
                     reshard_after_forward=reshard_after_forward,
@@ -309,7 +393,7 @@ def apply_fsdp_to_decoder(
                         return Shard(1)
                     return None
 
-                fully_shard(
+                _fully_shard_configured(
                     transformer_block,
                     **fsdp_config,
                     reshard_after_forward=reshard_after_forward,
@@ -353,14 +437,14 @@ def apply_fsdp_to_decoder(
                             placement=Shard(0), mesh_info=_dp_mesh_info
                         )
 
-                fully_shard(
+                _fully_shard_configured(
                     transformer_block,
                     **fsdp_config,
                     reshard_after_forward=reshard_after_forward,
                     shard_placement_fn=_shard_placement_fn,
                 )
         else:
-            fully_shard(
+            _fully_shard_configured(
                 transformer_block,
                 **fsdp_config,
                 reshard_after_forward=reshard_after_forward,
@@ -369,7 +453,7 @@ def apply_fsdp_to_decoder(
     fully_shard(model, **fsdp_config)
 
     if enable_symm_mem:
-        enable_fsdp_symm_mem(model)
+        enable_fsdp_symm_mem(model, symm_mem_policy)
 
     # Disable FSDP's automatic gradient division for all FSDP modules
     disable_fsdp_gradient_division(model)

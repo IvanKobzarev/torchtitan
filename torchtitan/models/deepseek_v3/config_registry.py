@@ -4,6 +4,11 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from dataclasses import replace
+from typing import Literal, TYPE_CHECKING
+
+import torch
+
 from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.components.data import ConcatThenSplitPackingConfig, GrainDataLoader
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
@@ -18,11 +23,152 @@ from torchtitan.components.quantization import (
 from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.hf_datasets.text_datasets import DATASETS
+from torchtitan.models.common.attention import VarlenAttention
 from torchtitan.models.common.config_utils import decoder_vocab_size
+from torchtitan.models.common.router_gate import (
+    RouterGateLinearConverter,
+    RouterGemmConfig,
+)
 from torchtitan.models.deepseek_v3.mtp import MTPLoss
+from torchtitan.protocols.model import ModelConfigConverter
 from torchtitan.trainer import Trainer
 
 from . import model_registry
+from .model import Attention
+
+if TYPE_CHECKING:
+    from torchtitan.models.common.dist_moe import DistMoeBackendConfig
+
+
+_DIST_MOE_VARLEN_MAX_NUM_DOCUMENTS = 512
+
+
+def _mxfp8_dist_moe_backend(
+    *,
+    max_routing_imbalance_factor: float = 1.0,
+    device_memory_budget_bytes: int | Literal["maximum_useful"] | None = None,
+    vmm_host_scratch_imbalance_factor: float | Literal["auto"] | None = "auto",
+) -> "DistMoeBackendConfig":
+    """Build the production MXFP8 E4M3 DistMoE policy."""
+    # pyrefly: ignore [missing-import]
+    from dist_moe import BlockScaledFormat, DistMoeBlockScaledConfig
+
+    from torchtitan.models.common.dist_moe import DistMoeBackendConfig
+
+    return DistMoeBackendConfig(
+        max_routing_imbalance_factor=max_routing_imbalance_factor,
+        device_memory_budget_bytes=device_memory_budget_bytes,
+        vmm_host_scratch_imbalance_factor=vmm_host_scratch_imbalance_factor,
+        blockscaled=DistMoeBlockScaledConfig(
+            format=BlockScaledFormat.MXFP8_E4M3,
+            fast_math=True,
+            pipeline="staged",
+        ),
+    )
+
+
+def _mxfp8_dense_converters() -> list[ModelConfigConverter.Config]:
+    """Return MXFP8 converters for the non-routed DeepSeek GEMMs."""
+    return [
+        MXFP8LinearConverter.Config(
+            model_compile_enabled=False,
+            fqns=["attention", "shared_experts", "feed_forward", "lm_head"],
+        )
+    ]
+
+
+def _dist_moe_converters(*, quantize_dense: bool) -> list[ModelConfigConverter.Config]:
+    """Return the router and optional dense-MXFP8 converters for DistMoE."""
+    converters: list[ModelConfigConverter.Config] = [
+        RouterGateLinearConverter.Config(
+            forward=RouterGemmConfig(
+                input_dtype=torch.bfloat16,
+                compute_mode="bf16",
+                output_dtype=torch.float32,
+            ),
+            backward=RouterGemmConfig(
+                input_dtype=torch.float32,
+                compute_mode="tf32",
+                output_dtype=torch.float32,
+            ),
+        )
+    ]
+    if quantize_dense:
+        converters.extend(_mxfp8_dense_converters())
+    return converters
+
+
+def _apply_dist_moe_mixed_precision(config: Trainer.Config) -> None:
+    """Apply the DistMoE mixed-precision and optimizer-state policy."""
+    config.training.dtype = "float32"
+    config.training.mixed_precision_param = "bfloat16"
+    config.training.mixed_precision_reduce = "bfloat16"
+    config.optimizer.implementation = "fused_opt_states_bf16"
+
+
+def attention_batch_size(config: Trainer.Config) -> int:
+    """Return the number of fixed-length rows in one local microbatch."""
+    num_tokens = config.training.num_tokens_per_microbatch_per_dp_rank
+    max_context_length = config.training.max_context_length
+    if num_tokens % max_context_length:
+        raise ValueError(
+            "num_tokens_per_microbatch_per_dp_rank must divide evenly by "
+            "max_context_length for fixed-row attention"
+        )
+    return num_tokens // max_context_length
+
+
+def _set_varlen_max_num_documents(
+    config: Trainer.Config,
+    max_num_documents: int = _DIST_MOE_VARLEN_MAX_NUM_DOCUMENTS,
+) -> None:
+    """Set the fixed document capacity on every varlen attention layer."""
+    assert config.model_spec is not None
+    for _, attention, _, _ in config.model_spec.model.traverse(VarlenAttention.Config):
+        assert isinstance(attention, VarlenAttention.Config)
+        attention.max_num_documents = max_num_documents
+
+
+def enable_mlperf_packing(config: Trainer.Config) -> None:
+    """Use continuous positions so every packed row is one causal document."""
+    dataloader = config.dataloader
+    if not isinstance(dataloader, GrainDataLoader.Config) or not isinstance(
+        dataloader.dataset, ConcatThenSplitPackingConfig
+    ):
+        raise ValueError("MLPerf packing requires Grain ConcatThenSplit packing")
+    dataloader.dataset = replace(
+        dataloader.dataset,
+        mask_document_boundaries=False,
+    )
+    max_num_documents = attention_batch_size(config)
+    assert config.model_spec is not None
+    for _, attention, _, _ in config.model_spec.model.traverse(VarlenAttention.Config):
+        assert isinstance(attention, VarlenAttention.Config)
+        attention.max_num_documents = max_num_documents
+        attention.single_document_rows = True
+
+
+def _enable_dist_moe(
+    config: Trainer.Config,
+    flavor: str,
+    backend: "DistMoeBackendConfig",
+    *,
+    quantize_dense: bool = False,
+) -> Trainer.Config:
+    """Configure one standard Trainer DistMoE experiment."""
+    config.training.disable_cuda_graphs = False
+    config.compile.enable = False
+    config.model_spec = model_registry(
+        flavor,
+        attn_backend="varlen",
+        moe_backend="dist_moe",
+        dist_moe=backend,
+        converters=_dist_moe_converters(quantize_dense=quantize_dense),
+    )
+    _set_varlen_max_num_documents(config)
+    enable_fused_mla(config)
+    _apply_dist_moe_mixed_precision(config)
+    return config
 
 
 def enable_fused_swiglu(config: Trainer.Config) -> None:
@@ -34,6 +180,51 @@ def enable_fused_swiglu(config: Trainer.Config) -> None:
     ):
         assert override not in config.override.imports
         config.override.imports.append(override)
+
+
+def fused_mla_query_projection(config: Trainer.Config) -> str:
+    """Return the query projection mutated by fused Q RoPE.
+
+    Args:
+        config: DeepSeek-V3 trainer configuration.
+
+    Returns:
+        Module FQN of the query projection mutated by fused Q RoPE.
+    """
+    assert config.model_spec is not None
+    q_lora_ranks = set()
+    for _, attention, _, _ in config.model_spec.model.traverse(Attention.Config):
+        assert isinstance(attention, Attention.Config)
+        q_lora_ranks.add(attention.q_lora_rank)
+    if len(q_lora_ranks) != 1:
+        raise ValueError("Fused MLA requires one query projection layout")
+    return "attention.wq" if q_lora_ranks == {0} else "attention.wq_b"
+
+
+def enable_fused_mla(config: Trainer.Config) -> str:
+    """Enable fused MLA assembly for a DeepSeek-V3 training recipe.
+
+    Args:
+        config: Trainer configuration updated in place.
+
+    Returns:
+        Module FQN of the query projection mutated by fused Q RoPE.
+    """
+    override = "torchtitan.overrides.fused_mla.fused_mla"
+    assert override not in config.override.imports
+    config.override.imports.append(override)
+    q_projection = fused_mla_query_projection(config)
+    if isinstance(config.activation_checkpoint, SelectiveAC.Config):
+        # Q RoPE mutates the projection result, so SAC must recompute rather
+        # than cache that GEMM's output for backward replay.
+        if (
+            q_projection
+            not in config.activation_checkpoint.force_recompute_mm_shapes_by_fqns
+        ):
+            config.activation_checkpoint.force_recompute_mm_shapes_by_fqns.append(
+                q_projection
+            )
+    return q_projection
 
 
 def deepseek_v3_debugmodel() -> Trainer.Config:
@@ -173,6 +364,51 @@ def deepseek_v3_16b() -> Trainer.Config:
     )
 
 
+def deepseek_v3_16b_varlen() -> Trainer.Config:
+    """Build DSV3 16B with fixed-shape FA4 varlen attention.
+
+    Returns:
+        No-compile configuration compatible with full-step CUDA graph replay.
+    """
+    config = deepseek_v3_16b()
+    config.model_spec = model_registry("16B", attn_backend="varlen")
+    _set_varlen_max_num_documents(config)
+    config.training.disable_cuda_graphs = False
+    config.compile.enable = False
+    return config
+
+
+def deepseek_v3_16b_dist_moe_bf16() -> Trainer.Config:
+    """Build DSV3 16B with BF16-compute DistMoE and full CUDA graphs.
+
+    Returns:
+        Standard Trainer configuration with FP32 persistent state and BF16
+        FSDP compute parameters.
+    """
+    from torchtitan.models.common.dist_moe import DistMoeBackendConfig
+
+    return _enable_dist_moe(
+        deepseek_v3_16b_varlen(),
+        "16B",
+        DistMoeBackendConfig(),
+    )
+
+
+def deepseek_v3_16b_dist_moe_mxfp8() -> Trainer.Config:
+    """Build DSV3 16B with MXFP8 DistMoE and dense GEMMs.
+
+    Returns:
+        Standard Trainer MXFP8 configuration with FP32 persistent state and
+        BF16 FSDP inputs to weight quantization.
+    """
+    return _enable_dist_moe(
+        deepseek_v3_16b_varlen(),
+        "16B",
+        _mxfp8_dist_moe_backend(),
+        quantize_dense=True,
+    )
+
+
 def deepseek_v3_16b_hybridep() -> Trainer.Config:
     config = deepseek_v3_16b()
     config.model_spec = model_registry(
@@ -201,24 +437,6 @@ def deepseek_v3_16b_minimal_async_ep() -> Trainer.Config:
         pipeline_parallel_degree=1,
         expert_parallel_degree=1,
         enable_sequence_parallel=False,
-    )
-    config.training.disable_cuda_graphs = False
-    return config
-
-
-def deepseek_v3_16b_dist_moe_bf16() -> Trainer.Config:
-    """Build DSV3 16B with BF16 DistMoE routed experts."""
-    from torchtitan.models.common.dist_moe import DistMoeBackendConfig
-
-    config = deepseek_v3_16b()
-    config.model_spec = model_registry(
-        "16B",
-        attn_backend="flex",
-        moe_backend="dist_moe",
-        dist_moe=DistMoeBackendConfig(
-            max_routing_imbalance_factor=1.25,
-            vmm_host_scratch_imbalance_factor=None,
-        ),
     )
     config.training.disable_cuda_graphs = False
     return config
@@ -260,6 +478,51 @@ def deepseek_v3_671b() -> Trainer.Config:
         checkpoint=CheckpointManager.Config(interval=500),
         activation_checkpoint=SelectiveAC.Config(),
         compile=CompileConfig(enable=True, components=["loss"]),
+    )
+
+
+def deepseek_v3_671b_varlen() -> Trainer.Config:
+    """Build DSV3 671B with fixed-shape FA4 varlen attention.
+
+    Returns:
+        No-compile configuration compatible with full-step CUDA graph replay.
+    """
+    config = deepseek_v3_671b()
+    config.model_spec = model_registry("671B", attn_backend="varlen")
+    _set_varlen_max_num_documents(config)
+    config.training.disable_cuda_graphs = False
+    config.compile.enable = False
+    return config
+
+
+def deepseek_v3_671b_dist_moe_bf16() -> Trainer.Config:
+    """Build DSV3 671B with BF16-compute DistMoE and full CUDA graphs.
+
+    Returns:
+        Standard Trainer configuration with FP32 persistent state and BF16
+        FSDP compute parameters.
+    """
+    from torchtitan.models.common.dist_moe import DistMoeBackendConfig
+
+    return _enable_dist_moe(
+        deepseek_v3_671b_varlen(),
+        "671B",
+        DistMoeBackendConfig(),
+    )
+
+
+def deepseek_v3_671b_dist_moe_mxfp8() -> Trainer.Config:
+    """Build DSV3 671B with MXFP8 DistMoE and dense GEMMs.
+
+    Returns:
+        Standard Trainer MXFP8 configuration with FP32 persistent state and
+        BF16 FSDP inputs to weight quantization.
+    """
+    return _enable_dist_moe(
+        deepseek_v3_671b_varlen(),
+        "671B",
+        _mxfp8_dist_moe_backend(),
+        quantize_dense=True,
     )
 
 

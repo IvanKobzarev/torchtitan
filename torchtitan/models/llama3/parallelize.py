@@ -75,6 +75,7 @@ def parallelize_llama(
         reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
         dp_mesh_dims=dp_mesh_dims,
         enable_symm_mem=parallelism.enable_fsdp_symm_mem,
+        symm_mem_policy=parallelism.fsdp_symm_mem_policy,
     )
 
     return model
