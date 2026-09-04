@@ -442,9 +442,7 @@ class TestCODAFlexGemmPass(TestCase):
         other = graph.placeholder("other")
         other.meta["val"] = alias
         self.assertTrue(
-            coda_passes._flex_gemm_body_has_aliasing(
-                (placeholder, other), (value + 1,)
-            )
+            coda_passes._flex_gemm_body_has_aliasing((placeholder, other), (value + 1,))
         )
 
     def test_structural_patterns_do_not_require_module_fqns(self):
@@ -1407,9 +1405,7 @@ class TestCODAFlexGemmPass(TestCase):
         )
         gm = make_fx(_BackwardCast(True))(*inputs)
         _tag_graph(gm, ["layers.0.attention.wo"], backward=True)
-        benchmark_region = mock.Mock(
-            return_value=CompileTimeBenchmarkResult(2.0, 1.0)
-        )
+        benchmark_region = mock.Mock(return_value=CompileTimeBenchmarkResult(2.0, 1.0))
 
         clear_compile_time_benchmark_cache()
         with (
@@ -1662,9 +1658,9 @@ class TestCODAFlexGemmPass(TestCase):
             summary,
             """CODA benchmark results for B_linear_dw_bf16_to_fp32: candidates=2, applied=1, rejected=1 (slower=1, failed=0)
   APPLIED (1):
-    candidate _to_copy: region 0: eager=2000.0 us, FlexGEMM=1000.0 us, speedup=2.000x, cache=miss
+    candidate _to_copy: region 0: baseline=2000.0 us, FlexGEMM=1000.0 us, speedup=2.000x, cache=miss
   REJECTED (1):
-    candidate _to_copy_1: region 0: eager=1000.0 us, FlexGEMM=2000.0 us, speedup=0.500x, cache=miss; FlexGEMM was not faster for every changed region""",  # noqa: B950
+    candidate _to_copy_1: region 0: baseline=1000.0 us, FlexGEMM=2000.0 us, speedup=0.500x, cache=miss; FlexGEMM did not clear every changed region's profitability threshold""",  # noqa: B950
         )
         trace.assert_called_once()
         self.assertEqual(trace.call_args.args, ("artifact",))
