@@ -344,10 +344,18 @@ class TestCompileTimeBenchmark(TestCase):
         self.assertFalse(benchmarker.accepts(CompileTimeBenchmarkResult(1.0, 0.99)))
         self.assertTrue(benchmarker.accepts(CompileTimeBenchmarkResult(1.0, 0.95)))
 
-    def test_benchmark_region_compares_eager_original(self):
+        guarded = CompileTimeBenchmarker(
+            minimum_speedup=1.02,
+            minimum_savings_ms=0.1,
+        )
+        self.assertFalse(guarded.accepts(CompileTimeBenchmarkResult(1.0, 0.95)))
+        self.assertTrue(guarded.accepts(CompileTimeBenchmarkResult(1.0, 0.85)))
+
+    def test_benchmark_region_compares_compiled_original(self):
         output = torch.ones(2)
         baseline = mock.Mock(return_value=output)
         candidate = mock.Mock()
+        compiled_baseline = mock.Mock(return_value=output.clone())
         compiled_candidate = mock.Mock(return_value=output.clone())
         baseline_input = mock.Mock(device=torch.device("cuda:0"))
         candidate_input = mock.Mock(device=torch.device("cuda:0"))
@@ -373,28 +381,42 @@ class TestCompileTimeBenchmark(TestCase):
             mock.patch.object(
                 torch,
                 "compile",
-                return_value=compiled_candidate,
+                side_effect=(compiled_baseline, compiled_candidate),
             ) as compile_mock,
             mock.patch.object(torch.cuda, "empty_cache"),
         ):
             result = benchmarker.benchmark_region(baseline, (), candidate, ())
 
-        compile_mock.assert_called_once_with(
-            candidate,
-            backend="inductor",
-            fullgraph=True,
-            mode="max-autotune-no-cudagraphs",
+        self.assertEqual(compile_mock.call_count, 2)
+        compile_mock.assert_has_calls(
+            (
+                mock.call(
+                    baseline,
+                    backend="inductor",
+                    fullgraph=True,
+                    mode="max-autotune-no-cudagraphs",
+                ),
+                mock.call(
+                    candidate,
+                    backend="inductor",
+                    fullgraph=True,
+                    mode="max-autotune-no-cudagraphs",
+                ),
+            )
         )
-        self.assertEqual(baseline.call_count, 2)
-        self.assertEqual(compiled_candidate.call_count, 2)
+        self.assertEqual(baseline.call_count, 1)
+        self.assertEqual(compiled_baseline.call_count, 6)
+        self.assertEqual(compiled_candidate.call_count, 6)
         baseline.assert_called_with(baseline_input)
+        compiled_baseline.assert_called_with(baseline_input)
         compiled_candidate.assert_called_with(candidate_input)
-        self.assertEqual(measurements, [(20, "median"), (20, "median")])
-        self.assertEqual(result, CompileTimeBenchmarkResult(2.0, 1.0))
+        self.assertEqual(measurements, [(4, "median")] * 10)
+        self.assertEqual(result, CompileTimeBenchmarkResult(1.0, 1.0))
 
     def test_benchmark_region_rejects_incorrect_output(self):
         baseline = mock.Mock(return_value=torch.ones(2))
         candidate = mock.Mock()
+        compiled_baseline = mock.Mock(return_value=torch.ones(2))
         compiled_candidate = mock.Mock(return_value=torch.zeros(2))
         input_tensor = mock.Mock(device=torch.device("cuda:0"))
         benchmarker = CompileTimeBenchmarker()
@@ -405,7 +427,11 @@ class TestCompileTimeBenchmark(TestCase):
                 "_realize_paired_inputs",
                 return_value=((input_tensor,), (input_tensor,)),
             ),
-            mock.patch.object(torch, "compile", return_value=compiled_candidate),
+            mock.patch.object(
+                torch,
+                "compile",
+                side_effect=(compiled_baseline, compiled_candidate),
+            ),
             mock.patch.object(compile_time_benchmark, "do_bench") as do_bench,
             mock.patch.object(torch.cuda, "empty_cache"),
             self.assertRaises(AssertionError),

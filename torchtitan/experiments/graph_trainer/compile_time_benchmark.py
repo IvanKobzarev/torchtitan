@@ -12,6 +12,7 @@ import fcntl
 import hashlib
 import json
 import os
+import statistics
 from collections import Counter, defaultdict
 from collections.abc import Callable, Hashable, Iterable
 from dataclasses import dataclass, field
@@ -44,7 +45,7 @@ class CompileTimeBenchmarkResult:
 
 @dataclass(frozen=True)
 class RewriteBenchmarkRegion:
-    """Equivalent eager and candidate graphs with positional tensor interfaces."""
+    """Equivalent baseline and candidate graphs with positional tensor interfaces."""
 
     baseline: GraphModule
     baseline_inputs: tuple[Node, ...]
@@ -102,6 +103,9 @@ BenchmarkCandidateFn = Callable[
     GraphModule,
 ]
 RewriteFinalizerFn = Callable[[GraphModule], GraphModule]
+
+
+_BENCHMARK_CONTRACT_VERSION = 3
 
 
 def _hint_int(value: int | torch.SymInt) -> int:
@@ -511,12 +515,14 @@ class CompileTimeBenchmarker:
         atol: float = 0.15,
         rtol: float = 0.05,
         minimum_speedup: float = 1.02,
+        minimum_savings_ms: float = 0.0,
         cache_path: str | os.PathLike[str] | None = None,
     ) -> None:
         self.duration_ms = duration_ms
         self.atol = atol
         self.rtol = rtol
         self.minimum_speedup = minimum_speedup
+        self.minimum_savings_ms = minimum_savings_ms
         self.cache_path = Path(cache_path) if cache_path is not None else None
         self._cache: dict[tuple[Any, ...], CompileTimeBenchmarkResult] = {}
 
@@ -524,7 +530,10 @@ class CompileTimeBenchmarker:
         self._cache.clear()
 
     def accepts(self, result: CompileTimeBenchmarkResult) -> bool:
-        return result.speedup >= self.minimum_speedup
+        return (
+            result.speedup >= self.minimum_speedup
+            and result.baseline_ms - result.candidate_ms >= self.minimum_savings_ms
+        )
 
     def _persistent_cache_path(self) -> Path | None:
         if self.cache_path is not None:
@@ -630,6 +639,12 @@ class CompileTimeBenchmarker:
         baseline_inputs, candidate_inputs = _realize_paired_inputs(
             baseline_input_nodes, candidate_input_nodes
         )
+        compiled_baseline = torch.compile(
+            baseline,
+            backend="inductor",
+            fullgraph=True,
+            mode="max-autotune-no-cudagraphs",
+        )
         compiled_candidate = torch.compile(
             candidate,
             backend="inductor",
@@ -638,23 +653,43 @@ class CompileTimeBenchmarker:
         )
         try:
             expected = baseline(*baseline_inputs)
-            actual = compiled_candidate(*candidate_inputs)
+            baseline_actual = compiled_baseline(*baseline_inputs)
+            candidate_actual = compiled_candidate(*candidate_inputs)
             torch.testing.assert_close(
-                actual,
+                baseline_actual,
                 expected,
                 atol=self.atol,
                 rtol=self.rtol,
             )
-            baseline_ms = do_bench(
-                lambda: baseline(*baseline_inputs),
-                rep=self.duration_ms,
-                return_mode="median",
+            torch.testing.assert_close(
+                candidate_actual,
+                expected,
+                atol=self.atol,
+                rtol=self.rtol,
             )
-            candidate_ms = do_bench(
-                lambda: compiled_candidate(*candidate_inputs),
-                rep=self.duration_ms,
-                return_mode="median",
-            )
+            samples: dict[str, list[float]] = {"baseline": [], "candidate": []}
+            functions = {
+                "baseline": lambda: compiled_baseline(*baseline_inputs),
+                "candidate": lambda: compiled_candidate(*candidate_inputs),
+            }
+            rounds = 5
+            duration_ms = max(1, self.duration_ms // rounds)
+            for round_index in range(rounds):
+                order = (
+                    ("baseline", "candidate")
+                    if round_index % 2 == 0
+                    else ("candidate", "baseline")
+                )
+                for name in order:
+                    samples[name].append(
+                        do_bench(
+                            functions[name],
+                            rep=duration_ms,
+                            return_mode="median",
+                        )
+                    )
+            baseline_ms = statistics.median(samples["baseline"])
+            candidate_ms = statistics.median(samples["candidate"])
             return CompileTimeBenchmarkResult(baseline_ms, candidate_ms)
         finally:
             torch.cuda.empty_cache()
@@ -685,6 +720,7 @@ class CompileTimeBenchmarker:
         results = []
         for region in regions:
             cache_key = (
+                _BENCHMARK_CONTRACT_VERSION,
                 namespace,
                 region.signature,
                 _graph_fingerprint(region.baseline),
@@ -722,7 +758,15 @@ class CompileTimeBenchmarker:
         return tuple(results)
 
 
-_COMPILE_TIME_BENCHMARKER = CompileTimeBenchmarker()
+_COMPILE_TIME_BENCHMARKER = CompileTimeBenchmarker(
+    duration_ms=int(
+        os.environ.get("TORCHTITAN_COMPILE_TIME_BENCHMARK_DURATION_MS", "20")
+    ),
+    minimum_savings_ms=float(
+        os.environ.get("TORCHTITAN_COMPILE_TIME_BENCHMARK_MINIMUM_SAVINGS_US", "0")
+    )
+    / 1000
+)
 
 
 def clear_compile_time_benchmark_cache() -> None:
@@ -736,7 +780,7 @@ def benchmark_region(
     candidate: GraphModule,
     candidate_input_nodes: tuple[Node, ...],
 ) -> CompileTimeBenchmarkResult:
-    """Benchmark one explicit eager/candidate region pair."""
+    """Benchmark one explicit compiled-baseline/candidate region pair."""
     return _COMPILE_TIME_BENCHMARKER.benchmark_region(
         baseline,
         baseline_input_nodes,
@@ -763,7 +807,7 @@ def _log_benchmark_summary(
 
     def details(application: _BenchmarkApplication, *, cache: str | None = None):
         result_details = [
-            f"region {index}: eager={result.baseline_ms * 1000:.1f} us, "
+            f"region {index}: baseline={result.baseline_ms * 1000:.1f} us, "
             f"{candidate_label}={result.candidate_ms * 1000:.1f} us, "
             f"speedup={result.speedup:.3f}x, "
             f"cache={cache or ('hit' if result.cache_hit else 'miss')}"
@@ -850,7 +894,7 @@ def apply_benchmarked_rewrites(
     finalize: RewriteFinalizerFn | None = None,
     batch_candidates: bool = False,
 ) -> GraphModule:
-    """Independently retain each rewrite candidate that is faster than eager."""
+    """Independently retain each rewrite candidate that clears the benchmark gate."""
     if not torch.cuda.is_available():
         logger.warning(
             f"{rewrite_name} compile-time benchmark requires CUDA; "
@@ -927,8 +971,8 @@ def apply_benchmarked_rewrites(
                             results,
                             None
                             if use_candidate
-                            else f"{candidate_label} was not faster for every "
-                            "changed region",
+                            else f"{candidate_label} did not clear every changed "
+                            "region's profitability threshold",
                         )
                     )
                     if use_candidate:
@@ -1050,7 +1094,8 @@ def apply_benchmarked_rewrites(
                     results,
                     None
                     if use_candidate
-                    else f"{candidate_label} was not faster for every changed region",
+                    else f"{candidate_label} did not clear every changed region's "
+                    "profitability threshold",
                 )
             )
 
