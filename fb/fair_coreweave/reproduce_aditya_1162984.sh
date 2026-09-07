@@ -46,6 +46,9 @@ if [ "$sync_source" -eq 1 ] && [ "$dry_run" -eq 0 ]; then
   env "${common_env[@]}" "$script_dir/cw.sh" sync
   env "${common_env[@]}" "$script_dir/cw.sh" setup-overlay
 fi
+if [ "$dry_run" -eq 0 ]; then
+  env "${common_env[@]}" "$script_dir/cw.sh" verify-runtime
+fi
 
 submit_options=(
   --nodes 64

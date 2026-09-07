@@ -21,6 +21,7 @@ stack
   sync                 rsync the configured source trees to the cluster
   setup-env            create or refresh the cluster venv
   setup-overlay        install external TorchTitan-only Python dependencies
+  verify-runtime       check imports and stack-specific PyTorch operators
   build-torch          build PyTorch from the synced source on a GB300 node  [TODO: unverified]
   build-ao             build torchao's extensions for sm_${CW_CUDA_ARCH//./}         [TODO: unverified]
 
@@ -192,6 +193,27 @@ cmd_setup_overlay() {
     "CW_PYTHON_OVERLAY='$CW_PYTHON_OVERLAY'" \
     "CW_OVERLAY_REQUIREMENTS='$(cw_workdir)/fb/fair_coreweave/requirements-runtime-overlay.txt'" \
     bash
+}
+
+cmd_verify_runtime() {
+  cw_require_master
+  cw_resolve_paths
+  local pythonpath compat
+  pythonpath="$(cw_remote_pythonpath)"
+  compat="$CW_VENV/lib/cuda-compat-13-1"
+  cw_bash "cd '$(cw_workdir)' &&
+    PYTHONPATH='$pythonpath' \
+    LD_LIBRARY_PATH='$CW_VENV/lib' \
+    LD_PRELOAD='$compat/libcuda.so.1:$compat/libnvidia-ptxjitcompiler.so.1' \
+    '$CW_VENV/bin/python' -c '
+import grain.python
+import torch
+import torchtitan
+assert hasattr(torch, \"_scaled_addmm_\"), \"torch._scaled_addmm_ is missing\"
+assert hasattr(torch, \"_mm_with_compute_mode\"), \"torch._mm_with_compute_mode is missing\"
+print(\"torch\", torch.__version__)
+print(\"TorchTitan and runtime operator checks passed\")
+'"
 }
 
 # Compilation needs a GB300 so nvcc and torch see the real compute capability.
@@ -496,6 +518,7 @@ case "${1:-}" in
   sync)        shift; cmd_sync ;;
   setup-env)   shift; cmd_setup_env ;;
   setup-overlay) shift; cmd_setup_overlay ;;
+  verify-runtime) shift; cmd_verify_runtime ;;
   build-torch) shift; cmd_build_torch ;;
   build-ao)    shift; cmd_build_ao ;;
   setup-bridge) shift; cmd_setup_bridge ;;
