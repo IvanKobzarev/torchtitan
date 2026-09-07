@@ -20,6 +20,7 @@ connection
 stack
   sync                 rsync the configured source trees to the cluster
   setup-env            create or refresh the cluster venv
+  setup-overlay        install external TorchTitan-only Python dependencies
   build-torch          build PyTorch from the synced source on a GB300 node  [TODO: unverified]
   build-ao             build torchao's extensions for sm_${CW_CUDA_ARCH//./}         [TODO: unverified]
 
@@ -181,6 +182,16 @@ cmd_setup_env() {
     "CW_REQUIREMENTS='$(cw_workdir)/requirements.txt'" \
     bash
   cw_compile_trees
+}
+
+cmd_setup_overlay() {
+  cw_require_master
+  cw_resolve_paths
+  cw_run_remote_script setup_runtime_overlay.sh \
+    "CW_VENV='$CW_VENV'" \
+    "CW_PYTHON_OVERLAY='$CW_PYTHON_OVERLAY'" \
+    "CW_OVERLAY_REQUIREMENTS='$(cw_workdir)/fb/fair_coreweave/requirements-runtime-overlay.txt'" \
+    bash
 }
 
 # Compilation needs a GB300 so nvcc and torch see the real compute capability.
@@ -484,6 +495,7 @@ case "${1:-}" in
   sh)          shift; cw_require_master; cw_bash "$*" ;;
   sync)        shift; cmd_sync ;;
   setup-env)   shift; cmd_setup_env ;;
+  setup-overlay) shift; cmd_setup_overlay ;;
   build-torch) shift; cmd_build_torch ;;
   build-ao)    shift; cmd_build_ao ;;
   setup-bridge) shift; cmd_setup_bridge ;;

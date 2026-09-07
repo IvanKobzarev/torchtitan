@@ -208,6 +208,7 @@ cw_expand() {
 cw_resolve_paths() {
   CW_REMOTE_ROOT="$(cw_expand "$CW_REMOTE_ROOT")"
   CW_VENV="$(cw_expand "$CW_VENV")"
+  CW_PYTHON_OVERLAY="$(cw_expand "$CW_PYTHON_OVERLAY")"
   CW_LOG_DIR="$(cw_expand "$CW_LOG_DIR")"
   CW_OUTPUT_DIR="$(cw_expand "$CW_OUTPUT_DIR")"
   CW_CONTAINER_DIR="$(cw_expand "$CW_CONTAINER_DIR")"
@@ -222,6 +223,7 @@ cw_remote_pythonpath() {
     name="${entry##*:}"
     parts+=("$CW_REMOTE_ROOT/$name")
   done
+  parts+=("$CW_PYTHON_OVERLAY")
   local IFS=:
   printf '%s' "${parts[*]}"
 }

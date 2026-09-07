@@ -23,6 +23,13 @@ export PYTHONPATH="@PYTHONPATH@"
 export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS=8
 export PYTORCH_ALLOC_CONF=expandable_segments:True
+export LD_LIBRARY_PATH="@VENV@/lib:${LD_LIBRARY_PATH:-}"
+
+cuda_compat="@VENV@/lib/cuda-compat-13-1"
+if [ -d "$cuda_compat" ]; then
+  export LD_PRELOAD="$cuda_compat/libcuda.so.1:$cuda_compat/libnvidia-ptxjitcompiler.so.1"
+  export TRITON_LIBCUDA_PATH="$cuda_compat"
+fi
 
 # Ranks must not write .pyc back to the shared home. Concurrent writers there
 # hand out stale NFS file handles; it starts biting around 16 ranks.

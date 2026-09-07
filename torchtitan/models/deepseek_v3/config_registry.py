@@ -409,6 +409,37 @@ def deepseek_v3_16b_dist_moe_mxfp8() -> Trainer.Config:
     )
 
 
+def deepseek_v3_16b_dist_moe_mxfp8_spmd_mlperf() -> Trainer.Config:
+    """Build the 16B eager SPMD recipe with MLPerf-style packing."""
+    config = _enable_dist_moe(
+        deepseek_v3_16b_varlen(),
+        "16B",
+        _mxfp8_dist_moe_backend(
+            device_memory_budget_bytes="maximum_useful",
+            vmm_host_scratch_imbalance_factor=None,
+        ),
+        quantize_dense=True,
+    )
+    config.training.num_tokens_per_microbatch_per_dp_rank = 4 * 4096
+    config.training.num_tokens_per_train_step = 512 * 4096
+    config.activation_checkpoint = None
+
+    parallelism = config.parallelism
+    parallelism.data_parallel_replicate_degree = 1
+    parallelism.data_parallel_shard_degree = -1
+    parallelism.tensor_parallel_degree = 1
+    parallelism.context_parallel_degree = 1
+    parallelism.pipeline_parallel_degree = 1
+    parallelism.expert_parallel_degree = 8
+    parallelism.enable_sequence_parallel = True
+    parallelism.fsdp_reshard_after_forward = "never"
+
+    enable_fused_swiglu(config)
+    enable_mlperf_packing(config)
+    config.debug.moe_force_load_balance = True
+    return config
+
+
 def deepseek_v3_16b_hybridep() -> Trainer.Config:
     config = deepseek_v3_16b()
     config.model_spec = model_registry(

@@ -24,6 +24,7 @@
 # Everything below lives on the shared home filesystem, visible from every node.
 : "${CW_REMOTE_ROOT:=\$HOME/cw}"
 : "${CW_VENV:=\$HOME/venvs/cw}"
+: "${CW_PYTHON_OVERLAY:=\$HOME/cw/overlays/torchtitan-public}"
 : "${CW_LOG_DIR:=\$HOME/cw/logs}"
 
 # Job outputs (traces, memory snapshots, checkpoints) live outside the synced
@@ -42,7 +43,7 @@
 # wheel       install the prebuilt CW_TORCH_WHEEL (only if it matches the cluster ABI)
 : "${CW_TORCH_MODE:=nightly}"
 : "${CW_TORCH_NIGHTLY_INDEX:=https://download.pytorch.org/whl/nightly/cu130}"
-: "${CW_TORCH_SRC:=/data/users/$USER/mywork2/pytorch}"
+: "${CW_TORCH_SRC:=/data/users/$USER/fbsource/fbcode/caffe2}"
 : "${CW_TORCH_WHEEL:=}"
 
 # ------------------------------------------------------------ source trees ---
@@ -50,7 +51,7 @@
 # Pure Python trees. Synced as-is and prepended to PYTHONPATH in the job, in the
 # order listed. Never pip-install these too; a site-packages copy shadows them.
 #   "<local path>:<name under CW_REMOTE_ROOT>"
-: "${CW_TORCHTITAN_SRC:=/data/users/$USER/mywork2/torchtitan}"
+: "${CW_TORCHTITAN_SRC:=/home/$USER/local/c/torchtitan}"
 : "${CW_DIST_MOE_SRC:=/data/users/$USER/fbsource/genai/msl/dist_moe}"
 CW_PYTHONPATH_TREES=(
   "$CW_TORCHTITAN_SRC:torchtitan"
@@ -60,7 +61,7 @@ CW_PYTHONPATH_TREES=(
 # Trees with native code. Synced without build artifacts, then compiled on a
 # GB300 node by `cw.sh build-ao`. Also prepended to PYTHONPATH.
 CW_BUILD_TREES=(
-  "/data/users/$USER/fbsource/fbcode/pytorch/ao:ao"
+  "/home/$USER/fbsource/fbcode/pytorch/ao:ao"
 )
 
 # torchao vendors cutlass as a submodule that fbsource does not materialize, so
@@ -119,5 +120,5 @@ CW_RSYNC_EXCLUDES=(
   "*.so" "*.o" "*.a" "*.dylib"
   "build/" "dist/" "*.egg-info" ".eggs"
   ".pytest_cache" ".mypy_cache" ".ruff_cache"
-  "outputs/" "wandb/" "*.pt" "*.safetensors"
+  "agent_space/" "outputs/" "wandb/" "*.pt" "*.safetensors"
 )

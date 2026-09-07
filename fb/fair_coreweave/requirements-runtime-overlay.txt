@@ -1,0 +1,7 @@
+# Dependencies used by the public TorchTitan data loader but absent from the
+# internal immutable runtime. Keep this overlay free of torch and torchao.
+grain==0.2.18
+array-record==0.8.3
+cloudpickle==3.1.2
+etils==1.14.0
+portpicker==1.6.0

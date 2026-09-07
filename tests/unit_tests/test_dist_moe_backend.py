@@ -44,6 +44,7 @@ from torchtitan.models.deepseek_v3.config_registry import (
     attention_batch_size,
     deepseek_v3_16b_dist_moe_bf16,
     deepseek_v3_16b_dist_moe_mxfp8,
+    deepseek_v3_16b_dist_moe_mxfp8_spmd_mlperf,
     deepseek_v3_16b_minimal_async_ep,
     deepseek_v3_671b_dist_moe_bf16,
     deepseek_v3_671b_dist_moe_mxfp8,
@@ -703,14 +704,7 @@ class DistMoeBackendTest(unittest.TestCase):
         self.assertEqual(config.dataloader.num_prefetch_batches, original_prefetch)
 
     def test_mxfp8_spmd_mlperf_config(self) -> None:
-        config = deepseek_v3_16b_dist_moe_mxfp8()
-        config.training.num_tokens_per_microbatch_per_dp_rank = 4 * 4096
-        config.training.num_tokens_per_train_step = 512 * 4096
-        config.activation_checkpoint = None
-        config.parallelism.data_parallel_shard_degree = -1
-        config.parallelism.expert_parallel_degree = 8
-        config.parallelism.fsdp_reshard_after_forward = "never"
-        enable_mlperf_packing(config)
+        config = deepseek_v3_16b_dist_moe_mxfp8_spmd_mlperf()
 
         self.assertEqual(
             config.training.num_tokens_per_microbatch_per_dp_rank,
