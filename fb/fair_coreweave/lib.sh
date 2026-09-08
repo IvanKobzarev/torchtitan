@@ -215,11 +215,18 @@ cw_resolve_paths() {
   CW_BRIDGE_REPO="$(cw_expand "$CW_BRIDGE_REPO")"
 }
 
-# Space-separated remote PYTHONPATH entries, build trees first so a compiled
-# extension is never shadowed by a pure-Python copy of the same package.
+# Space-separated remote PYTHONPATH entries. Immutable runtimes already contain
+# their matching compiled build trees, so exposing a synced source-only copy
+# would shadow native extensions such as torchao._C_mxfp8.
 cw_remote_pythonpath() {
   local entry name parts=()
-  for entry in "${CW_BUILD_TREES[@]}" "${CW_PYTHONPATH_TREES[@]}"; do
+  if [[ "$CW_VENV" != "$CW_REMOTE_ROOT"/runtimes/*/conda ]]; then
+    for entry in "${CW_BUILD_TREES[@]}"; do
+      name="${entry##*:}"
+      parts+=("$CW_REMOTE_ROOT/$name")
+    done
+  fi
+  for entry in "${CW_PYTHONPATH_TREES[@]}"; do
     name="${entry##*:}"
     parts+=("$CW_REMOTE_ROOT/$name")
   done
