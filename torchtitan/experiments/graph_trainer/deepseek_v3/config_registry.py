@@ -193,6 +193,9 @@ def graph_trainer_deepseek_v3_16b_dist_moe_mxfp8_mlperf_16gpu() -> (
     config.training.num_tokens_per_train_step = 256 * 4096
     config.activation_checkpoint = None
     config.compile.numerics_changing_optim = True
+    config.dataloader.dataset = ConcatThenSplitPackingConfig(
+        dataset=DATASETS["c4_test"]
+    )
 
     parallelism = config.parallelism
     parallelism.data_parallel_replicate_degree = 1
@@ -299,6 +302,9 @@ def _graph_trainer_deepseek_v3_671b_dist_moe_mxfp8_mlperf_spmd(
     config.training.num_tokens_per_train_step = 4096 * 4096
     config.activation_checkpoint = None
     config.compile.numerics_changing_optim = True
+    config.dataloader.dataset = ConcatThenSplitPackingConfig(
+        dataset=DATASETS["c4_test"]
+    )
 
     parallelism = config.parallelism
     parallelism.data_parallel_replicate_degree = 1

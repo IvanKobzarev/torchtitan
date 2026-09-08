@@ -209,9 +209,15 @@ cmd_verify_runtime() {
 import grain.python
 import torch
 import torchtitan
+from torchtitan.experiments.graph_trainer.deepseek_v3.config_registry import (
+    graph_trainer_deepseek_v3_16b_dist_moe_mxfp8_mlperf_16gpu,
+)
+
 assert hasattr(torch.Tensor, \"_scaled_addmm_\"), \"Tensor._scaled_addmm_ is missing\"
 assert hasattr(torch.ops.aten, \"_scaled_addmm_\"), \"aten._scaled_addmm_ is missing\"
 assert hasattr(torch, \"_mm_with_compute_mode\"), \"torch._mm_with_compute_mode is missing\"
+config = graph_trainer_deepseek_v3_16b_dist_moe_mxfp8_mlperf_16gpu()
+assert config.parallelism.data_parallel_shard_degree == 16
 print(\"torch\", torch.__version__)
 print(\"TorchTitan and runtime operator checks passed\")
 '"

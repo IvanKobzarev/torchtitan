@@ -63,9 +63,9 @@ fi
 env "${common_env[@]}" "$script_dir/cw.sh" submit "${submit_options[@]}" -- \
   --module graph_trainer.deepseek_v3 \
   --config graph_trainer_deepseek_v3_671b_dist_moe_mxfp8_mlperf_64gpu \
-  --training.local-batch-size 1 \
-  --training.global-batch-size 4096 \
-  --training.seq-len 4096 \
+  --training.num-tokens-per-microbatch-per-dp-rank 4096 \
+  --training.num-tokens-per-train-step 16777216 \
+  --training.max-context-length 4096 \
   --training.steps 22 \
   --parallelism.data-parallel-replicate-degree 1 \
   --parallelism.data-parallel-shard-degree 256 \
@@ -86,7 +86,6 @@ env "${common_env[@]}" "$script_dir/cw.sh" submit "${submit_options[@]}" -- \
   --training.no-disable-cuda-graphs \
   --compile.require-cudagraph \
   --optimizer.implementation fused_opt_states_bf16 \
-  --dataloader.dataset c4_test \
   --hf-assets-path ./tests/assets/tokenizer \
   --metrics.log-freq 1 \
   --metrics.no-enable-tensorboard \

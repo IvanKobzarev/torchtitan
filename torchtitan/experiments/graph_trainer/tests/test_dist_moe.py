@@ -27,6 +27,7 @@ from torchtitan.experiments.graph_trainer.deepseek_v3.config_registry import (
     graph_trainer_deepseek_v3_671b_dist_moe_mxfp8_mlperf_64gpu,
 )
 from torchtitan.experiments.graph_trainer.trainer import GraphTrainer
+from torchtitan.hf_datasets.text_datasets import DATASETS
 from torchtitan.models.common.attention import VarlenAttention
 from torchtitan.models.common.dist_moe import DistMoeRoutedExperts
 from torchtitan.models.common.router_gate import RouterGateLinear
@@ -254,6 +255,7 @@ class DistMoeGraphTrainerConfigTest(unittest.TestCase):
         self.assertEqual(1, config.parallelism.context_parallel_degree)
         self.assertEqual(1, config.parallelism.pipeline_parallel_degree)
         self.assertEqual(64, config.parallelism.expert_parallel_degree)
+        self.assertIs(config.dataloader.dataset.dataset, DATASETS["c4_test"])
         attentions = [
             attention for _, attention, _, _ in config.traverse(VarlenAttention.Config)
         ]
@@ -293,6 +295,7 @@ class DistMoeGraphTrainerConfigTest(unittest.TestCase):
         self.assertEqual(1, config.parallelism.pipeline_parallel_degree)
         self.assertEqual(4, config.parallelism.expert_parallel_degree)
         self.assertEqual("never", config.parallelism.fsdp_reshard_after_forward)
+        self.assertIs(config.dataloader.dataset.dataset, DATASETS["c4_test"])
         self.assertEqual(
             16,
             config.training.num_tokens_per_train_step
@@ -341,6 +344,7 @@ class DistMoeGraphTrainerConfigTest(unittest.TestCase):
         self.assertEqual(1, config.parallelism.context_parallel_degree)
         self.assertEqual(1, config.parallelism.pipeline_parallel_degree)
         self.assertEqual(64, config.parallelism.expert_parallel_degree)
+        self.assertIs(config.dataloader.dataset.dataset, DATASETS["c4_test"])
         data_parallel_degree = (
             config.parallelism.data_parallel_replicate_degree
             * config.parallelism.data_parallel_shard_degree
