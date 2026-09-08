@@ -543,6 +543,11 @@ defaults to `min(nodes, 16)` and rejects a node count that is not a multiple of
 the segment. Never ask for more than 16: a rack has 18 nodes but is rarely fully
 free, so larger segments may never schedule.
 
+The segment must contain every rank in a symmetric-memory communication group.
+In particular, EP64 on four-GPU nodes requires `--segment 16`; using segment 8
+splits an expert group across NVLink domains and makes remote symmetric-memory
+access invalid.
+
 | GPUs | Nodes | Segment |
 |---:|---:|---:|
 | 4 | 1 | 1 |
