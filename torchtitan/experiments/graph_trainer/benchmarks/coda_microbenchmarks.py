@@ -1123,8 +1123,7 @@ def _quack_autotune_cache_state() -> dict[Path, int]:
     if not cache_root.is_dir():
         return {}
     return {
-        path: path.stat().st_mtime_ns
-        for path in cache_root.rglob("*.autotune.json")
+        path: path.stat().st_mtime_ns for path in cache_root.rglob("*.autotune.json")
     }
 
 

@@ -664,10 +664,7 @@ def model_registry(
     post_parallelize_fn = None
     cleanup_fn = None
     if moe_backend == "dist_moe":
-        from torchtitan.models.common.dist_moe import (
-            cleanup_dist_moe,
-            setup_dist_moe,
-        )
+        from torchtitan.models.common.dist_moe import cleanup_dist_moe, setup_dist_moe
 
         post_parallelize_fn = setup_dist_moe
         cleanup_fn = cleanup_dist_moe

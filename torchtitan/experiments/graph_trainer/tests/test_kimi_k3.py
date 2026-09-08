@@ -94,9 +94,7 @@ class TestGraphTrainerKimiK3(TestCase):
         )
 
         config = graph_trainer_kimi_k3_15b_compute_bound()
-        self.assertEqual(
-            config.training.num_tokens_per_microbatch_per_dp_rank, 65536
-        )
+        self.assertEqual(config.training.num_tokens_per_microbatch_per_dp_rank, 65536)
         self.assertEqual(config.training.max_context_length, 4096)
         self.assertFalse(config.training.disable_cuda_graphs)
         self.assertEqual(config.parallelism.data_parallel_shard_degree, 2)
