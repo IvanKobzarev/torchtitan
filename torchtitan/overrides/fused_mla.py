@@ -751,11 +751,11 @@ class _FusedMLAQ(torch.autograd.Function):
         block_h: int,
         num_warps: int,
     ) -> torch.Tensor:
-        q_type = {"dp": spmd.S(0), "cp": spmd.S(1), "tp": spmd.S(2)}
-        positions_type = {"dp": spmd.S(0), "cp": spmd.S(1), "tp": spmd.R}
-        spmd.assert_type(q, q_type)
+        q_type = (spmd.V, spmd.PartitionSpec(None, ("dp", "cp"), "tp", None))
+        positions_type = (spmd.V, spmd.PartitionSpec(None, ("dp", "cp")))
+        spmd.assert_type(q, *q_type)
         spmd.assert_type(rope_cache_real, spmd.R)
-        spmd.assert_type(positions, positions_type)
+        spmd.assert_type(positions, *positions_type)
         output = _FusedMLAQ.apply(
             q,
             rope_cache_real,
@@ -764,7 +764,7 @@ class _FusedMLAQ(torch.autograd.Function):
             block_h,
             num_warps,
         )
-        spmd.assert_type(output, q_type)
+        spmd.assert_type(output, *q_type)
         return output
 
     @staticmethod
@@ -827,16 +827,13 @@ class _FusedMLAKV(torch.autograd.Function):
         backward_block_h: int,
         backward_num_warps: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        kv_type = {"dp": spmd.S(0), "cp": spmd.S(1), "tp": spmd.S(2)}
-        replicated_head_type = {
-            "dp": spmd.S(0),
-            "cp": spmd.S(1),
-            "tp": spmd.R,
-        }
-        spmd.assert_type(kv, kv_type)
-        spmd.assert_type(k_pe, replicated_head_type)
+        kv_type = (spmd.V, spmd.PartitionSpec(None, ("dp", "cp"), "tp", None))
+        k_pe_type = (spmd.V, spmd.PartitionSpec(None, ("dp", "cp"), None))
+        positions_type = (spmd.V, spmd.PartitionSpec(None, ("dp", "cp")))
+        spmd.assert_type(kv, *kv_type)
+        spmd.assert_type(k_pe, *k_pe_type)
         spmd.assert_type(rope_cache_real, spmd.R)
-        spmd.assert_type(positions, replicated_head_type)
+        spmd.assert_type(positions, *positions_type)
         k, v = _FusedMLAKV.apply(
             kv,
             k_pe,
@@ -848,8 +845,8 @@ class _FusedMLAKV(torch.autograd.Function):
             backward_block_h,
             backward_num_warps,
         )
-        spmd.assert_type(k, kv_type)
-        spmd.assert_type(v, kv_type)
+        spmd.assert_type(k, *kv_type)
+        spmd.assert_type(v, *kv_type)
         return k, v
 
     @staticmethod
@@ -1059,11 +1056,20 @@ class FusedMLAAttention(Attention):
         if not x.is_cuda:
             return super().forward(x, attention_masks, positions)
 
-        batch, seq_len, _ = x.size()
+        num_tokens = x.shape[0]
         if self.q_lora_rank == 0:
             q = self.wq(x)
         else:
             q = self.wq_b(self.q_norm(self.wq_a(x)))
+
+        with spmd.local():
+            q = q.view(num_tokens, -1, self.qk_head_dim)
+            if get_spmd_backend() == "spmd_types" and spmd.is_type_checking():
+                spmd.assert_type(
+                    q,
+                    spmd.V,
+                    spmd.PartitionSpec(("dp", "cp"), "tp", None),
+                )
 
         if positions is not None:
             _maybe_check_max_pos(
@@ -1071,19 +1077,12 @@ class FusedMLAAttention(Attention):
                 max_valid_pos=self.rope.cache.shape[0] - 1,
             )
         q = fused_mla_q(
-            q,
+            q.unsqueeze(0),
             self.rope.cache,
             positions,
             self.qk_nope_head_dim,
             self.kernel_config,
-        )
-        with spmd.local():
-            q = q.view(batch, seq_len, -1, self.qk_head_dim)
-            if get_spmd_backend() == "spmd_types":
-                spmd.assert_type(
-                    q,
-                    {"dp": spmd.S(0), "cp": spmd.S(1), "tp": spmd.S(2)},
-                )
+        ).squeeze(0)
 
         kv_down = self.wkv_a(x)
         kv_latent, k_pe = torch.split(
@@ -1094,25 +1093,26 @@ class FusedMLAAttention(Attention):
 
         kv = self.wkv_b(self.kv_norm(kv_latent))
         with spmd.local():
-            kv = kv.view(
-                batch,
-                seq_len,
-                -1,
-                self.qk_nope_head_dim + self.v_head_dim,
-            )
+            kv = kv.view(num_tokens, -1, self.qk_nope_head_dim + self.v_head_dim)
             k, v = fused_mla_kv(
-                kv,
-                k_pe,
+                kv.unsqueeze(0),
+                k_pe.unsqueeze(0),
                 self.rope.cache,
                 positions,
                 self.qk_nope_head_dim,
                 self.kernel_config,
             )
-            if get_spmd_backend() == "spmd_types" and not torch.compiler.is_compiling():
+            k, v = k.squeeze(0), v.squeeze(0)
+            if (
+                get_spmd_backend() == "spmd_types"
+                and spmd.is_type_checking()
+                and not torch.compiler.is_compiling()
+            ):
                 for tensor in (k, v):
                     spmd.assert_type(
                         tensor,
-                        {"dp": spmd.S(0), "cp": spmd.S(1), "tp": spmd.S(2)},
+                        spmd.V,
+                        spmd.PartitionSpec(("dp", "cp"), "tp", None),
                     )
 
         output = self.inner_attention(
@@ -1122,7 +1122,7 @@ class FusedMLAAttention(Attention):
             attention_masks=attention_masks,
             scale=self.softmax_scale,
         ).contiguous()
-        output = output.view(batch, seq_len, -1)
+        output = output.view(num_tokens, -1)
         return self.wo(output)
 
 

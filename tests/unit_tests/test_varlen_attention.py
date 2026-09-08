@@ -41,6 +41,34 @@ class TestPackedVarlenMetadata(unittest.TestCase):
 
 
 class TestPackedVarlenAttention(unittest.TestCase):
+    def test_dense_attention_preserves_value_head_dimension(self):
+        """MLA values may have a smaller head dimension than queries."""
+        num_tokens, num_heads = 8, 2
+        q_TNH = torch.randn(num_tokens, num_heads, 6)
+        k_TNH = torch.randn_like(q_TNH)
+        v_TNH = torch.randn(num_tokens, num_heads, 4)
+        attention = VarlenAttention.Config(single_document_rows=True).build()
+
+        with patch(
+            "torchtitan.models.common.attention.F.scaled_dot_product_attention",
+            side_effect=lambda q, k, v, **kwargs: torch.zeros(
+                (*q.shape[:-1], v.shape[-1]),
+                dtype=q.dtype,
+            ),
+        ):
+            out_TNH = attention._dense_forward(
+                q_TNH,
+                k_TNH,
+                v_TNH,
+                batch=2,
+                seq_len=4,
+                scale=None,
+                out_transform=None,
+                enable_gqa=False,
+            )
+
+        self.assertEqual(out_TNH.shape, v_TNH.shape)
+
     def test_gqa_preserves_td_shape(self):
         torch.manual_seed(42)
         num_tokens, dim, num_heads, head_dim = 6, 8, 2, 4

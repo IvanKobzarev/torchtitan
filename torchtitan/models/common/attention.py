@@ -222,7 +222,7 @@ class VarlenAttention(Module):
                     scale=scale,
                     enable_gqa=enable_gqa,
                 )
-            return out_BNLH.transpose(1, 2).reshape_as(q_TNH).to(q_TNH.dtype)
+            return out_BNLH.transpose(1, 2).reshape_as(v_TNH).to(q_TNH.dtype)
 
         out_BNLH, lse_BNL = torch.ops.aten._scaled_dot_product_cudnn_attention(
             q_BNLH,
@@ -235,7 +235,7 @@ class VarlenAttention(Module):
             False,
             scale=scale,
         )[:2]
-        out_TNH = out_BNLH.transpose(1, 2).reshape_as(q_TNH).to(q_TNH.dtype)
+        out_TNH = out_BNLH.transpose(1, 2).reshape_as(v_TNH).to(q_TNH.dtype)
         lse_TN = lse_BNL.transpose(1, 2).reshape(q_TNH.shape[0], -1)
         return out_transform(out_TNH, lse_TN)
 
