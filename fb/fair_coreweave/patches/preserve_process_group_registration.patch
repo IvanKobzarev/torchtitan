@@ -1,0 +1,29 @@
+diff --git a/fbcode/caffe2/torch/_C/_distributed_c10d.pyi b/fbcode/caffe2/torch/_C/_distributed_c10d.pyi
+--- a/fbcode/caffe2/torch/_C/_distributed_c10d.pyi
++++ b/fbcode/caffe2/torch/_C/_distributed_c10d.pyi
+@@ -964,6 +964,7 @@ def _register_process_group(
+     process_group: ProcessGroup,
+ ) -> None: ...
+ def _resolve_process_group(group_name: GroupName) -> ProcessGroup: ...
++def _is_process_group_registered(group_name: GroupName) -> bool: ...
+ def _create_work_from_future(future: Future) -> Work: ...
+ def _register_work(tensor: torch.Tensor, work: Work) -> ProcessGroup: ...
+ def _get_work_registry_size() -> int: ...
+diff --git a/fbcode/caffe2/torch/csrc/distributed/c10d/init.cpp b/fbcode/caffe2/torch/csrc/distributed/c10d/init.cpp
+--- a/fbcode/caffe2/torch/csrc/distributed/c10d/init.cpp
++++ b/fbcode/caffe2/torch/csrc/distributed/c10d/init.cpp
+@@ -1105,6 +1105,14 @@ PyObject* c10d_init(PyObject* _unused, PyObject* noargs) {
+       },
+       py::arg("group_name"));
+
++  // Check the native registry without throwing on unknown group names.
++  module.def(
++      "_is_process_group_registered",
++      [](const std::string& group_name) {
++        return ::c10d::is_process_group_registered(group_name);
++      },
++      py::arg("group_name"));
++
+   module.def(
+       "_register_work",
+       [](const at::Tensor& tensor,
