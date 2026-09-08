@@ -209,7 +209,8 @@ cmd_verify_runtime() {
 import grain.python
 import torch
 import torchtitan
-assert hasattr(torch, \"_scaled_addmm_\"), \"torch._scaled_addmm_ is missing\"
+assert hasattr(torch.Tensor, \"_scaled_addmm_\"), \"Tensor._scaled_addmm_ is missing\"
+assert hasattr(torch.ops.aten, \"_scaled_addmm_\"), \"aten._scaled_addmm_ is missing\"
 assert hasattr(torch, \"_mm_with_compute_mode\"), \"torch._mm_with_compute_mode is missing\"
 print(\"torch\", torch.__version__)
 print(\"TorchTitan and runtime operator checks passed\")
