@@ -37,6 +37,7 @@ from torchtitan.experiments.graph_trainer.cudagraph import (
     CUDAGraphWrapper,
 )
 from torchtitan.experiments.graph_trainer.deferred_fsdp import (
+    _append_accumulator_placeholders,
     bind_deferred_fsdp_graph,
     build_deferred_fsdp_graph,
 )
@@ -3032,6 +3033,34 @@ class TestTraceModels(unittest.TestCase):
                 custom,
                 f"{node.name} missing compile_with_inductor annotation",
             )
+
+
+class TestDeferredFSDPMetadata(unittest.TestCase):
+    def test_accumulator_metadata_has_independent_tensor_identity(self):
+        from torch._subclasses.fake_tensor import FakeTensorMode
+
+        graph = torch.fx.Graph()
+        with FakeTensorMode():
+            boundary_value = torch.empty_strided(
+                (4, 5),
+                (7, 1),
+                device="cuda",
+                dtype=torch.bfloat16,
+            )
+        boundary = graph.placeholder("boundary")
+        boundary.meta["val"] = boundary_value
+        graph.output((boundary,))
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+        accumulator = _append_accumulator_placeholders(gm, [boundary])[0]
+        accumulator_value = accumulator.meta["val"]
+
+        self.assertIsNot(accumulator_value, boundary_value)
+        self.assertEqual(accumulator_value.shape, boundary_value.shape)
+        self.assertEqual(accumulator_value.stride(), boundary_value.stride())
+        self.assertEqual(accumulator_value.dtype, boundary_value.dtype)
+        self.assertEqual(accumulator_value.device, boundary_value.device)
+        self.assertIs(accumulator_value.fake_mode, boundary_value.fake_mode)
 
 
 class TestTraceFSDP(FSDPTest):

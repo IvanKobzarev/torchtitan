@@ -309,6 +309,14 @@ def _append_accumulator_placeholders(
         for index, boundary in enumerate(boundaries):
             accumulator = gm.graph.placeholder(f"deferred_grad_{index}")
             accumulator.meta = copy.copy(boundary.meta)
+            boundary_value = boundary.meta["val"]
+            # The persistent accumulator and this microbatch's gradient are
+            # separate runtime buffers, so their fake tensors must be distinct.
+            accumulator.meta["val"] = boundary_value.new_empty_strided(
+                boundary_value.shape,
+                boundary_value.stride(),
+                requires_grad=boundary_value.requires_grad,
+            )
             accumulators.append(accumulator)
     return accumulators
 
