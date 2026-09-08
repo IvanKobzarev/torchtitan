@@ -53,7 +53,7 @@ fi
 submit_options=(
   --nodes 64
   --segment 16
-  --time 01:30:00
+  --time 00:30:00
   --name gt-dsv3-671b-dp256-ep64-lbs1-ga16-noac-wgrad-v11-repro
 )
 if [ "$dry_run" -eq 1 ]; then
