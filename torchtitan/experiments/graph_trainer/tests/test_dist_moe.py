@@ -20,6 +20,8 @@ from torchtitan.experiments.graph_trainer.deepseek_v3.config_registry import (
     graph_trainer_deepseek_v3_16b_dist_moe_mxfp8,
     graph_trainer_deepseek_v3_16b_dist_moe_mxfp8_mlperf,
     graph_trainer_deepseek_v3_16b_dist_moe_mxfp8_mlperf_16gpu,
+    graph_trainer_deepseek_v3_16b_dist_moe_mxfp8_mlperf_64gpu,
+    graph_trainer_deepseek_v3_16b_dist_moe_mxfp8_mlperf_64gpu_coda,
     graph_trainer_deepseek_v3_671b_dist_moe_bf16,
     graph_trainer_deepseek_v3_671b_dist_moe_mxfp8,
     graph_trainer_deepseek_v3_671b_dist_moe_mxfp8_mlperf,
@@ -317,6 +319,36 @@ class DistMoeGraphTrainerConfigTest(unittest.TestCase):
                 attention.single_document_rows and attention.max_num_documents == 1
                 for attention in attentions
             )
+        )
+
+    def test_16b_mxfp8_mlperf_64gpu_coda_pair(self) -> None:
+        """The 64-GPU baseline and CODA arm differ only in CODA settings."""
+        with (
+            patch.object(MXFP8LinearConverter, "__init__", return_value=None),
+            patch.object(
+                MXFP8LinearConverter,
+                "convert",
+                side_effect=lambda config: config,
+            ),
+        ):
+            baseline = graph_trainer_deepseek_v3_16b_dist_moe_mxfp8_mlperf_64gpu()
+            coda = graph_trainer_deepseek_v3_16b_dist_moe_mxfp8_mlperf_64gpu_coda()
+
+        self.assertEqual(64, baseline.parallelism.data_parallel_shard_degree)
+        self.assertEqual(64, baseline.parallelism.expert_parallel_degree)
+        self.assertEqual(64 * 16 * 4096, baseline.training.num_tokens_per_train_step)
+        self.assertEqual("regional", baseline.compile.inductor_compilation)
+        self.assertFalse(baseline.compile.enable_coda)
+        self.assertTrue(coda.compile.enable_coda)
+        self.assertEqual(
+            [
+                "F_swiglu",
+                "B_swiglu_backward_activation",
+                "B_parallel_mm_dx_merge",
+                "B_mm_dx_residual_add",
+                "B_linear_dw_bf16_to_fp32",
+            ],
+            coda.compile.coda_patterns,
         )
 
     def test_671b_mxfp8_mlperf_256gpu_config(self) -> None:

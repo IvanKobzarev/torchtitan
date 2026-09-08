@@ -211,6 +211,34 @@ def graph_trainer_deepseek_v3_16b_dist_moe_mxfp8_mlperf_16gpu() -> (
     return config
 
 
+def graph_trainer_deepseek_v3_16b_dist_moe_mxfp8_mlperf_64gpu() -> (
+    GraphTrainer.Config
+):
+    """Build the DP64/EP64 16B performance proxy with GA16."""
+    config = graph_trainer_deepseek_v3_16b_dist_moe_mxfp8_mlperf_16gpu()
+    config.training.num_tokens_per_train_step = 64 * 16 * 4096
+    config.parallelism.data_parallel_shard_degree = 64
+    config.parallelism.expert_parallel_degree = 64
+    config.compile.inductor_compilation = "regional"
+    return config
+
+
+def graph_trainer_deepseek_v3_16b_dist_moe_mxfp8_mlperf_64gpu_coda() -> (
+    GraphTrainer.Config
+):
+    """Add benchmark-gated CODA fusions to the DP64/EP64 proxy."""
+    config = graph_trainer_deepseek_v3_16b_dist_moe_mxfp8_mlperf_64gpu()
+    config.compile.enable_coda = True
+    config.compile.coda_patterns = [
+        "F_swiglu",
+        "B_swiglu_backward_activation",
+        "B_parallel_mm_dx_merge",
+        "B_mm_dx_residual_add",
+        "B_linear_dw_bf16_to_fp32",
+    ]
+    return config
+
+
 def graph_trainer_deepseek_v3_16b_minimal_async_ep() -> GraphTrainer.Config:
     config = to_graph_trainer_config(
         deepseek_v3_16b_minimal_async_ep(),
