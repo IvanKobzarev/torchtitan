@@ -235,9 +235,10 @@ class GraphTrainerStageGraphs(GraphPPStageGraphs):
 
         ``flat_param_values`` is the live stage parameter list flattened with
         the tracer's subclass rules. The unshard graph consumes only the flat
-        parameters that own an all-gather chain and returns one flat value for
-        every original parameter input. Replicated parameters pass through
-        unchanged so later forward calls can use a uniform parameter prefix.
+        parameters that own an all-gather chain and returns one value for every
+        parameter input consumed by the forward graph. Replicated parameters
+        pass through unchanged so later forward calls can use a uniform
+        parameter prefix.
         """
 
         if (
@@ -264,14 +265,12 @@ class GraphTrainerStageGraphs(GraphPPStageGraphs):
         unsharded_param_values = list(
             _execute_graph_module(self.modules.unshard, unshard_args)
         )
-        if (
-            runtime_validate
-            and len(unsharded_param_values) != self.meta.num_flat_param_values
-        ):
+        expected_num_outputs = self.meta.num_fw_unsharded_param_inputs
+        if runtime_validate and len(unsharded_param_values) != expected_num_outputs:
             raise ValueError(
-                "GraphPP unshard graph output count must match flat parameter "
-                "count: "
-                f"{len(unsharded_param_values)} != {self.meta.num_flat_param_values}"
+                "GraphPP unshard graph output count must match its forward "
+                "parameter input count: "
+                f"{len(unsharded_param_values)} != {expected_num_outputs}"
             )
         return unsharded_param_values
 
@@ -306,13 +305,18 @@ class GraphTrainerStageGraphs(GraphPPStageGraphs):
         """Pack the extracted forward graph inputs in placeholder order."""
 
         num_unsharded_inputs = self.meta.num_fw_unsharded_param_inputs
+        expected_num_param_inputs = (
+            self.meta.num_flat_param_values
+            if self.modules.unshard is None
+            else num_unsharded_inputs
+        )
         if (
             runtime_validate
-            and len(unsharded_param_values) != self.meta.num_flat_param_values
+            and len(unsharded_param_values) != expected_num_param_inputs
         ):
             raise ValueError(
-                "GraphPP forward expected one unsharded value per flat param: "
-                f"{len(unsharded_param_values)} != {self.meta.num_flat_param_values}"
+                "GraphPP forward parameter input count mismatch: "
+                f"{len(unsharded_param_values)} != {expected_num_param_inputs}"
             )
 
         flat_user_inputs = self._flat_user_forward_inputs(
@@ -335,15 +339,23 @@ class GraphTrainerStageGraphs(GraphPPStageGraphs):
             self.meta.fwd_flat_input_indices,
             strict=True,
         ):
+            runtime_flat_index = flat_index
+            if self.modules.unshard is not None:
+                # The traced parameter prefix may contain unused aliases from
+                # parametrized modules. The unshard graph omits those leaves,
+                # shifting every following buffer and user input to the left.
+                runtime_flat_index -= (
+                    self.meta.num_flat_param_values - num_unsharded_inputs
+                )
             if runtime_validate and (
-                flat_index < 0 or flat_index >= len(flat_inputs)
+                runtime_flat_index < 0 or runtime_flat_index >= len(flat_inputs)
             ):
                 raise ValueError(
                     "GraphPP forward placeholder index is out of range: "
-                    f"{name} indexes {flat_index}, but runtime has "
+                    f"{name} indexes {runtime_flat_index}, but runtime has "
                     f"{len(flat_inputs)} flattened inputs"
                 )
-            fw_args.append(flat_inputs[flat_index])
+            fw_args.append(flat_inputs[runtime_flat_index])
         return fw_args
 
     def _split_forward_outputs(
