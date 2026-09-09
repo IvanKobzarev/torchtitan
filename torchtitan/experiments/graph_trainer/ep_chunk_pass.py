@@ -636,9 +636,17 @@ def prepare_ep_overlap_trace_inputs(
     if chunk_strategy == "eager":
         return
     dim = 0
-    if not args or not isinstance(args[0], torch.Tensor):
-        raise ValueError("ep_overlap tracing expects first user input to be a Tensor")
-    hint = int(args[0].shape[dim])
+    reference = next(
+        (
+            value
+            for value in tree_leaves(args[0] if args else ())
+            if isinstance(value, torch.Tensor) and value.dim() > dim
+        ),
+        None,
+    )
+    if reference is None:
+        raise ValueError("ep_overlap tracing expects a non-scalar tensor input")
+    hint = int(reference.shape[dim])
 
     def mark_leaf(value: object) -> None:
         if (
@@ -650,38 +658,15 @@ def prepare_ep_overlap_trace_inputs(
             # heuristic with explicit token-grid input role metadata.
             mark_chunk_dynamic_dims(value, mode=mode)
 
-    # The traced training step is `(inputs, labels, global_valid_tokens,
-    # extra_inputs, extra_kwargs)`. Mark only tensors with semantic training
-    # roles tied to the model token grid; skip scalar loss bookkeeping.
-    model_inputs = [args[0]]
-    if len(args) > 1:
-        model_inputs.append(args[1])
-    if len(args) > 3:
-        model_inputs.append(args[3])
-    if len(args) > 4:
-        model_inputs.append(args[4])
-    model_inputs.append(kwargs)
-
-    for leaf in tree_leaves(model_inputs):
+    for leaf in tree_leaves((args, kwargs)):
         mark_leaf(leaf)
 
 
-@register_trace_call_input_preparer("ep_overlap")
-def prepare_ep_overlap_trace_call_inputs(
-    compile_config: Any,
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-) -> tuple[tuple[Any, ...], dict[str, Any]] | None:
-    """Bind FlexAttention mask lengths to fake token-grid dims during tracing."""
-    if not compile_config.ep_overlap.enabled:
-        return None
-    _, chunk_strategy, _ = validate_ep_overlap_config(compile_config.ep_overlap)
-    if chunk_strategy == "eager" or len(args) <= 3 or not isinstance(args[3], dict):
-        return None
-
-    extra_kwargs = args[3]
-    positions = extra_kwargs.get("positions")
-    attention_masks = extra_kwargs.get("attention_masks")
+def _rebind_ep_overlap_attention_masks(
+    call_kwargs: dict[str, Any],
+) -> dict[str, Any] | None:
+    positions = call_kwargs.get("positions")
+    attention_masks = call_kwargs.get("attention_masks")
     if not isinstance(positions, torch.Tensor) or attention_masks is None:
         return None
     if positions.dim() < 1:
@@ -690,10 +675,13 @@ def prepare_ep_overlap_trace_call_inputs(
     from torch.nn.attention.flex_attention import BlockMask
 
     seq_len = positions.shape[0]
+    rebound = False
 
     def rebind(mask: object) -> object:
+        nonlocal rebound
         if not isinstance(mask, BlockMask):
             return mask
+        rebound = True
         return BlockMask(
             seq_lengths=(seq_len, seq_len),
             kv_num_blocks=mask.kv_num_blocks,
@@ -716,14 +704,36 @@ def prepare_ep_overlap_trace_call_inputs(
         rebound_masks = {key: rebind(mask) for key, mask in attention_masks.items()}
     else:
         rebound_masks = rebind(attention_masks)
-    if rebound_masks is attention_masks:
+    if not rebound:
         return None
 
-    rebound_extra_kwargs = dict(extra_kwargs)
-    rebound_extra_kwargs["attention_masks"] = rebound_masks
+    rebound_call_kwargs = dict(call_kwargs)
+    rebound_call_kwargs["attention_masks"] = rebound_masks
+    return rebound_call_kwargs
+
+
+@register_trace_call_input_preparer("ep_overlap")
+def prepare_ep_overlap_trace_call_inputs(
+    compile_config: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> tuple[tuple[Any, ...], dict[str, Any]] | None:
+    """Bind FlexAttention mask lengths to fake token-grid dims during tracing."""
+    if not compile_config.ep_overlap.enabled:
+        return None
+    _, chunk_strategy, _ = validate_ep_overlap_config(compile_config.ep_overlap)
+    if chunk_strategy == "eager":
+        return None
+
     rebound_args = list(args)
-    rebound_args[3] = rebound_extra_kwargs
-    return tuple(rebound_args), kwargs
+    for index, arg in enumerate(args):
+        if not isinstance(arg, dict):
+            continue
+        rebound_call_kwargs = _rebind_ep_overlap_attention_masks(arg)
+        if rebound_call_kwargs is not None:
+            rebound_args[index] = rebound_call_kwargs
+            return tuple(rebound_args), kwargs
+    return None
 
 
 # Step 2: Discover selected-symbol body regions and classify their boundaries.
@@ -2351,6 +2361,19 @@ def _ep_annotated_roots(gm: fx.GraphModule, module_pattern: str) -> list[str]:
     return sorted(roots)
 
 
+def find_ep_overlap_roots(
+    gm: fx.GraphModule,
+    module_pattern: str,
+    *,
+    require_all_to_all: bool,
+) -> list[str]:
+    """Return EP roots confirmed by collective or trace metadata."""
+    roots = _ep_roots(gm, module_pattern)
+    if roots or require_all_to_all:
+        return roots
+    return _ep_annotated_roots(gm, module_pattern)
+
+
 def apply_chunk_pass(
     gm: fx.GraphModule,
     example_inputs: tuple[Any, ...] | None = None,
@@ -2434,12 +2457,14 @@ def ep_overlap_chunk_pass(
     require_all_to_all: bool = True,
 ) -> fx.GraphModule:
     """Resolve EP roots from one pattern, then run graph chunking."""
-    roots = _ep_roots(gm, module_pattern)
+    roots = find_ep_overlap_roots(
+        gm,
+        module_pattern,
+        require_all_to_all=require_all_to_all,
+    )
     if not roots:
         if require_all_to_all:
             raise ValueError(f"No EP all-to-all regions matched {module_pattern!r}.")
-        roots = _ep_annotated_roots(gm, module_pattern)
-    if not roots:
         raise ValueError(f"No EP regions matched {module_pattern!r}.")
     return apply_chunk_pass(
         gm,

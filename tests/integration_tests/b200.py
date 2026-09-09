@@ -31,4 +31,11 @@ def build_b200_tests_list() -> list[OverrideDefinitions]:
             ngpu=4,
             use_real_pg=True,
         ),
+        OverrideDefinitions(
+            configs=[recipes.graph_trainer_deepseek_v3_debugmodel_mxfp8_fsdp2_pp2_ep2],
+            test_descr="GraphTrainer MXFP8 with FSDP, PP, and graph EP overlap",
+            test_name="graph_trainer_mxfp8_fsdp+pp+ep_overlap",
+            ngpu=4,
+            use_real_pg=True,
+        ),
     ]

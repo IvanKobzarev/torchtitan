@@ -54,6 +54,7 @@ from torchtitan.experiments.graph_trainer.debug_utils import (
 )
 from torchtitan.experiments.graph_trainer.ep_chunk_pass import (
     ep_overlap_chunk_pass,
+    find_ep_overlap_roots,
     populate_chunk_dim_metadata_pass,
 )
 from torchtitan.experiments.graph_trainer.ep_eager_chunk import (
@@ -152,6 +153,7 @@ def compile_time_passes(
     parallel_dims=None,
     include_inductor: bool = True,
     include_mandatory_normalization: bool = True,
+    stage_local: bool = False,
 ) -> list[Callable]:
     """Cleanup, FlexAttention annotation, and regional_inductor passes.
 
@@ -217,6 +219,7 @@ def compile_time_passes(
     ep_overlap_chunk_passes: list[Callable] = []
     ep_overlap_module_fqn: str | None = None
     ep_overlap_chunk_strategy: str | None = None
+    run_ep_overlap_passes = ep_overlap_enabled
     if ep_overlap_enabled:
         (
             overlap_dim,
@@ -235,15 +238,28 @@ def compile_time_passes(
                 "Use tensor_parallel_degree=1 or eager chunking for this "
                 "configuration."
             )
-        if ep_overlap_chunk_strategy == "eager":
+        require_all_to_all = (
+            getattr(config.parallelism, "expert_parallel_degree", 1) > 1
+        )
+        if stage_local:
+            run_ep_overlap_passes = bool(
+                find_ep_overlap_roots(
+                    traced_result.gm,
+                    ep_overlap_module_fqn,
+                    require_all_to_all=require_all_to_all,
+                )
+            )
+        if ep_overlap_chunk_strategy == "eager" and run_ep_overlap_passes:
             ep_overlap_chunk_passes.append(populate_eager_chunk_metadata_pass)
         if ep_overlap_chunk_strategy == "graph":
-            ep_overlap_chunk_passes.extend(
-                [
-                    functools.partial(
-                        populate_chunk_dim_metadata_pass,
-                        mode=overlap_dim,
-                    ),
+            ep_overlap_chunk_passes.append(
+                functools.partial(
+                    populate_chunk_dim_metadata_pass,
+                    mode=overlap_dim,
+                )
+            )
+            if run_ep_overlap_passes:
+                ep_overlap_chunk_passes.append(
                     functools.partial(
                         ep_overlap_chunk_pass,
                         mode=overlap_dim,
@@ -252,12 +268,9 @@ def compile_time_passes(
                         optimize_grad_live_out=not (
                             config.compile.ep_overlap.disable_early_grad_accumulation
                         ),
-                        require_all_to_all=(
-                            getattr(config.parallelism, "expert_parallel_degree", 1) > 1
-                        ),
-                    ),
-                ]
-            )
+                        require_all_to_all=require_all_to_all,
+                    )
+                )
 
     passes.extend(
         [
@@ -273,8 +286,9 @@ def compile_time_passes(
             selective_activation_remat_pass,
         ]
     )
-    if ep_overlap_enabled:
+    if ep_overlap_chunk_passes:
         passes.extend(ep_overlap_chunk_passes)
+    if run_ep_overlap_passes:
         passes.append(isolate_ep_process_group_pass)
         passes.append(eliminate_dead_code_pass)
 
@@ -292,7 +306,7 @@ def compile_time_passes(
         )
     )
 
-    if ep_overlap_enabled:
+    if run_ep_overlap_passes:
         assert ep_overlap_module_fqn is not None
         passes.append(
             functools.partial(
@@ -304,6 +318,7 @@ def compile_time_passes(
                 pair_first_token_exchange=ep_overlap_module_fqn == MOE_BLOCK_FQN,
             )
         )
+    if ep_overlap_enabled and ep_overlap_chunk_strategy == "graph":
         passes.append(concretize_ep_chunk_symbolic_shapes_pass)
 
     enable_fsdp_dense_region_overlap = config.compile.enable_fsdp_dense_region_overlap

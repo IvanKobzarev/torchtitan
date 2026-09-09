@@ -3863,6 +3863,58 @@ class TestChunkPasses(TestCase):
                 ):
                     compile_time_passes(traced_result, config, use_cudagraph=False)
 
+    def test_stage_local_ep_overlap_uses_traced_collective_metadata(self):
+        traced_result, config = self._compile_config_for_ep_overlap_test()
+        config.compile.ep_overlap.module_fqn = "layers.*.moe"
+        config.parallelism.expert_parallel_degree = 2
+
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        graph.output((x,))
+        traced_result.gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+        passes = compile_time_passes(
+            traced_result,
+            config,
+            use_cudagraph=False,
+            stage_local=True,
+        )
+        names = [
+            pass_fn.func.__name__ if hasattr(pass_fn, "func") else pass_fn.__name__
+            for pass_fn in passes
+        ]
+
+        self.assertIn("populate_chunk_dim_metadata_pass", names)
+        self.assertIn("concretize_ep_chunk_symbolic_shapes_pass", names)
+        self.assertNotIn("ep_overlap_chunk_pass", names)
+        self.assertNotIn("ep_overlap_schedule_pass", names)
+
+        output = next(node for node in graph.nodes if node.op == "output")
+        with graph.inserting_before(output):
+            all_to_all = graph.call_function(
+                torch.ops._c10d_functional.all_to_all_single.default,
+                args=(x, [], [], "ep_pg"),
+            )
+        all_to_all.meta["custom"] = {
+            _MODULE_FQN: "layers.0.moe",
+            _EP_TOKEN_EXCHANGE: "dispatch",
+        }
+        output.args = ((all_to_all,),)
+        traced_result.gm.recompile()
+        passes = compile_time_passes(
+            traced_result,
+            config,
+            use_cudagraph=False,
+            stage_local=True,
+        )
+        names = [
+            pass_fn.func.__name__ if hasattr(pass_fn, "func") else pass_fn.__name__
+            for pass_fn in passes
+        ]
+
+        self.assertIn("ep_overlap_chunk_pass", names)
+        self.assertIn("ep_overlap_schedule_pass", names)
+        self.assertIn("isolate_ep_process_group_pass", names)
+
     def test_fsdp_dense_region_scheduler_pass_gating(self):
         def transformer_batch_default(config):
             pass
@@ -3969,6 +4021,22 @@ class TestChunkPasses(TestCase):
         self.assertIn(0, positions._dynamo_unbacked_indices)
         self.assertEqual(x._dynamo_unbacked_bounds[0], (4, 8))
 
+    def test_prepare_ep_overlap_trace_inputs_marks_graph_pp_stage_dims(self):
+        _traced_result, config = self._compile_config_for_ep_overlap_test()
+        x = torch.randn(8, 4)
+        positions = torch.arange(8)
+        output_grad = torch.randn(8, 4)
+
+        prepare_ep_overlap_trace_inputs(
+            config.compile,
+            ((x,), {"positions": positions}, (output_grad,)),
+            {},
+        )
+
+        self.assertIn(0, x._dynamo_unbacked_indices)
+        self.assertIn(0, positions._dynamo_unbacked_indices)
+        self.assertIn(0, output_grad._dynamo_unbacked_indices)
+
     def test_prepare_ep_overlap_trace_inputs_bounds_seq_dim_to_original_half(self):
         _traced_result, config = self._compile_config_for_ep_overlap_test()
         config.compile.ep_overlap.chunk_dim = "seq"
@@ -4001,6 +4069,21 @@ class TestChunkPasses(TestCase):
         traced = minimal_fx_tracer(lambda h, y: loss_fn(h, y))(hidden_states, labels)
 
         self.assertGreater(len(list(traced.gm.graph.nodes)), 0)
+
+    def test_mxfp8_row_padding_traces_chunk_dynamic_dim(self):
+        from torchtitan.components.quantization.mxfp8.linear import _pad_rows
+
+        x = torch.randn(64, 128)
+        mark_chunk_dynamic_dims(x, mode="batch")
+
+        traced = minimal_fx_tracer(_pad_rows)(x)
+        runtime_x = torch.randn(48, 128)
+        padded, num_rows = run_traced(traced)(runtime_x)
+
+        self.assertEqual(num_rows, 48)
+        self.assertEqual(padded.shape, (64, 128))
+        self.assertEqual(padded[:num_rows], runtime_x)
+        self.assertEqual(padded[num_rows:], torch.zeros(16, 128))
 
     def test_prepare_ep_overlap_trace_inputs_rejects_empty_module_pattern(self):
         _traced_result, config = self._compile_config_for_ep_overlap_test()
@@ -4053,6 +4136,50 @@ class TestChunkPasses(TestCase):
         self.assertIsNotNone(prepared)
         prepared_args, _ = prepared
         rebound_mask = prepared_args[3]["attention_masks"]
+        seq_len = positions.shape[0]
+        self.assertEqual(rebound_mask.seq_lengths[0].node.expr, seq_len.node.expr)
+        self.assertEqual(rebound_mask.seq_lengths[1].node.expr, seq_len.node.expr)
+
+    def test_prepare_ep_overlap_trace_call_inputs_handles_graph_pp_args(self):
+        from torch._dynamo.source import LocalSource
+        from torch._subclasses.fake_tensor import FakeTensorMode
+        from torch.fx.experimental.symbolic_shapes import (
+            DimDynamic,
+            StatelessSymbolicContext,
+        )
+        from torch.nn.attention.flex_attention import create_block_mask
+
+        _traced_result, config = self._compile_config_for_ep_overlap_test()
+        fake_mode = FakeTensorMode(allow_non_fake_inputs=True, shape_env=ShapeEnv())
+        positions = fake_mode.from_tensor(
+            torch.arange(8),
+            source=LocalSource("positions", is_input=True),
+            symbolic_context=StatelessSymbolicContext(
+                dynamic_sizes=[DimDynamic.UNBACKED],
+                shape_ids={0: "torchtitan_chunk_batch"},
+            ),
+        )
+        block_mask = create_block_mask(
+            lambda b, h, q_idx, kv_idx: q_idx >= kv_idx,
+            B=1,
+            H=None,
+            Q_LEN=8,
+            KV_LEN=8,
+            device="cpu",
+        )
+
+        prepared = prepare_ep_overlap_trace_call_inputs(
+            config.compile,
+            (
+                (torch.empty(8, 4),),
+                {"positions": positions, "attention_masks": block_mask},
+            ),
+            {},
+        )
+
+        self.assertIsNotNone(prepared)
+        prepared_args, _ = prepared
+        rebound_mask = prepared_args[1]["attention_masks"]
         seq_len = positions.shape[0]
         self.assertEqual(rebound_mask.seq_lengths[0].node.expr, seq_len.node.expr)
         self.assertEqual(rebound_mask.seq_lengths[1].node.expr, seq_len.node.expr)

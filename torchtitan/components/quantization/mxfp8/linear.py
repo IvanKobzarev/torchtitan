@@ -54,9 +54,10 @@ def _pad_rows(x_MK: torch.Tensor) -> tuple[torch.Tensor, int]:
     num_padded_rows = (
         (num_rows + _MXFP8_BLOCK_SIZE - 1) // _MXFP8_BLOCK_SIZE
     ) * _MXFP8_BLOCK_SIZE
-    if num_padded_rows == num_rows:
+    if isinstance(num_rows, int) and num_padded_rows == num_rows:
         return x_MK, num_rows
-    return F.pad(x_MK, (0, 0, 0, num_padded_rows - num_rows)), num_rows
+    padding_MK = x_MK.new_zeros((num_padded_rows - num_rows, x_MK.shape[1]))
+    return torch.cat((x_MK, padding_MK), dim=0), num_rows
 
 
 # Adapted from torchao.prototype.moe_training.mxfp8_linear.mx_mm. This variant

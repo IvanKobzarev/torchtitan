@@ -23,6 +23,7 @@ import dataclasses
 import types
 import warnings
 from collections.abc import Callable
+from functools import partial
 from typing import Any, cast
 
 import torch
@@ -42,6 +43,10 @@ from torchtitan.experiments.graph_trainer.common_utils import (
     maybe_register_blockmask_pytree_node,
 )
 from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConfig
+from torchtitan.experiments.graph_trainer.ep_chunk_pass import (
+    prepare_ep_overlap_trace_call_inputs,
+    prepare_ep_overlap_trace_inputs,
+)
 from torchtitan.experiments.graph_trainer.graph_pp.split_fsdp_collectives import (
     split_backward_fsdp_collectives,
     split_forward_fsdp_collectives,
@@ -835,6 +840,7 @@ def _apply_graph_pp_pre_partition_passes(
         use_cudagraph=False,
         include_inductor=False,
         include_mandatory_normalization=False,
+        stage_local=True,
     )
     traced.gm = apply_graph_passes(
         traced.gm,
@@ -947,6 +953,10 @@ def _build_stage_graphs(
     num_state_buffer_values = len(flatten_graph_values(state_buffers))
     num_grad_params = len(grad_params)
     num_input_grad_leaves = len(_grad_input_leaves(stage_args, stage_kwargs))
+    trace_input_preparer = partial(prepare_ep_overlap_trace_inputs, compile_config)
+    trace_call_input_preparer = partial(
+        prepare_ep_overlap_trace_call_inputs, compile_config
+    )
 
     # 2. Trace the stage calling convention. Last stages differentiate a scalar
     # loss. Non-last stages differentiate stage outputs against runtime
@@ -985,7 +995,12 @@ def _build_stage_graphs(
                 tuple(grads[len(grad_params) :]),
             )
 
-        traced = minimal_fx_tracer(stage_step, module=stage.submod)(
+        traced = minimal_fx_tracer(
+            stage_step,
+            module=stage.submod,
+            prepare_inputs=trace_input_preparer,
+            prepare_call_inputs=trace_call_input_preparer,
+        )(
             stage_args,
             stage_kwargs,
             target,
@@ -1020,7 +1035,12 @@ def _build_stage_graphs(
                 tuple(grads[len(grad_params) :]),
             )
 
-        traced = minimal_fx_tracer(stage_step, module=stage.submod)(
+        traced = minimal_fx_tracer(
+            stage_step,
+            module=stage.submod,
+            prepare_inputs=trace_input_preparer,
+            prepare_call_inputs=trace_call_input_preparer,
+        )(
             stage_args,
             stage_kwargs,
             output_grads,
