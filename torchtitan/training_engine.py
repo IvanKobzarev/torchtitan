@@ -19,6 +19,7 @@ from torch.distributed.fsdp import FSDPModule
 from torchtitan.components.checkpointer import BaseCheckpointManager, CheckpointManager
 from torchtitan.components.data.loader import BaseDataLoader
 from torchtitan.components.data.types import TrainingMicrobatch
+from torchtitan.components.dist_moe import DistMoeRuntime, prepare_dist_moe_runtime
 from torchtitan.components.loss import BaseLoss, ChunkedLossWrapper
 from torchtitan.components.optim import Optim
 from torchtitan.config import Configurable, TORCH_DTYPE_MAP
@@ -201,6 +202,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
     device_memory_monitor: DeviceMemoryMonitor
     model_device_mem_stats: DeviceMemStats
     _run_forward_backward: _ForwardBackwardFn
+    dist_moe_runtime: DistMoeRuntime | None
 
     def __init__(
         self,
@@ -221,6 +223,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         self.num_completed_steps = 0
         self.ntokens_seen = 0
         self.sdc_replayer = None
+        self.dist_moe_runtime = None
         self.preprocess_inputs_kwargs: dict[str, Any] = {}
         self.loss_metrics = {}
         self._initialize_distributed_runtime()
@@ -349,12 +352,31 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             self.pp_has_first_stage = True
             self.pp_has_last_stage = True
 
-        with self.parallelism_context.activate_spmd():
-            for model_part in self.model_parts:
-                model_part.to_empty(device=init_device)
-                with torch.no_grad():
-                    model_part.init_weights(buffer_device=buffer_device)
-                model_part.train()
+        self.dist_moe_runtime = prepare_dist_moe_runtime(
+            config=config,
+            model_parts=self.model_parts,
+            parallelism_context=self.parallelism_context,
+            device=self.device,
+            pp_schedule=(
+                self.pp_schedule if self.parallelism_context.pp_enabled else None
+            ),
+            create_seed_checkpoint=create_seed_checkpoint,
+        )
+
+        try:
+            with self.parallelism_context.activate_spmd():
+                for model_part in self.model_parts:
+                    model_part.to_empty(device=init_device)
+                    with torch.no_grad():
+                        model_part.init_weights(buffer_device=buffer_device)
+                    model_part.train()
+            if self.dist_moe_runtime is not None:
+                self.dist_moe_runtime.initialize()
+        except Exception:
+            if self.dist_moe_runtime is not None:
+                self.dist_moe_runtime.close()
+                self.dist_moe_runtime = None
+            raise
 
         if isinstance(self.loss_fn, ChunkedLossWrapper) and (
             not self.parallelism_context.pp_enabled or self.pp_has_last_stage
@@ -675,6 +697,8 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         The input lists contain one pipeline schedule step. ``finalize_gradients``
         controls whether that step finishes FSDP gradient reduction.
         """
+        if self.dist_moe_runtime is not None:
+            self.dist_moe_runtime.reset()
         with self.parallelism_context.activate_spmd(
             typechecking=self.config.debug.spmd_typechecking,
         ):
@@ -751,5 +775,8 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         self.close_profiler()
         if not self.config.training.disable_cuda_graphs:
             cuda_graph_teardown()
+        if self.dist_moe_runtime is not None:
+            self.dist_moe_runtime.close()
+            self.dist_moe_runtime = None
         if hasattr(self, "checkpointer"):
             self.checkpointer.close()
