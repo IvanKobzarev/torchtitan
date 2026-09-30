@@ -557,6 +557,7 @@ class GraphRuntimeTraceTest(unittest.TestCase):
         runner.stage_graphs = {0: object()}
         runner.loss_kwargs = {"stale": object()}
         runner._graph_pp_ready = True
+        runner.is_spmd = False
 
         with self.assertRaisesRegex(RuntimeError, "step failed"):
             runner.step()
