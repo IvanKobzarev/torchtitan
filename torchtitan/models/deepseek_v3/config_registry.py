@@ -4,9 +4,10 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
 from typing import Literal
 
-from dist_moe import DistMoeBlockScaledConfig, DistMoeBlockScaledFormat
+from dist_moe import BlockScaledFormat, DistMoeBlockScaledConfig
 
 from torchtitan.components.data import ConcatThenSplitPackingConfig, GrainDataLoader
 
@@ -89,7 +90,7 @@ def _enable_dist_moe(
             )
         )
         block_scaled = DistMoeBlockScaledConfig(
-            format=DistMoeBlockScaledFormat.MXFP8_E4M3,
+            format=BlockScaledFormat.MXFP8_E4M3,
             fast_math=True,
             pipeline="staged",
         )
@@ -351,11 +352,13 @@ def deepseek_v3_16b_dist_moe_mxfp8(
 def configure_deepseek_v3_16b_dist_moe_local_4gpu(
     config: Trainer.Config,
 ) -> Trainer.Config:
-    """Configure the shared two-row, four-GPU DistMoE performance workload."""
+    """Configure fixed rows for the local four-GPU DistMoE performance workload."""
     if not isinstance(config.dataloader, GrainDataLoader.Config):
         raise TypeError("the local DistMoE recipe requires GrainDataLoader")
     dataloader = config.dataloader
-    num_fixed_rows = 2
+    num_fixed_rows = int(os.environ.get("CODA_LOCAL_BATCH_SIZE", "2"))
+    if num_fixed_rows < 1:
+        raise ValueError("CODA_LOCAL_BATCH_SIZE must be positive")
     num_tokens_per_row = config.training.max_context_length
     config.training.num_tokens_per_microbatch_per_dp_rank = (
         num_fixed_rows * num_tokens_per_row

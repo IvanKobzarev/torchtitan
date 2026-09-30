@@ -232,6 +232,7 @@ class GraphRuntimeTraceTest(unittest.TestCase):
             loss_fn=mock.Mock(),
             backward_requires_autograd=False,
         )
+        schedule.pipeline_order_with_comms = {0: []}
         runtime = GraphRuntime(schedule, is_spmd=True)
 
         runtime._skip_spmd_stage_initialization(has_backward=True)

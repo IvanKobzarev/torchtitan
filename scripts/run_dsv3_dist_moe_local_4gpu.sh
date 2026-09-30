@@ -19,12 +19,15 @@ python_source_root="${CODA_PYTORCH_SOURCE_ROOT:-$workspace_dir/pytorch}"
 runs_root="${CODA_LOCAL_RUNS_ROOT:-$HOME/tmp/coda-gt-local-runs}"
 cuda_home="${CUDA_HOME:-/usr/local/cuda-13.0}"
 cutlass_python="${CODA_CUTLASS_PYTHON_ROOT:-$binary_runtime_root/lib/python3.12/site-packages/nvidia_cutlass_dsl/python_packages}"
-steps=15
+steps=35
 precision=mxfp8
 trainer_mode=graph
+boundary_mode=schedule
 run_name=""
 preflight_only=0
+capacity_probe=0
 profile=0
+profile_step=36
 deterministic=0
 grad_accum_steps=16
 local_batch_size=2
@@ -75,6 +78,15 @@ while [ "$#" -gt 0 ]; do
       local_batch_size="$2"
       shift 2
       ;;
+    --boundary-mode)
+      require_option_value "$@"
+      boundary_mode="$2"
+      shift 2
+      ;;
+    --capacity-probe)
+      capacity_probe=1
+      shift
+      ;;
     --preflight-only)
       preflight_only=1
       shift
@@ -82,6 +94,11 @@ while [ "$#" -gt 0 ]; do
     --profile)
       profile=1
       shift
+      ;;
+    --profile-step)
+      require_option_value "$@"
+      profile_step="$2"
+      shift 2
       ;;
     --deterministic)
       deterministic=1
@@ -97,20 +114,29 @@ done
 require_positive_integer --steps "$steps"
 require_positive_integer --grad-accum-steps "$grad_accum_steps"
 require_positive_integer --local-batch-size "$local_batch_size"
-if [ "$grad_accum_steps" -ne 16 ]; then
-  echo "the checked-in comparison recipe requires 16 gradient accumulation steps" >&2
+require_positive_integer --profile-step "$profile_step"
+if [ "$boundary_mode" != schedule ] && [ "$boundary_mode" != edge ]; then
+  echo "--boundary-mode must be schedule or edge, got '$boundary_mode'" >&2
   exit 2
 fi
-if [ "$local_batch_size" -ne 2 ]; then
-  echo "the checked-in comparison recipe requires local batch size 2" >&2
+if [ "$trainer_mode" = eager ] && [ "$boundary_mode" = edge ]; then
+  echo "--boundary-mode edge requires the graph trainer" >&2
   exit 2
 fi
-if [ "$steps" -lt 15 ]; then
-  echo "performance runs require five warmup and ten measured steps" >&2
+if [ "$boundary_mode" = edge ] && [ "$grad_accum_steps" -lt 2 ]; then
+  echo "edge FSDP boundaries require at least two gradient accumulation steps" >&2
   exit 2
 fi
-if [ "$profile" -eq 1 ] && [ "$steps" -lt 16 ]; then
-  echo "the step-16 profile requires at least 16 steps" >&2
+if [ "$capacity_probe" -eq 0 ] && [ "$steps" -lt 35 ]; then
+  echo "performance runs require five warmup and 30 measured steps" >&2
+  exit 2
+fi
+if [ "$profile" -eq 1 ] && [ "$capacity_probe" -eq 0 ] && [ "$profile_step" -ne 36 ]; then
+  echo "measured runs profile step 36, after 30 measured steps" >&2
+  exit 2
+fi
+if [ "$profile" -eq 1 ] && [ "$steps" -lt "$profile_step" ]; then
+  echo "the step-$profile_step profile requires at least $profile_step steps" >&2
   exit 2
 fi
 if [ "$trainer_mode" = eager ]; then
@@ -187,11 +213,27 @@ train=(
 if [ "$deterministic" -eq 1 ]; then
   train+=(--debug.deterministic)
 fi
+if [ "$trainer_mode" = graph ]; then
+  if [ "$boundary_mode" = edge ]; then
+    train+=(
+      --compile.fsdp-param-unshard-mode only_in_first_microbatch
+      --compile.fsdp-gradient-sync-mode only_in_last_microbatch
+    )
+  else
+    train+=(
+      --compile.fsdp-param-unshard-mode extracted_in_schedule_stage
+      --compile.fsdp-gradient-sync-mode deferred_as_schedule_stage
+    )
+  fi
+  train+=(
+    --compile.gradient-accum-in-wgrad-fusion enabled
+  )
+fi
 profiler=(--profiler.no-enable-profiling)
 if [ "$profile" -eq 1 ]; then
   profiler=(
     --profiler.enable-profiling
-    --profiler.profile-freq 16
+    --profiler.profile-freq "$profile_step"
     --profiler.profiler-warmup 0
     --profiler.profiler-active 1
     --profiler.profiler-repeat 1
@@ -199,6 +241,7 @@ if [ "$profile" -eq 1 ]; then
 fi
 train+=("${profiler[@]}")
 train+=(
+  --training.num-tokens-per-microbatch-per-dp-rank "$((4096 * local_batch_size))"
   --training.num-tokens-per-train-step "$((4096 * local_batch_size * 4 * grad_accum_steps))"
 )
 command=(
@@ -212,9 +255,14 @@ command=(
   "${train[@]}"
 )
 
-measurement_protocol=warmup_steps_1-5,measured_steps_6-15,profile=off
-if [ "$profile" -eq 1 ]; then
-  measurement_protocol=warmup_steps_1-5,measured_steps_6-15,profile_step_16
+measurement_protocol=warmup_steps_1-5,measured_steps_6-35,profile=off
+if [ "$capacity_probe" -eq 1 ]; then
+  measurement_protocol=capacity_probe
+  if [ "$profile" -eq 1 ]; then
+    measurement_protocol="capacity_probe,profile_step_$profile_step"
+  fi
+elif [ "$profile" -eq 1 ]; then
+  measurement_protocol=warmup_steps_1-5,measured_steps_6-35,profile_step_36
 fi
 {
   printf 'source_commit='
@@ -230,6 +278,7 @@ fi
   printf 'cache_root=%s\n' "$cache_root"
   printf 'local_batch_size=%s\n' "$local_batch_size"
   printf 'gradient_accumulation_steps=%s\n' "$grad_accum_steps"
+  printf 'fsdp_boundary_mode=%s\n' "$boundary_mode"
   printf 'deterministic=%s\n' "$deterministic"
   printf 'tokens_per_microbatch_per_dp_rank=%s\n' "$((4096 * local_batch_size))"
   printf 'tokens_per_train_step=%s\n' "$((4096 * local_batch_size * 4 * grad_accum_steps))"
@@ -286,11 +335,11 @@ if os.environ["CODA_TRAINER_MODE"] == "graph":
     if config.compile.memory_policy != "none":
         raise RuntimeError("the comparison recipe must disable graph rematerialization")
     if config.compile.fsdp_param_unshard_mode != "extracted_in_schedule_stage":
-        raise RuntimeError("the comparison recipe must extract FSDP unshard")
+        raise RuntimeError("the comparison recipe must default to extracted FSDP unshard")
     if config.compile.fsdp_gradient_sync_mode != "deferred_as_schedule_stage":
-        raise RuntimeError("the comparison recipe must defer FSDP gradient sync")
-    if config.compile.gradient_accumulation_mode != "in_graph":
-        raise RuntimeError("the comparison recipe must accumulate gradients in graph")
+        raise RuntimeError("the comparison recipe must default to deferred FSDP reduction")
+    if config.compile.gradient_accum_in_wgrad_fusion != "enabled":
+        raise RuntimeError("the comparison recipe must enable WGrad fusion")
 else:
     config = (
         deepseek_v3_16b_dist_moe_bf16_local_4gpu()
@@ -323,8 +372,8 @@ if not isinstance(config.dataloader.dataset, ConcatThenSplitPackingConfig):
     raise RuntimeError("the comparison recipe must use concat packing")
 if config.dataloader.dataset.mask_document_boundaries:
     raise RuntimeError("the comparison recipe must use complete fixed rows")
-if config.dataloader.max_num_documents != 2:
-    raise RuntimeError("the comparison recipe must expose two fixed rows")
+if config.dataloader.max_num_documents != int(os.environ["CODA_LOCAL_BATCH_SIZE"]):
+    raise RuntimeError("the comparison recipe must match the requested fixed rows")
 inner_attentions = list(config.model.traverse(VarlenInnerAttention.Config))
 if not inner_attentions or any(
     not inner_attention.fixed_length_rows
@@ -342,7 +391,7 @@ expected_train_step_tokens = (
     expected_microbatch_tokens * 4 * int(os.environ["CODA_GRAD_ACCUM_STEPS"])
 )
 if config.training.num_tokens_per_microbatch_per_dp_rank != expected_microbatch_tokens:
-    raise RuntimeError("the checked-in recipe and requested local batch size disagree")
+    raise RuntimeError("the comparison recipe must match the requested local batch size")
 if config.training.num_tokens_per_train_step != expected_microbatch_tokens * 4 * 16:
     raise RuntimeError("the checked-in comparison recipe must default to GA16")
 print(
