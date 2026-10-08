@@ -51,6 +51,7 @@ from torchtitan.experiments.graph_trainer.fsdp_patterns import (
     find_fsdp_unshard_outputs_by_param,
     find_fsdp_unshard_save_node,
     find_fsdp_unshard_save_nodes,
+    fsdp_collective_group_name,
 )
 from torchtitan.experiments.graph_trainer.grad_accumulation import (
     insert_graph_gradient_accumulation,
@@ -68,15 +69,15 @@ from torchtitan.experiments.graph_trainer.graph_pp import (
     split_fsdp_unshard_wait,
 )
 from torchtitan.experiments.graph_trainer.graph_pp.partition import GraphMeta
+from torchtitan.experiments.graph_trainer.graph_pp.split_fsdp_collectives import (
+    coalesce_fsdp_reduce_grad_add_pass,
+)
 from torchtitan.experiments.graph_trainer.graph_pp.utils import (
     example_inputs_from_placeholders,
     flatten_graph_values,
 )
 from torchtitan.experiments.graph_trainer.inductor_passes import (
     full_inductor_compilation_pass,
-)
-from torchtitan.experiments.graph_trainer.graph_pp.split_fsdp_collectives import (
-    coalesce_fsdp_reduce_grad_add_pass,
 )
 from torchtitan.experiments.graph_trainer.make_fx_tracer import (
     extract_module_state,
@@ -1597,6 +1598,31 @@ def _make_forward_graph_with_unshard_and_replicated_param() -> fx.GraphModule:
     return _make_graph_module(graph)
 
 
+def _make_forward_graph_with_dynamic_process_group() -> fx.GraphModule:
+    graph = fx.Graph()
+    sharded_param = graph.placeholder("sharded_param")
+    process_group = graph.placeholder("process_group")
+    x = graph.placeholder("x")
+    all_gather = graph.call_function(
+        torch.ops._c10d_functional.all_gather_into_tensor.default,
+        kwargs={
+            "input": sharded_param,
+            "group_size": 1,
+            "group_name": process_group,
+        },
+    )
+    wait = graph.call_function(
+        torch.ops._c10d_functional.wait_tensor.default,
+        args=(all_gather,),
+    )
+    out = graph.call_function(torch.ops.aten.add.Tensor, args=(wait, x))
+    fsdp_meta = {FSDP_PARAM_FQNS_META: ("linear.weight",)}
+    all_gather.meta["custom"] = fsdp_meta
+    wait.meta["custom"] = fsdp_meta
+    graph.output((out,))
+    return _make_graph_module(graph)
+
+
 def _make_forward_graph_with_quantized_unshard() -> fx.GraphModule:
     graph = fx.Graph()
     sharded_param = graph.placeholder("sharded_param")
@@ -1819,8 +1845,19 @@ def _make_backward_graph_with_reduce_grad_add(
     extra_branch_output: bool = False,
     duplicate_reduced_input: bool = False,
     parameter_gradient_marker: bool = False,
+    dynamic_process_group: bool = False,
+    rhs_dynamic_process_group_axis: int = 0,
+    rhs_dynamic_process_group_uses_distinct_mesh: bool = False,
 ) -> fx.GraphModule:
     graph = fx.Graph()
+    process_group_mesh = (
+        graph.placeholder("process_group") if dynamic_process_group else None
+    )
+    rhs_process_group_mesh = (
+        graph.placeholder("rhs_process_group")
+        if dynamic_process_group and rhs_dynamic_process_group_uses_distinct_mesh
+        else process_group_mesh
+    )
     local_grads = [
         graph.placeholder(f"local_grad_{index}") for index in range(num_contributions)
     ]
@@ -1829,7 +1866,23 @@ def _make_backward_graph_with_reduce_grad_add(
 
     reduced = []
     for index, local_grad in enumerate(local_grads):
-        process_group = rhs_process_group if index == 1 else _FAKE_PG
+        if process_group_mesh is not None:
+            from torchtitan.experiments.graph_trainer.precompile import (
+                _register_coor_ops,
+            )
+
+            _register_coor_ops()
+            process_group = graph.call_function(
+                torch.ops._dtensor.mesh_get_process_group.default,
+                kwargs={
+                    "mesh": rhs_process_group_mesh
+                    if index == 1
+                    else process_group_mesh,
+                    "dim": rhs_dynamic_process_group_axis if index == 1 else 0,
+                },
+            )
+        else:
+            process_group = rhs_process_group if index == 1 else _FAKE_PG
         param_fqn = rhs_param_fqn if index == 1 else "weight"
         reduction_input = local_grad
         if reduce_dtype_cast:
@@ -1839,9 +1892,22 @@ def _make_backward_graph_with_reduce_grad_add(
                 kwargs={"dtype": reduce_dtype},
             )
             reduction_input.meta["val"] = torch.empty(4, dtype=reduce_dtype)
+        reduce_scatter_kwargs = (
+            {
+                "input": reduction_input,
+                "reduce_op": "sum",
+                "group_size": 1,
+                "group_name": process_group,
+            }
+            if dynamic_process_group
+            else {}
+        )
         reduce_scatter = graph.call_function(
             torch.ops._c10d_functional.reduce_scatter_tensor.default,
-            args=(reduction_input, "sum", 1, process_group),
+            args=()
+            if dynamic_process_group
+            else (reduction_input, "sum", 1, process_group),
+            kwargs=reduce_scatter_kwargs,
         )
         reduction_dtype = reduction_input.meta["val"].dtype
         reduce_scatter.meta["val"] = torch.empty(4, dtype=reduction_dtype)
@@ -2811,6 +2877,25 @@ class GraphPPActionBucketingTest(unittest.TestCase):
 
 
 class GraphPPFSDPCollectiveSplitTest(unittest.TestCase):
+    def test_forward_split_accepts_dynamic_process_group(self) -> None:
+        gm = _make_forward_graph_with_dynamic_process_group()
+
+        split = extract_fsdp_unshard_graph(
+            gm,
+            num_params=1,
+            input_names=("sharded_param", "process_group", "x"),
+            flat_input_indices=(0, 1, 2),
+            mode="cut",
+        )
+
+        self.assertIsNone(split.unshard_module)
+        self.assertEqual(split.num_compute_param_inputs, 1)
+        self.assertEqual(split.compute_flat_input_indices, (1, 2))
+        self.assertNotIn(
+            torch.ops._c10d_functional.all_gather_into_tensor.default,
+            _call_targets(split.compute_module),
+        )
+
     def test_forward_pattern_batch_lookup(self) -> None:
         gm = _make_forward_graph_with_unshard_and_replicated_param()
         deduplicate_fsdp_unshard_chains_pass(gm)
@@ -3580,6 +3665,49 @@ class GraphPPFSDPCollectiveSplitTest(unittest.TestCase):
             ),
             1,
         )
+
+    def test_coalesces_reduce_grad_with_dynamic_process_group(self) -> None:
+        gm = _make_backward_graph_with_reduce_grad_add(dynamic_process_group=True)
+
+        coalesce_fsdp_reduce_grad_add_pass(gm, ())
+
+        reduce_scatters = gm.graph.find_nodes(
+            op="call_function",
+            target=torch.ops._c10d_functional.reduce_scatter_tensor.default,
+        )
+        self.assertEqual(len(reduce_scatters), 1)
+        process_group = fsdp_collective_group_name(reduce_scatters[0])
+        self.assertIsInstance(process_group, fx.Node)
+        self.assertEqual(
+            process_group.target,
+            torch.ops._dtensor.mesh_get_process_group.default,
+        )
+        self.assertEqual(process_group.kwargs["dim"], 0)
+
+    def test_does_not_coalesce_reduce_grad_across_dynamic_process_groups(
+        self,
+    ) -> None:
+        for kwargs in (
+            {"rhs_dynamic_process_group_axis": 1},
+            {"rhs_dynamic_process_group_uses_distinct_mesh": True},
+        ):
+            with self.subTest(**kwargs):
+                gm = _make_backward_graph_with_reduce_grad_add(
+                    dynamic_process_group=True,
+                    **kwargs,
+                )
+
+                coalesce_fsdp_reduce_grad_add_pass(gm, ())
+
+                self.assertEqual(
+                    len(
+                        gm.graph.find_nodes(
+                            op="call_function",
+                            target=torch.ops._c10d_functional.reduce_scatter_tensor.default,
+                        )
+                    ),
+                    2,
+                )
 
     def test_backward_split_coalesces_nested_reduce_grad_add(self) -> None:
         contributions = (
