@@ -300,6 +300,55 @@ class TestCompileTimeBenchmark(TestCase):
 
         self.assertEqual(result, CompileTimeBenchmarkResult(2.0, 1.0))
 
+    def test_default_tolerances_are_per_output_dtype(self):
+        eps = torch.finfo(torch.bfloat16).eps
+        bf16_zeros = torch.zeros(2, dtype=torch.bfloat16)
+        fp32_zeros = torch.zeros(2, dtype=torch.float32)
+        cases = (
+            (
+                "accept-bf16-boundary",
+                torch.full((2,), 2 * eps**2, dtype=torch.bfloat16),
+                bf16_zeros,
+                True,
+            ),
+            (
+                "reject-larger-bf16-error",
+                torch.full((2,), 4 * eps**2, dtype=torch.bfloat16),
+                bf16_zeros,
+                False,
+            ),
+            (
+                "accept-mixed-dtype-boundaries",
+                (
+                    torch.full((2,), 2 * eps**2, dtype=torch.bfloat16),
+                    torch.full((2,), 1e-5, dtype=torch.float32),
+                ),
+                (bf16_zeros, fp32_zeros),
+                True,
+            ),
+            (
+                "reject-fp32-error-at-bf16-tolerance",
+                (
+                    torch.full((2,), 2 * eps**2, dtype=torch.bfloat16),
+                    torch.full((2,), 2 * eps**2, dtype=torch.float32),
+                ),
+                (bf16_zeros, fp32_zeros),
+                False,
+            ),
+        )
+
+        for name, actual, expected, should_pass in cases:
+            with self.subTest(name=name):
+                if should_pass:
+                    compile_time_benchmark._assert_close_with_default_tolerances(
+                        actual, expected
+                    )
+                else:
+                    with self.assertRaises(AssertionError):
+                        compile_time_benchmark._assert_close_with_default_tolerances(
+                            actual, expected
+                        )
+
 
 if __name__ == "__main__":
     run_tests()

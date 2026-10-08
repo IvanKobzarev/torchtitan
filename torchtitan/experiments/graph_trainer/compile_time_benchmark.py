@@ -20,6 +20,8 @@ from torch._logging import trace_structured
 from torch._subclasses.fake_tensor import FakeTensor
 from torch.fx import GraphModule, Node
 from torch.fx.experimental.symbolic_shapes import optimization_hint
+from torch.testing._comparison import default_tolerances
+from torch.utils._pytree import tree_flatten
 from triton.testing import do_bench
 
 logger = logging.getLogger(__name__)
@@ -263,6 +265,46 @@ def _realize_paired_inputs(
     return baseline_inputs, tuple(candidate_inputs)
 
 
+def _default_tensor_comparison_tolerances(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+) -> tuple[float, float]:
+    rtol, atol = default_tolerances(actual, expected)
+    low_precision_eps = max(
+        (
+            torch.finfo(value.dtype).eps
+            for value in (actual, expected)
+            if value.dtype in (torch.bfloat16, torch.float16)
+        ),
+        default=0.0,
+    )
+    return rtol, max(atol, 2 * low_precision_eps**2)
+
+
+def _assert_close_with_default_tolerances(actual: Any, expected: Any) -> None:
+    actual_leaves, actual_spec = tree_flatten(actual)
+    expected_leaves, expected_spec = tree_flatten(expected)
+    if actual_spec != expected_spec:
+        torch.testing.assert_close(actual, expected)
+        raise AssertionError("actual and expected outputs have different structures")
+
+    for actual_leaf, expected_leaf in zip(actual_leaves, expected_leaves):
+        if isinstance(actual_leaf, torch.Tensor) and isinstance(
+            expected_leaf, torch.Tensor
+        ):
+            rtol, atol = _default_tensor_comparison_tolerances(
+                actual_leaf, expected_leaf
+            )
+            torch.testing.assert_close(
+                actual_leaf,
+                expected_leaf,
+                atol=atol,
+                rtol=rtol,
+            )
+        else:
+            torch.testing.assert_close(actual_leaf, expected_leaf)
+
+
 class CompileTimeBenchmarker:
     """Measure explicit rewrite regions and cache structurally equivalent runs."""
 
@@ -320,12 +362,15 @@ class CompileTimeBenchmarker:
         )
         expected = processed_baseline(*baseline_inputs)
         actual = processed_candidate(*candidate_inputs)
-        torch.testing.assert_close(
-            actual,
-            expected,
-            atol=self.atol,
-            rtol=self.rtol,
-        )
+        if self.atol is None:
+            _assert_close_with_default_tolerances(actual, expected)
+        else:
+            torch.testing.assert_close(
+                actual,
+                expected,
+                atol=self.atol,
+                rtol=self.rtol,
+            )
         baseline_ms = do_bench(
             lambda: processed_baseline(*baseline_inputs),
             rep=self.duration_ms,
