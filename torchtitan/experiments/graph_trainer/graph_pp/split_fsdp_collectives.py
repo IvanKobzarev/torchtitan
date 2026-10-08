@@ -500,6 +500,8 @@ class FSDPUnshardExtraction:
             collectives removed.
         unshard_flat_param_indices (tuple[int, ...]): Flat parameter indices
             consumed by ``unshard_module``.
+        unshard_flat_runtime_input_indices (tuple[int, ...]): Flat traced input
+            indices for non-parameter inputs consumed by ``unshard_module``.
         unshard_output_names (tuple[str, ...]): ``unshard_module`` output
             names.
         compute_input_names (tuple[str, ...]): ``compute_module``
@@ -515,6 +517,7 @@ class FSDPUnshardExtraction:
     unshard_module: fx.GraphModule | None
     compute_module: fx.GraphModule
     unshard_flat_param_indices: tuple[int, ...]
+    unshard_flat_runtime_input_indices: tuple[int, ...]
     unshard_output_names: tuple[str, ...]
     compute_input_names: tuple[str, ...]
     compute_flat_input_indices: tuple[int, ...]
@@ -555,8 +558,10 @@ class FSDPReduceGradExtraction:
         compute_output_names (tuple[str, ...]): ``compute_module`` output
             names.
         reduce_grad_input_names (tuple[str, ...]): ``reduce_grad_module``
-            placeholder names, or empty when ``reduce_grad_module`` is
+            gradient input names, or empty when ``reduce_grad_module`` is
             ``None``.
+        reduce_grad_runtime_input_names (tuple[str, ...]): Non-gradient
+            placeholder names consumed by ``reduce_grad_module``.
         reduction_node_names (frozenset[str]): Nodes owned by the reduction
             epilogue, including when extraction is disabled.
     """
@@ -565,7 +570,29 @@ class FSDPReduceGradExtraction:
     reduce_grad_module: fx.GraphModule | None
     compute_output_names: tuple[str, ...]
     reduce_grad_input_names: tuple[str, ...]
+    reduce_grad_runtime_input_names: tuple[str, ...] = ()
     reduction_node_names: frozenset[str] = frozenset()
+
+
+def _input_placeholders_in_closure(
+    outputs: list[object],
+    *,
+    boundaries: set[fx.Node],
+) -> set[fx.Node]:
+    """Return placeholders needed above explicit extraction boundaries."""
+    pending = list(outputs)
+    seen: set[fx.Node] = set()
+    placeholders: set[fx.Node] = set()
+    while pending:
+        value = pending.pop()
+        if not isinstance(value, fx.Node) or value in seen or value in boundaries:
+            continue
+        seen.add(value)
+        if value.op == "placeholder":
+            placeholders.add(value)
+        else:
+            pending.extend(value.all_input_nodes)
+    return placeholders
 
 
 def remove_fsdp_reduction_tail(
@@ -800,6 +827,7 @@ def extract_fsdp_unshard_graph(
             unshard_module=None,
             compute_module=graph_module,
             unshard_flat_param_indices=(),
+            unshard_flat_runtime_input_indices=(),
             unshard_output_names=(),
             compute_input_names=input_names,
             compute_flat_input_indices=flat_input_indices,
@@ -845,6 +873,7 @@ def extract_fsdp_unshard_graph(
             unshard_module=None,
             compute_module=graph_module,
             unshard_flat_param_indices=(),
+            unshard_flat_runtime_input_indices=(),
             unshard_output_names=(),
             compute_input_names=input_names,
             compute_flat_input_indices=flat_input_indices,
@@ -864,24 +893,18 @@ def extract_fsdp_unshard_graph(
         output_node.meta.get("desc", [None] * len(all_outputs))
     )
     unshard_output_descs = [None] * len(unshard_outputs)
-    unshard_graph_inputs = param_inputs
-    if mode == "cut":
-        # CooR makes process groups graph inputs. Cut mode uses this graph only
-        # to identify and remove the unshard region, so include those inputs.
-        pending = [
-            output for output in compute_param_inputs if isinstance(output, fx.Node)
-        ]
-        unshard_ancestors: set[fx.Node] = set()
-        while pending:
-            node = pending.pop()
-            if node in unshard_ancestors:
-                continue
-            unshard_ancestors.add(node)
-            pending.extend(node.all_input_nodes)
-        unshard_graph_inputs = [
-            *param_inputs,
-            *(node for node in remaining_inputs if node in unshard_ancestors),
-        ]
+    # CooR makes process groups graph inputs. Preserve the non-parameter
+    # placeholders needed to resolve those groups in both cut and split mode.
+    unshard_runtime_inputs = [
+        node
+        for node in remaining_inputs
+        if node
+        in _input_placeholders_in_closure(
+            compute_param_inputs,
+            boundaries=set(param_inputs),
+        )
+    ]
+    unshard_graph_inputs = [*param_inputs, *unshard_runtime_inputs]
 
     with allow_fx_graph_extraction_of_side_effectful_ops(
         {
@@ -952,6 +975,10 @@ def extract_fsdp_unshard_graph(
         unshard_module=unshard_module,
         compute_module=compute_module,
         unshard_flat_param_indices=tuple(param_flat_indices),
+        unshard_flat_runtime_input_indices=tuple(
+            remaining_flat_input_indices[remaining_inputs.index(node)]
+            for node in unshard_runtime_inputs
+        ),
         unshard_output_names=unshard_output_names,
         compute_input_names=compute_input_names,
         compute_flat_input_indices=compute_flat_input_indices,
@@ -1118,6 +1145,15 @@ def extract_fsdp_reduce_grad_graph(
         for input_node in reduce_grad_inputs
         if isinstance(input_node, fx.Node)
     )
+    reduce_grad_runtime_inputs = [
+        node
+        for node in placeholders
+        if node
+        in _input_placeholders_in_closure(
+            list(grad_outputs),
+            boundaries=set(unique_reduce_grad_inputs),
+        )
+    ]
     compute_grad_output_descs = [None] * len(reduce_grad_inputs)
     with allow_fx_graph_extraction_of_side_effectful_ops(
         {
@@ -1140,7 +1176,7 @@ def extract_fsdp_reduce_grad_graph(
         reduce_grad_graph = (
             _extract_graph_with_inputs_outputs(
                 graph,
-                unique_reduce_grad_inputs,
+                [*unique_reduce_grad_inputs, *reduce_grad_runtime_inputs],
                 list(grad_outputs),
                 grad_output_descs,
                 "reduce_grad",
@@ -1170,5 +1206,8 @@ def extract_fsdp_reduce_grad_graph(
         compute_output_names=output_names(compute_module),
         # The reduction graph's placeholders are the unique reduction inputs.
         reduce_grad_input_names=tuple(node.name for node in unique_reduce_grad_inputs),
+        reduce_grad_runtime_input_names=tuple(
+            node.name for node in reduce_grad_runtime_inputs
+        ),
         reduction_node_names=frozenset(reduction_node_names),
     )

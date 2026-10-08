@@ -11,6 +11,7 @@ import operator
 import unittest
 import warnings
 from dataclasses import dataclass, replace
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
@@ -39,8 +40,10 @@ from torchtitan.experiments.graph_trainer.deepseek_v3 import (
     build_model_config as build_deepseek_v3_model_config,
 )
 from torchtitan.experiments.graph_trainer.fsdp_passes import (
+    _FSDP_BUCKET_META,
     deduplicate_fsdp_unshard_chains_pass,
     joint_transformer_block_bucketing_reordering_pass,
+    JointManualOverlapScheduler,
     merge_all_all_gathers,
     merge_all_all_reduces,
     merge_all_reduce_scatters,
@@ -68,15 +71,15 @@ from torchtitan.experiments.graph_trainer.graph_pp import (
     split_fsdp_unshard_wait,
 )
 from torchtitan.experiments.graph_trainer.graph_pp.partition import GraphMeta
+from torchtitan.experiments.graph_trainer.graph_pp.split_fsdp_collectives import (
+    coalesce_fsdp_reduce_grad_add_pass,
+)
 from torchtitan.experiments.graph_trainer.graph_pp.utils import (
     example_inputs_from_placeholders,
     flatten_graph_values,
 )
 from torchtitan.experiments.graph_trainer.inductor_passes import (
     full_inductor_compilation_pass,
-)
-from torchtitan.experiments.graph_trainer.graph_pp.split_fsdp_collectives import (
-    coalesce_fsdp_reduce_grad_add_pass,
 )
 from torchtitan.experiments.graph_trainer.make_fx_tracer import (
     extract_module_state,
@@ -1524,6 +1527,55 @@ def _make_distributed_reduction_order_graph(
     return _make_graph_module(graph)
 
 
+def _make_dynamic_reduction_order_graph(*, reverse_local_order: bool) -> fx.GraphModule:
+    from torchtitan.experiments.graph_trainer.precompile import _register_coor_ops
+
+    _register_coor_ops()
+    graph = fx.Graph()
+    expert_mesh = graph.placeholder("expert_mesh")
+    dense_mesh = graph.placeholder("dense_mesh")
+    expert_gradient = graph.placeholder("expert_gradient")
+    dense_gradient = graph.placeholder("dense_gradient")
+    with FakeTensorMode() as fake_mode:
+        expert_input = fake_mode.from_tensor(torch.empty(2, dtype=torch.float32))
+        dense_input = fake_mode.from_tensor(torch.empty(4, dtype=torch.float32))
+        output_value = fake_mode.from_tensor(torch.empty(1, dtype=torch.float32))
+    expert_gradient.meta["val"] = expert_input
+    dense_gradient.meta["val"] = dense_input
+
+    reductions = {
+        "expert": (expert_mesh, expert_gradient, 2),
+        "dense": (dense_mesh, dense_gradient, 4),
+    }
+    outputs: dict[str, fx.Node] = {}
+    order = ("dense", "expert") if reverse_local_order else ("expert", "dense")
+    for role in order:
+        mesh, gradient, group_size = reductions[role]
+        process_group = graph.call_function(
+            torch.ops._dtensor.mesh_get_process_group.default,
+            args=(mesh, 0),
+        )
+        process_group.meta["val"] = SimpleNamespace(group_name=f"{role}_group")
+        reduction = graph.call_function(
+            torch.ops._c10d_functional.reduce_scatter_tensor.default,
+            args=(gradient, "sum", group_size, process_group),
+        )
+        wait = graph.call_function(
+            torch.ops._c10d_functional.wait_tensor.default,
+            args=(reduction,),
+        )
+        module_fqn = f"layers.0.{role}"
+        for node in (reduction, wait):
+            node.meta["val"] = output_value
+            node.meta["custom"] = {
+                _MODULE_FQN: module_fqn,
+                FSDP_PARAM_FQNS_META: (f"{module_fqn}.weight",),
+            }
+        outputs[role] = wait
+    graph.output((outputs["expert"], outputs["dense"]))
+    return _make_graph_module(graph)
+
+
 def _quantize_weight_for_graph_test(
     weight: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -2535,6 +2587,53 @@ class GraphPPActionBucketingTest(unittest.TestCase):
             (_FAKE_PG_2, _FAKE_PG),
         )
 
+    def test_standalone_reduce_grad_orders_dynamic_process_groups_by_mesh_input(
+        self,
+    ) -> None:
+        gm = _make_dynamic_reduction_order_graph(reverse_local_order=True)
+        reductions = gm.graph.find_nodes(
+            op="call_function",
+            target=torch.ops._c10d_functional.reduce_scatter_tensor.default,
+        )
+        waits = gm.graph.find_nodes(
+            op="call_function",
+            target=torch.ops._c10d_functional.wait_tensor.default,
+        )
+        plan_fqns = ("layers.0.expert", "layers.0.dense")
+        for reduction in reductions:
+            reduction.meta[_FSDP_BUCKET_META] = {"plan_fqns": plan_fqns}
+        scheduler = SimpleNamespace(
+            graph=gm.graph,
+            bucketer=SimpleNamespace(
+                bucketed_node_types={
+                    **{node: "bucketed_reduce_scatter" for node in reductions},
+                    **{node: "bucketed_reduce_scatter_wait" for node in waits},
+                },
+                node_to_wait_map={node: node for node in waits},
+            ),
+            _bucket_plan_order={plan_fqns: 0},
+        )
+        process_group_ranks = {
+            "expert_group": [0, 1],
+            "dense_group": [0, 1, 2, 3],
+        }
+        with patch(
+            "torch.distributed.get_process_group_ranks",
+            side_effect=lambda group: process_group_ranks[group.group_name],
+        ):
+            JointManualOverlapScheduler._schedule_communication_only_reductions(
+                scheduler
+            )
+
+        group_names = []
+        for node in gm.graph.nodes:
+            if node.target != torch.ops._c10d_functional.reduce_scatter_tensor.default:
+                continue
+            process_group = node.args[3]
+            self.assertIsInstance(process_group, fx.Node)
+            group_names.append(process_group.meta["val"].group_name)
+        self.assertEqual(group_names, ["expert_group", "dense_group"])
+
     def test_standalone_reduce_grad_rejects_process_group_name_only_tie(
         self,
     ) -> None:
@@ -2865,15 +2964,51 @@ class GraphPPFSDPCollectiveSplitTest(unittest.TestCase):
             num_params=1,
             input_names=("sharded_param", "process_group", "x"),
             flat_input_indices=(0, 1, 2),
-            mode="cut",
+            mode="split",
         )
 
-        self.assertIsNone(split.unshard_module)
+        self.assertIsNotNone(split.unshard_module)
+        if split.unshard_module is None:
+            self.fail("Expected dynamic process group in the unshard graph")
+        self.assertEqual(
+            _placeholder_names(split.unshard_module),
+            ("sharded_param", "process_group"),
+        )
+        self.assertEqual(split.unshard_flat_param_indices, (0,))
+        self.assertEqual(split.unshard_flat_runtime_input_indices, (1,))
         self.assertEqual(split.num_compute_param_inputs, 1)
         self.assertEqual(split.compute_flat_input_indices, (1, 2))
+        self.assertIn(
+            torch.ops._c10d_functional.all_gather_into_tensor.default,
+            _call_targets(split.unshard_module),
+        )
         self.assertNotIn(
             torch.ops._c10d_functional.all_gather_into_tensor.default,
             _call_targets(split.compute_module),
+        )
+
+    def test_backward_split_accepts_dynamic_process_group(self) -> None:
+        gm = _make_backward_graph_with_reduce_grad_add(dynamic_process_group=True)
+        coalesce_fsdp_reduce_grad_add_pass(gm, ())
+
+        split = extract_fsdp_reduce_grad_graph(gm, num_param_grads=1)
+
+        self.assertIsNotNone(split.reduce_grad_module)
+        if split.reduce_grad_module is None:
+            self.fail("Expected dynamic process group in the reduce-grad graph")
+        self.assertEqual(
+            _placeholder_names(split.reduce_grad_module),
+            ("add_tensor_1", "process_group"),
+        )
+        self.assertEqual(split.reduce_grad_input_names, ("add_tensor_1",))
+        self.assertEqual(split.reduce_grad_runtime_input_names, ("process_group",))
+        self.assertNotIn(
+            torch.ops._c10d_functional.reduce_scatter_tensor.default,
+            _call_targets(split.compute_module),
+        )
+        self.assertIn(
+            torch.ops._c10d_functional.reduce_scatter_tensor.default,
+            _call_targets(split.reduce_grad_module),
         )
 
     def test_forward_pattern_batch_lookup(self) -> None:

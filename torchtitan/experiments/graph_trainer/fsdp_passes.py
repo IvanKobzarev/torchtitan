@@ -803,16 +803,30 @@ class JointManualOverlapScheduler(ManualOverlapScheduler):
                 + ", ".join(missing_waits)
             )
 
-        def reduction_group_name(node: fx.Node) -> str:
+        def reduction_group(node: fx.Node) -> object:
             if is_reduce_scatter_tensor(node):
-                return str(node.args[3])
+                return node.args[3]
             if is_all_reduce_tensor(node):
-                return str(node.args[2])
+                return node.args[2]
             raise AssertionError(f"Unsupported reduction node {node.name}")
 
         def process_group_key(node: fx.Node) -> tuple[int, tuple[int, ...]]:
-            group_name = reduction_group_name(node)
-            process_group = dist.distributed_c10d._resolve_process_group(group_name)
+            group = reduction_group(node)
+            if isinstance(group, fx.Node):
+                if group.target != torch.ops._dtensor.mesh_get_process_group.default:
+                    raise AssertionError(
+                        f"Reduction {node.name} has unsupported dynamic process "
+                        f"group producer {group.format_node()}"
+                    )
+                if "val" not in group.meta:
+                    raise AssertionError(
+                        f"Reduction {node.name} dynamic process group is missing "
+                        "its trace-time ProcessGroup value"
+                    )
+                process_group = group.meta["val"]
+            else:
+                process_group = dist.distributed_c10d._resolve_process_group(str(group))
+
             ranks = tuple(sorted(dist.get_process_group_ranks(process_group)))
             return (len(ranks), ranks)
 
@@ -829,8 +843,8 @@ class JointManualOverlapScheduler(ManualOverlapScheduler):
                 raise AssertionError(
                     f"Reduction {node.name} has unknown bucket plan {plan_fqns}"
                 )
-            group_size, ranks = process_group_key(node)
             collective_kind = 0 if is_reduce_scatter_tensor(node) else 1
+            group_size, ranks = process_group_key(node)
             return (
                 self._bucket_plan_order[plan_fqns],
                 group_size,
@@ -887,8 +901,8 @@ class JointManualOverlapScheduler(ManualOverlapScheduler):
                         if lhs_before_rhs == rhs_before_lhs:
                             group_names = sorted(
                                 {
-                                    reduction_group_name(lhs),
-                                    reduction_group_name(rhs),
+                                    str(reduction_group(lhs)),
+                                    str(reduction_group(rhs)),
                                 }
                             )
                             relationship = "cyclic" if lhs_before_rhs else "independent"

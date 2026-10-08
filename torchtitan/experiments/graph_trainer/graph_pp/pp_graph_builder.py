@@ -17,6 +17,7 @@ from typing import Any, cast, TYPE_CHECKING
 import torch
 import torch.fx as fx
 import torch.utils._pytree as pytree
+from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.pipelining.schedules import _PipelineScheduleRuntime
 
 from torchtitan.experiments.graph_trainer.common_utils import (
@@ -169,6 +170,8 @@ class _StageGraphMeta:
     bw_no_fsdp_output_names: tuple[str, ...] = ()
     reduce_grad_input_names: tuple[str, ...] = ()
     unshard_flat_param_indices: tuple[int, ...] = ()
+    unshard_runtime_mesh_indices: tuple[int, ...] = ()
+    reduce_grad_runtime_mesh_indices: tuple[int, ...] = ()
     num_fw_param_inputs: int = 0
     num_unshard_launch_values: int = 0
     is_last_stage: bool = False
@@ -194,6 +197,7 @@ class GraphTrainerStageGraphs(SplitStageGraphs):
     compiled: bool = False
     full_bw_grad_accumulator_indices: tuple[int, ...] = ()
     bw_dw_grad_accumulator_indices: tuple[int, ...] = ()
+    runtime_meshes: tuple[DeviceMesh, ...] = ()
 
     def __post_init__(self) -> None:
         num_param_inputs = self.meta.num_fw_param_inputs
@@ -207,6 +211,20 @@ class GraphTrainerStageGraphs(SplitStageGraphs):
                 f"num_params={num_param_inputs}, "
                 f"flat_indices={self.meta.fwd_flat_input_indices}"
             )
+        for graph_name, indices in (
+            ("unshard", self.meta.unshard_runtime_mesh_indices),
+            ("reduce-grad", self.meta.reduce_grad_runtime_mesh_indices),
+        ):
+            invalid_indices = tuple(
+                index
+                for index in indices
+                if index < 0 or index >= len(self.runtime_meshes)
+            )
+            if invalid_indices:
+                raise ValueError(
+                    f"GraphPP {graph_name} runtime mesh indices are out of "
+                    f"range: {invalid_indices} for {len(self.runtime_meshes)} meshes"
+                )
 
     def _grad_accumulator_args(
         self,
@@ -267,6 +285,10 @@ class GraphTrainerStageGraphs(SplitStageGraphs):
                     f"{len(sharded_param_values)} sharded params"
                 )
             unshard_args.append(sharded_param_values[param_index])
+        unshard_args.extend(
+            self.runtime_meshes[index]
+            for index in self.meta.unshard_runtime_mesh_indices
+        )
         unshard_launch_values = list(
             _execute_graph_module(self.modules.unshard_launch, unshard_args)
         )
@@ -371,6 +393,7 @@ class GraphTrainerStageGraphs(SplitStageGraphs):
             unsharded_param_values=unsharded_param_values,
             flat_non_param_inputs=[
                 *buffer_values,
+                *self.runtime_meshes,
                 *flat_user_inputs,
                 *runtime_values,
             ],
@@ -650,6 +673,10 @@ class GraphTrainerStageGraphs(SplitStageGraphs):
         reduce_grad_args = [
             grad_values_by_name[name] for name in self.meta.reduce_grad_input_names
         ]
+        reduce_grad_args.extend(
+            self.runtime_meshes[index]
+            for index in self.meta.reduce_grad_runtime_mesh_indices
+        )
         return list(_execute_graph_module(self.modules.reduce_grad, reduce_grad_args))
 
     def param_grads_for_accumulation(
@@ -829,6 +856,7 @@ def _build_stage_graphs(
     gradient_accumulation: bool = False,
     fuse_wgrad_accumulation: bool = False,
     activation_slot_id_1: torch.Tensor | None = None,
+    runtime_meshes: list[DeviceMesh] | None = None,
 ) -> None:
     """Trace one stage-local train step and attach bound GraphPP graphs."""
     compile_config: GraphTrainerCompileConfig = config.compile
@@ -909,7 +937,11 @@ def _build_stage_graphs(
                 tuple(grads[len(grad_params) :]),
             )
 
-        traced = minimal_fx_tracer(stage_step, module=stage.submod)(
+        traced = minimal_fx_tracer(
+            stage_step,
+            module=stage.submod,
+            precompile_meshes=runtime_meshes,
+        )(
             stage_args,
             stage_kwargs,
             target,
@@ -963,7 +995,11 @@ def _build_stage_graphs(
                 tuple(grads[len(grad_params) :]),
             )
 
-        traced = minimal_fx_tracer(stage_step, module=stage.submod)(
+        traced = minimal_fx_tracer(
+            stage_step,
+            module=stage.submod,
+            precompile_meshes=runtime_meshes,
+        )(
             stage_args,
             stage_kwargs,
             activation_slot_id_1,
@@ -975,7 +1011,7 @@ def _build_stage_graphs(
         )
         backward_only_start = len(
             flatten_graph_values([*state_flat, *prefix_user_flat])
-        )
+        ) + len(runtime_meshes or ())
         backward_only_count = len(flatten_graph_values(list(output_grads)))
         backward_only_indices = tuple(
             range(backward_only_start, backward_only_start + backward_only_count)
@@ -1109,6 +1145,36 @@ def _build_stage_graphs(
             ),
         )
     full_bw_repeat = fsdp_bw.compute_module
+
+    runtime_meshes = tuple(runtime_meshes or ())
+    runtime_mesh_flat_start = num_state_param_values + num_state_buffer_values
+    runtime_mesh_flat_end = runtime_mesh_flat_start + len(runtime_meshes)
+
+    def runtime_mesh_index(flat_index: int, *, graph_name: str) -> int:
+        if not runtime_mesh_flat_start <= flat_index < runtime_mesh_flat_end:
+            raise ValueError(
+                f"{graph_name} has a non-state runtime input outside the "
+                "precompile mesh range: "
+                f"flat index {flat_index}, mesh range "
+                f"[{runtime_mesh_flat_start}, {runtime_mesh_flat_end})"
+            )
+        return flat_index - runtime_mesh_flat_start
+
+    traced_placeholders = list(traced.gm.graph.find_nodes(op="placeholder"))
+    flat_index_by_name = {
+        node.name: index for index, node in enumerate(traced_placeholders)
+    }
+    unshard_runtime_mesh_indices = tuple(
+        runtime_mesh_index(flat_index, graph_name="GraphPP unshard")
+        for flat_index in fsdp_fw.unshard_flat_runtime_input_indices
+    )
+    reduce_grad_runtime_mesh_indices = tuple(
+        runtime_mesh_index(
+            flat_index_by_name[name],
+            graph_name="GraphPP gradient reduction",
+        )
+        for name in fsdp_bw.reduce_grad_runtime_input_names
+    )
     didw_split = stage_builder._split_stage_backward_graph(
         full_bw_repeat,
         num_param_grads=num_param_grad_values,
@@ -1174,6 +1240,8 @@ def _build_stage_graphs(
         bw_no_fsdp_output_names=fsdp_bw.compute_output_names,
         reduce_grad_input_names=fsdp_bw.reduce_grad_input_names,
         unshard_flat_param_indices=fsdp_fw.unshard_flat_param_indices,
+        unshard_runtime_mesh_indices=unshard_runtime_mesh_indices,
+        reduce_grad_runtime_mesh_indices=reduce_grad_runtime_mesh_indices,
         num_fw_param_inputs=fsdp_fw.num_compute_param_inputs,
         num_unshard_launch_values=num_unshard_launch_values,
         is_last_stage=stage.is_last,
@@ -1183,6 +1251,7 @@ def _build_stage_graphs(
         meta=graph_meta,
         full_bw_grad_accumulator_indices=full_bw_grad_accumulator_indices,
         bw_dw_grad_accumulator_indices=bw_dw_grad_accumulator_indices,
+        runtime_meshes=runtime_meshes,
     )
     logger.info(
         "GraphPP traced stage %s: fwd_outputs=%s saved=%s "

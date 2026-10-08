@@ -2278,6 +2278,8 @@ class GraphRuntimeTraceTest(unittest.TestCase):
                 num_fw_param_inputs=1,
                 fwd_input_names=("unsharded_weight", "x"),
                 fwd_flat_input_indices=(2,),
+                unshard_runtime_mesh_indices=(),
+                reduce_grad_runtime_mesh_indices=(),
                 uses_dist_moe_activation_slot=False,
                 is_last_stage=False,
             ),
@@ -2297,6 +2299,59 @@ class GraphRuntimeTraceTest(unittest.TestCase):
 
         self.assertIs(forward_args[0], unsharded_weight)
         self.assertIs(forward_args[1], x)
+
+    def test_fsdp_actions_receive_runtime_mesh_inputs(self) -> None:
+        class BoxedRecorder:
+            def __init__(self, output: object) -> None:
+                self.output = output
+                self.args: tuple[object, ...] = ()
+
+            def __call__(self, args: list[object]) -> tuple[object, ...]:
+                self.args = tuple(args)
+                args.clear()
+                return (self.output,)
+
+        unshard_output = object()
+        reduce_output = object()
+        unshard = BoxedRecorder(unshard_output)
+        reduce_grad = BoxedRecorder(reduce_output)
+        dense_mesh = object()
+        sparse_mesh = object()
+        graphs = GraphTrainerStageGraphs(
+            modules=types.SimpleNamespace(
+                unshard_launch=unshard,
+                reduce_grad=reduce_grad,
+            ),
+            meta=types.SimpleNamespace(
+                num_sharded_param_values=2,
+                num_fw_param_inputs=0,
+                fwd_input_names=(),
+                fwd_flat_input_indices=(),
+                unshard_flat_param_indices=(1,),
+                unshard_runtime_mesh_indices=(0,),
+                num_unshard_launch_values=1,
+                num_param_grad_values=2,
+                bw_no_fsdp_output_names=("grad0", "grad1"),
+                reduce_grad_input_names=("grad0",),
+                reduce_grad_runtime_mesh_indices=(1,),
+            ),
+            runtime_meshes=(dense_mesh, sparse_mesh),
+        )
+        param0 = object()
+        param1 = object()
+        grad0 = object()
+        grad1 = object()
+
+        self.assertEqual(
+            graphs.launch_unshard_params([param0, param1]),
+            [unshard_output],
+        )
+        self.assertEqual(unshard.args, (param1, dense_mesh))
+        self.assertEqual(
+            graphs.reduce_grads([grad0, grad1]),
+            [reduce_output],
+        )
+        self.assertEqual(reduce_grad.args, (grad0, sparse_mesh))
 
     def test_stage_trace_preserves_buffers_and_forward_keeps_mutations(self) -> None:
         class BufferCountingStage(nn.Module):
