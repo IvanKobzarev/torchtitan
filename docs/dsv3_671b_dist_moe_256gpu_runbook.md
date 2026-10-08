@@ -684,6 +684,7 @@ tracked final overrides are installed:
 export LAUNCHER_TEMPLATE_FBPKG_ID=torchtitan_muse_spark_launcher_ivankobzarev_20261005_v1:925c00775066448cb3fcdcb8f43b395f
 export LAUNCHER_TEMPLATE_DIR=/path/to/large/tmp/launcher-template
 export LAUNCHER_SOURCE=/path/to/large/tmp/final-launcher-source
+export PP1_PRECOMPILE_ARTIFACT_DIR=/path/to/verified/pp1-artifact
 export FINAL_LAUNCHER_NAME=torchtitan_muse_spark_launcher_dist_moe_mtp1_final
 export CONDA_MAST_CORE_FBPKG_ID=conda_mast_core:bd79ff6a03ba48989f1b142418c1f0b0
 export TORCHX_TORCHRUN_FBPKG_ID=torchx_torchrun:5b856b7bf0ff472baad17a127e73dc3a
@@ -714,6 +715,15 @@ install -m 0755 "$LAUNCHER_TEMPLATE_DIR/cxx_wrapper.sh" "$LAUNCHER_SOURCE/"
 install -m 0644 "$LAUNCHER_TEMPLATE_DIR/mast.py" "$LAUNCHER_SOURCE/"
 install -m 0755 "$LAUNCHER_TEMPLATE_DIR/mount.sh" "$LAUNCHER_SOURCE/"
 cp -a "$LAUNCHER_TEMPLATE_DIR/lib" "$LAUNCHER_SOURCE/"
+test -f \
+  "$PP1_PRECOMPILE_ARTIFACT_DIR/scheduled_fwd_bwd_default.bin"
+mkdir -p "$LAUNCHER_SOURCE/precompile_artifacts/pp1"
+install -m 0644 \
+  "$PP1_PRECOMPILE_ARTIFACT_DIR/scheduled_fwd_bwd_default.bin" \
+  "$LAUNCHER_SOURCE/precompile_artifacts/pp1/scheduled_fwd_bwd_default.bin"
+sha256sum \
+  "$LAUNCHER_SOURCE/precompile_artifacts/pp1/scheduled_fwd_bwd_default.bin" \
+  | tee "$RELEASE_ARTIFACTS/pp1-precompile-artifact-sha256.txt"
 python3 - "$LAUNCHER_SOURCE/mast.py" <<'PY'
 from pathlib import Path
 import sys
