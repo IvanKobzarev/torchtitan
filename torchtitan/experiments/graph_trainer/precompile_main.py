@@ -28,6 +28,7 @@ import torch.distributed as dist
 from torchtitan.components.loss import ChunkedLossWrapper
 from torchtitan.config import apply_overrides, ConfigLoader, TORCH_DTYPE_MAP
 from torchtitan.distributed import ParallelismContext
+from torchtitan.distributed.cuda_graph import cuda_graphs_supported
 from torchtitan.experiments.graph_trainer.common_utils import (
     maybe_register_blockmask_pytree_node,
 )
@@ -259,6 +260,7 @@ def _compute_precompile_config_fingerprint(
     config,
     *,
     num_microbatches,
+    outer_cudagraphs_enabled,
 ):
     from torchtitan.experiments.graph_trainer.precompile import (
         compute_config_fingerprint,
@@ -271,6 +273,7 @@ def _compute_precompile_config_fingerprint(
         compile_config,
         parallelism_context,
         graph_signature=graph_signature,
+        outer_cudagraphs_enabled=outer_cudagraphs_enabled,
     )
 
 
@@ -342,6 +345,9 @@ def _precompile_aot_fx_trace(
     )
 
     storage = DiskStorageAdapter(compile_config.precompile_artifact_dir)
+    outer_cudagraphs_enabled = (
+        not config.training.disable_cuda_graphs and cuda_graphs_supported()
+    )
     num_microbatches = _num_spmd_microbatches(config, parallelism_context)
     config_fingerprint = _compute_precompile_config_fingerprint(
         model,
@@ -349,6 +355,7 @@ def _precompile_aot_fx_trace(
         parallelism_context,
         config,
         num_microbatches=num_microbatches,
+        outer_cudagraphs_enabled=outer_cudagraphs_enabled,
     )
     if num_microbatches > 1:
         from torchtitan.experiments.graph_trainer.graph_pp.pipeline import (
@@ -422,7 +429,10 @@ def _precompile_aot_fx_trace(
     )
 
     passes = compile_time_passes(
-        traced_result, config, parallelism_context=parallelism_context
+        traced_result,
+        config,
+        outer_cudagraphs_enabled=outer_cudagraphs_enabled,
+        parallelism_context=parallelism_context,
     )
 
     traced_result.gm = apply_graph_passes(

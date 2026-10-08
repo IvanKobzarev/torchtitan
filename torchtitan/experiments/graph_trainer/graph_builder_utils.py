@@ -31,6 +31,7 @@ import torch
 import torch.fx as fx
 
 from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.distributed.cuda_graph import cuda_graphs_supported
 from torchtitan.experiments.graph_trainer.common_utils import (
     BOXED_CODEGEN_META,
     ensure_boxed_graph_module,
@@ -74,15 +75,24 @@ class GraphTrainerConfigView:
 
     GraphPP is entered through TorchTitan's generic pipelining function API,
     which passes decomposed config fields instead of the full
-    ``GraphTrainer.Config``. PP graph construction reads only ``compile``,
-    ``parallelism``, and ``model``, so GraphPP exposes exactly those fields
-    instead of synthesizing a fake full trainer config. Both SPMD paths pass
-    the full ``GraphTrainer.Config``, which has the same fields.
+    ``GraphTrainer.Config``. PP graph construction reads the compile,
+    parallelism, and model fields plus whether its caller owns outer CUDA
+    graph capture. Both SPMD paths pass the full ``GraphTrainer.Config``.
     """
 
     compile: GraphTrainerCompileConfig
     parallelism: ParallelismConfig
     model: BaseModel.Config
+    outer_cudagraphs_enabled: bool
+
+
+def _outer_cudagraphs_enabled(
+    config: "GraphTrainer.Config | GraphTrainerConfigView",
+) -> bool:
+    """Return the outer CUDA graph state supplied to compile-time passes."""
+    if isinstance(config, GraphTrainerConfigView):
+        return config.outer_cudagraphs_enabled
+    return not config.training.disable_cuda_graphs and cuda_graphs_supported()
 
 
 def _find_fsdp_bucketing_pass(
@@ -317,6 +327,7 @@ def _apply_graph_pp_pre_partition_or_extraction_passes(
         traced,
         config,
         parallelism_context=parallelism_context,
+        outer_cudagraphs_enabled=_outer_cudagraphs_enabled(config),
         include_inductor=False,
         include_mandatory_normalization=False,
     )

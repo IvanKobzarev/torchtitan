@@ -48,6 +48,8 @@ from torchtitan.experiments.graph_trainer.graph_builder import (
 from torchtitan.experiments.graph_trainer.graph_builder_utils import (
     _compile_graph_pp_module,
     _execute_graph_module,
+    _outer_cudagraphs_enabled,
+    GraphTrainerConfigView,
 )
 from torchtitan.experiments.graph_trainer.graph_pp import multiplex_fw_bw_graph
 from torchtitan.experiments.graph_trainer.graph_pp.pipeline import (
@@ -116,6 +118,43 @@ def _make_runtime_schedule_mock() -> mock.Mock:
 
     schedule._prepare_schedule_with_comms.side_effect = prepare_schedule
     return schedule
+
+
+class TestOuterCudagraphOwnership(unittest.TestCase):
+    def test_graph_pp_uses_explicit_outer_cudagraph_state(self):
+        config = GraphTrainerConfigView(
+            compile=mock.Mock(),
+            parallelism=mock.Mock(),
+            model=mock.Mock(),
+            outer_cudagraphs_enabled=True,
+        )
+
+        with mock.patch(
+            "torchtitan.experiments.graph_trainer.graph_builder_utils."
+            "cuda_graphs_supported",
+            return_value=False,
+        ) as cuda_graphs_supported:
+            self.assertTrue(_outer_cudagraphs_enabled(config))
+
+        cuda_graphs_supported.assert_not_called()
+
+    def test_spmd_uses_effective_outer_cudagraph_state(self):
+        config = types.SimpleNamespace(
+            training=types.SimpleNamespace(disable_cuda_graphs=False)
+        )
+
+        with mock.patch(
+            "torchtitan.experiments.graph_trainer.graph_builder_utils."
+            "cuda_graphs_supported",
+            return_value=True,
+        ):
+            self.assertTrue(_outer_cudagraphs_enabled(config))
+        with mock.patch(
+            "torchtitan.experiments.graph_trainer.graph_builder_utils."
+            "cuda_graphs_supported",
+            return_value=False,
+        ):
+            self.assertFalse(_outer_cudagraphs_enabled(config))
 
 
 def _make_test_spmd_plan(
@@ -1044,6 +1083,17 @@ class GraphRuntimeTraceTest(unittest.TestCase):
             compile_config=GraphTrainerCompileConfig(),
             parallelism=ParallelismConfig(pipeline_parallel_schedule="Interleaved1F1B"),
         )
+
+    def test_graph_pp_rejects_precompile_artifacts(self) -> None:
+        with self.assertRaisesRegex(ValueError, "does not support"):
+            _validate_graph_pp_config(
+                compile_config=GraphTrainerCompileConfig(
+                    precompile_artifact_dir="artifacts"
+                ),
+                parallelism=ParallelismConfig(
+                    pipeline_parallel_schedule="Interleaved1F1B"
+                ),
+            )
 
     def test_split_fsdp_boundaries_reject_dense_region_overlap(self) -> None:
         compile_config = GraphTrainerCompileConfig(

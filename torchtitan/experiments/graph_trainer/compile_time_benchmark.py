@@ -305,6 +305,26 @@ def _assert_close_with_default_tolerances(actual: Any, expected: Any) -> None:
             torch.testing.assert_close(actual_leaf, expected_leaf)
 
 
+def _benchmark_callable(
+    fn: Callable[[], Any],
+    *,
+    duration_ms: int,
+    use_cuda_graph: bool,
+) -> float:
+    if not use_cuda_graph:
+        return do_bench(fn, rep=duration_ms, return_mode="median")
+
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = fn()
+    try:
+        return do_bench(graph.replay, rep=duration_ms, return_mode="median")
+    finally:
+        del output
+        graph.reset()
+
+
 class CompileTimeBenchmarker:
     """Measure explicit rewrite regions and cache structurally equivalent runs."""
 
@@ -315,6 +335,7 @@ class CompileTimeBenchmarker:
         atol: float | None = None,
         rtol: float | None = None,
         minimum_speedup: float = 1.01,
+        use_cuda_graph: bool = False,
     ) -> None:
         if (atol is None) != (rtol is None):
             raise ValueError("atol and rtol must both be specified or both omitted")
@@ -322,6 +343,7 @@ class CompileTimeBenchmarker:
         self.atol = atol
         self.rtol = rtol
         self.minimum_speedup = minimum_speedup
+        self.use_cuda_graph = use_cuda_graph
         self._cache: dict[tuple[Any, ...], CompileTimeBenchmarkResult] = {}
 
     def clear(self) -> None:
@@ -371,15 +393,15 @@ class CompileTimeBenchmarker:
                 atol=self.atol,
                 rtol=self.rtol,
             )
-        baseline_ms = do_bench(
+        baseline_ms = _benchmark_callable(
             lambda: processed_baseline(*baseline_inputs),
-            rep=self.duration_ms,
-            return_mode="median",
+            duration_ms=self.duration_ms,
+            use_cuda_graph=self.use_cuda_graph,
         )
-        candidate_ms = do_bench(
+        candidate_ms = _benchmark_callable(
             lambda: processed_candidate(*candidate_inputs),
-            rep=self.duration_ms,
-            return_mode="median",
+            duration_ms=self.duration_ms,
+            use_cuda_graph=self.use_cuda_graph,
         )
         return CompileTimeBenchmarkResult(baseline_ms, candidate_ms)
 
@@ -416,6 +438,7 @@ class CompileTimeBenchmarker:
                 self.duration_ms,
                 self.atol,
                 self.rtol,
+                self.use_cuda_graph,
             )
             result = self._cache.get(measurement_cache_key)
             if result is None:
@@ -446,12 +469,16 @@ class CompileTimeBenchmarker:
         return tuple(results)
 
 
-_COMPILE_TIME_BENCHMARKER = CompileTimeBenchmarker()
+_COMPILE_TIME_BENCHMARKERS = {
+    False: CompileTimeBenchmarker(),
+    True: CompileTimeBenchmarker(use_cuda_graph=True),
+}
 
 
 def clear_compile_time_benchmark_cache() -> None:
     """Clear measurements cached by the shared compile-time benchmarker."""
-    _COMPILE_TIME_BENCHMARKER.clear()
+    for benchmarker in _COMPILE_TIME_BENCHMARKERS.values():
+        benchmarker.clear()
 
 
 def _log_benchmark_summary(
@@ -507,6 +534,7 @@ def apply_benchmarked_rewrites(
     cache_key: Hashable,
     strict: bool = False,
     benchmarker: CompileTimeBenchmarker | None = None,
+    benchmark_cuda_graph_replay: bool = False,
     benchmark_region: Callable[
         [GraphModule, tuple[Node, ...], GraphModule, tuple[Node, ...]],
         CompileTimeBenchmarkResult,
@@ -530,7 +558,7 @@ def apply_benchmarked_rewrites(
         return gm
 
     if benchmarker is None:
-        benchmarker = _COMPILE_TIME_BENCHMARKER
+        benchmarker = _COMPILE_TIME_BENCHMARKERS[benchmark_cuda_graph_replay]
     applications: list[_BenchmarkApplication] = []
     for candidate in prepare_candidates(gm):
         if not candidate.regions:

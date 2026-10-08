@@ -3913,13 +3913,16 @@ class TestChunkPasses(TestCase):
             passes = compile_time_passes(
                 traced_result,
                 config,
-                use_cuda_graph=False,
+                outer_cudagraphs_enabled=True,
             )
 
         processor = configured_coda_pass.call_args.kwargs["benchmark_graph_processor"]
         self.assertEqual(
             configured_coda_pass.call_args.args[0].name,
             "F_mm_residual_rmsnorm",
+        )
+        self.assertTrue(
+            configured_coda_pass.call_args.kwargs["benchmark_cuda_graph_replay"]
         )
         terminal_passes = processor.keywords["passes"]
         self.assertEqual(processor.func.__name__, "apply_graph_passes")

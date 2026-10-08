@@ -30,6 +30,7 @@ from torchtitan.experiments.graph_trainer.grad_accumulation import (
     insert_graph_gradient_accumulation_from_outputs,
 )
 from torchtitan.experiments.graph_trainer.graph_builder_utils import (
+    _outer_cudagraphs_enabled,
     _apply_fsdp_action_overlap_scheduling,
     _apply_graph_pp_pre_partition_or_extraction_passes,
     _compile_graph_pp_module,
@@ -803,6 +804,9 @@ def _build_gradient_accumulation_fwd_bwd_graphs(
                 trainer_config.compile,
                 parallelism_context,
                 graph_signature=graph_config_signature(trainer_config),
+                outer_cudagraphs_enabled=_outer_cudagraphs_enabled(
+                    trainer_config
+                ),
             ),
             expected_execution_plan=plan,
             expected_runtime_input_schema=runtime_input_schema(
@@ -827,6 +831,7 @@ def _build_gradient_accumulation_fwd_bwd_graphs(
         loss_fn=loss_fn,
         compile_config=trainer_config.compile,
         parallelism_context=parallelism_context,
+        outer_cudagraphs_enabled=_outer_cudagraphs_enabled(trainer_config),
     )
     stage.graphs = _build_scheduled_fwd_bwd_graphs(
         stage,

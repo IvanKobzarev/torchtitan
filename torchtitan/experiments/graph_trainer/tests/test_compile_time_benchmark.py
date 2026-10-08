@@ -252,6 +252,33 @@ class TestCompileTimeBenchmark(TestCase):
         self.assertEqual(candidate.call_count, 1)
         self.assertEqual(result, CompileTimeBenchmarkResult(2.0, 1.0))
 
+    def test_benchmark_region_can_measure_cuda_graph_replay(self):
+        output = torch.ones(2)
+        baseline = mock.Mock(return_value=output)
+        candidate = mock.Mock(return_value=output.clone())
+        input_tensor = mock.Mock(device=torch.device("cuda:0"))
+        benchmarker = CompileTimeBenchmarker(use_cuda_graph=True)
+
+        with (
+            mock.patch.object(
+                compile_time_benchmark,
+                "_realize_paired_inputs",
+                return_value=((input_tensor,), (input_tensor,)),
+            ),
+            mock.patch.object(
+                compile_time_benchmark,
+                "_benchmark_callable",
+                side_effect=(2.0, 1.0),
+            ) as benchmark_callable,
+        ):
+            result = benchmarker.benchmark_region(baseline, (), candidate, ())
+
+        self.assertEqual(result, CompileTimeBenchmarkResult(2.0, 1.0))
+        self.assertEqual(benchmark_callable.call_count, 2)
+        for call in benchmark_callable.call_args_list:
+            self.assertEqual(call.kwargs["duration_ms"], 20)
+            self.assertTrue(call.kwargs["use_cuda_graph"])
+
     def test_benchmark_region_rejects_incorrect_output(self):
         baseline = mock.Mock(return_value=torch.full((2,), 0.1))
         candidate = mock.Mock()

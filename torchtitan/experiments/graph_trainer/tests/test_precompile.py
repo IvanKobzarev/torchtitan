@@ -185,17 +185,23 @@ class TestPrecompileMain(unittest.TestCase):
 
         compile_config = _StubCompileConfig()
         parallelism_context = _StubParallelismContext()
-        precompile_fingerprint = _compute_precompile_config_fingerprint(
-            _make_stub_model(),
-            compile_config,
-            parallelism_context,
-            SimpleNamespace(),
-            num_microbatches=1,
-        )
-        runtime_fingerprint = compute_config_fingerprint(
-            _make_stub_model(), compile_config, parallelism_context
-        )
-        self.assertEqual(precompile_fingerprint, runtime_fingerprint)
+        for outer_cudagraphs_enabled in (False, True):
+            with self.subTest(outer_cudagraphs_enabled=outer_cudagraphs_enabled):
+                precompile_fingerprint = _compute_precompile_config_fingerprint(
+                    _make_stub_model(),
+                    compile_config,
+                    parallelism_context,
+                    SimpleNamespace(),
+                    num_microbatches=1,
+                    outer_cudagraphs_enabled=outer_cudagraphs_enabled,
+                )
+                runtime_fingerprint = compute_config_fingerprint(
+                    _make_stub_model(),
+                    compile_config,
+                    parallelism_context,
+                    outer_cudagraphs_enabled=outer_cudagraphs_enabled,
+                )
+                self.assertEqual(precompile_fingerprint, runtime_fingerprint)
 
     def test_builds_inputs_from_configured_microbatches(self):
         from torchtitan.experiments.graph_trainer.precompile_main import (
@@ -498,6 +504,71 @@ class TestConfigFingerprint(unittest.TestCase):
             _make_stub_model(), cfg_graph_seq, dims
         )
         self.assertNotEqual(fp_graph_batch, fp_graph_seq)
+
+    def test_outer_cudagraphs_enabled_sensitivity(self):
+        from torchtitan.experiments.graph_trainer.precompile import (
+            _validate_config_fingerprint,
+            compute_config_fingerprint,
+        )
+
+        model = _make_stub_model()
+        cfg = _StubCompileConfig(
+            coda_passes_enabled=True,
+            coda_compile_time_benchmark=True,
+        )
+        dims = _StubParallelismContext()
+
+        fp_without_outer_cudagraphs = compute_config_fingerprint(
+            model,
+            cfg,
+            dims,
+            outer_cudagraphs_enabled=False,
+        )
+        fp_with_outer_cudagraphs = compute_config_fingerprint(
+            model,
+            cfg,
+            dims,
+            outer_cudagraphs_enabled=True,
+        )
+
+        self.assertNotEqual(fp_without_outer_cudagraphs, fp_with_outer_cudagraphs)
+        with self.assertRaisesRegex(ValueError, "fingerprint mismatch"):
+            _validate_config_fingerprint(
+                fp_without_outer_cudagraphs,
+                fp_with_outer_cudagraphs,
+            )
+
+    def test_outer_cudagraphs_enabled_irrelevant_without_coda_benchmark(self):
+        from torchtitan.experiments.graph_trainer.precompile import (
+            compute_config_fingerprint,
+        )
+
+        model = _make_stub_model()
+        dims = _StubParallelismContext()
+        for cfg in (
+            _StubCompileConfig(coda_passes_enabled=False),
+            _StubCompileConfig(
+                coda_passes_enabled=True,
+                coda_compile_time_benchmark=False,
+            ),
+        ):
+            with self.subTest(cfg=cfg):
+                fp_without_outer_cudagraphs = compute_config_fingerprint(
+                    model,
+                    cfg,
+                    dims,
+                    outer_cudagraphs_enabled=False,
+                )
+                fp_with_outer_cudagraphs = compute_config_fingerprint(
+                    model,
+                    cfg,
+                    dims,
+                    outer_cudagraphs_enabled=True,
+                )
+                self.assertEqual(
+                    fp_without_outer_cudagraphs,
+                    fp_with_outer_cudagraphs,
+                )
 
     def test_pass_order_sensitive(self):
         from torchtitan.experiments.graph_trainer.precompile import (

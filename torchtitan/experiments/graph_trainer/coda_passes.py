@@ -4373,6 +4373,7 @@ def _configured_coda_pass(
     compile_time_benchmark: bool,
     benchmark_strict: bool,
     coda_autotune: bool,
+    benchmark_cuda_graph_replay: bool,
     benchmark_graph_processor: Callable[
         [GraphModule, tuple[torch.Tensor, ...]], Callable[..., Any]
     ]
@@ -4403,6 +4404,7 @@ def _configured_coda_pass(
                     benchmark_graph_processor,
                 ),
                 strict=benchmark_strict,
+                benchmark_cuda_graph_replay=benchmark_cuda_graph_replay,
                 process_baseline=benchmark_graph_processor,
                 process_candidate=benchmark_graph_processor,
             )
@@ -4425,6 +4427,7 @@ def coda_flex_gemm_pass(
     compile_time_benchmark: bool = True,
     benchmark_strict: bool = False,
     coda_autotune: bool = False,
+    benchmark_cuda_graph_replay: bool = False,
     benchmark_graph_processor: Callable[
         [GraphModule, tuple[torch.Tensor, ...]], Callable[..., Any]
     ]
@@ -4442,6 +4445,7 @@ def coda_flex_gemm_pass(
             compile_time_benchmark=compile_time_benchmark,
             benchmark_strict=benchmark_strict,
             coda_autotune=coda_autotune,
+            benchmark_cuda_graph_replay=benchmark_cuda_graph_replay,
             benchmark_graph_processor=benchmark_graph_processor,
         )(gm, example_inputs)
     gm.recompile()
