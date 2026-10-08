@@ -647,11 +647,37 @@ class TestPrecompiledFxTraceArtifact(unittest.TestCase):
         traced = minimal_fx_tracer(forward, module=model)(inputs)
         example_inputs = flatten_runtime_inputs(model, (inputs,), {})
         loaded = PrecompiledFxTraceArtifact.from_traced_result(traced).to_traced_result(
-            example_inputs
+            example_inputs,
+            device=torch.device("cpu"),
         )
         run = run_traced(loaded, module=model)
 
         self.assertTrue(torch.equal(model(inputs), run(inputs)))
+
+    def test_load_maps_graph_state_to_runtime_device(self):
+        from torch._subclasses.fake_tensor import FakeTensorMode
+
+        from torchtitan.experiments.graph_trainer.make_fx_tracer import (
+            minimal_fx_tracer,
+        )
+        from torchtitan.experiments.graph_trainer.precompile import (
+            PrecompiledFxTraceArtifact,
+        )
+
+        traced = minimal_fx_tracer(lambda value: value + 1)(torch.ones(2))
+        fake_mode = FakeTensorMode()
+        with fake_mode:
+            gpu_constant = torch.ones(2, device="cuda:0")
+        traced.gm.register_buffer("gpu_constant", gpu_constant)
+        traced.gm.register_buffer("cpu_constant", torch.ones(2))
+
+        loaded = PrecompiledFxTraceArtifact.from_traced_result(traced).to_traced_result(
+            traced.example_inputs,
+            device=torch.device("cuda:1"),
+        )
+
+        self.assertEqual(loaded.gm.gpu_constant.device, torch.device("cuda:1"))
+        self.assertEqual(loaded.gm.cpu_constant.device, torch.device("cpu"))
 
     def test_rejects_trainer_owned_gradient_state(self):
         from torchtitan.experiments.graph_trainer.make_fx_tracer import (
@@ -710,6 +736,7 @@ class TestPrecompiledFxTraceArtifact(unittest.TestCase):
                 storage,
                 expected_fingerprint="",
                 example_inputs=example_inputs,
+                device=x.device,
             )
 
         self.assertEqual(len(loaded.example_inputs), len(example_inputs))
@@ -860,11 +887,14 @@ class TestPrecompiledFxTraceArtifact(unittest.TestCase):
                     storage,
                     expected_fingerprint="new_fp",
                     example_inputs=(),
+                    device=torch.device("cpu"),
                 )
 
 
 class TestPrecompiledScheduledFwdBwdArtifact(unittest.TestCase):
     def test_save_load_roundtrip(self):
+        from torch._subclasses.fake_tensor import FakeTensorMode
+
         from torchtitan.experiments.graph_trainer.common_utils import (
             ensure_boxed_graph_module,
         )
@@ -893,6 +923,10 @@ class TestPrecompiledScheduledFwdBwdArtifact(unittest.TestCase):
             graph_module = ensure_boxed_graph_module(
                 torch.fx.symbolic_trace(lambda value: value + 1)
             )
+            with FakeTensorMode():
+                gpu_constant = torch.ones(2, device="cuda:0")
+            graph_module.register_buffer("gpu_constant", gpu_constant)
+            graph_module.register_buffer("cpu_constant", torch.ones(2))
             return _FwdBwdCallSpec(
                 module=graph_module,
                 input_names=("value",),
@@ -936,9 +970,18 @@ class TestPrecompiledScheduledFwdBwdArtifact(unittest.TestCase):
                 expected_execution_plan=plan,
                 expected_runtime_input_schema=("test_spec", ()),
                 runtime_meshes=[],
+                device=torch.device("cuda:1"),
             )
 
         for computation_type, loaded_call_spec in loaded.graphs.call_specs.items():
+            self.assertEqual(
+                loaded_call_spec.module.gpu_constant.device,
+                torch.device("cuda:1"),
+            )
+            self.assertEqual(
+                loaded_call_spec.module.cpu_constant.device,
+                torch.device("cpu"),
+            )
             args = [torch.tensor(2)]
             (output,) = _execute_graph_module(loaded_call_spec.module, args)
             torch.testing.assert_close(output, torch.tensor(3))
@@ -1007,6 +1050,7 @@ class TestPrecompiledScheduledFwdBwdArtifact(unittest.TestCase):
                     expected_execution_plan=plan,
                     expected_runtime_input_schema=("runtime_spec", ()),
                     runtime_meshes=[],
+                    device=torch.device("cpu"),
                 )
 
     def test_execution_plan_mismatch(self):
@@ -1050,6 +1094,7 @@ class TestPrecompiledScheduledFwdBwdArtifact(unittest.TestCase):
                     expected_execution_plan=plan,
                     expected_runtime_input_schema=("test_spec", ()),
                     runtime_meshes=[],
+                    device=torch.device("cpu"),
                 )
 
     def test_rejects_stale_artifact_format(self):
@@ -1093,6 +1138,7 @@ class TestPrecompiledScheduledFwdBwdArtifact(unittest.TestCase):
                     expected_execution_plan=plan,
                     expected_runtime_input_schema=("test_spec", ()),
                     runtime_meshes=[],
+                    device=torch.device("cpu"),
                 )
 
 

@@ -238,6 +238,7 @@ def _trace_joint_stage_graph(
                 {},
                 precompile_meshes=runtime_meshes,
             ),
+            device=stage.device,
         )
         return traced, runtime_meshes
 

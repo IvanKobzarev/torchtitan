@@ -367,6 +367,26 @@ class _SerializedFwdBwdCallSpec:
     grad_accumulator_input_indices: tuple[int, ...]
 
 
+def _map_precompiled_graph_device(
+    serialized_device: torch.device,
+    *,
+    runtime_device: torch.device,
+) -> torch.device:
+    """Map serialized accelerator state to the runtime device index.
+
+    GraphPickler preserves the trace-time device index for graph-owned tensor
+    constants. Distributed workers select different local devices, so a
+    constant serialized on ``cuda:0`` must follow the graph to ``cuda:1`` on
+    local rank 1. CPU constants remain on CPU.
+    """
+
+    return (
+        runtime_device
+        if serialized_device.type == runtime_device.type
+        else serialized_device
+    )
+
+
 def _execution_plan_signature(plan: GraphExecutionPlan) -> tuple[tuple[str, Any], ...]:
     """Return the graph-affecting resolved accumulation policy."""
     return tuple(
@@ -440,6 +460,7 @@ class PrecompiledScheduledFwdBwdArtifact:
         self,
         *,
         runtime_meshes: list[DeviceMesh],
+        device: torch.device,
     ) -> GraphTrainerScheduledFwdBwdStageGraphs:
         from torch._subclasses import FakeTensorMode
         from torch.fx._graph_pickler import GraphPickler
@@ -465,7 +486,14 @@ class PrecompiledScheduledFwdBwdArtifact:
         )
         call_specs = {}
         for key, serialized_module in self.serialized_modules.items():
-            gm = GraphPickler.loads(serialized_module, fake_mode)
+            gm = GraphPickler.loads(
+                serialized_module,
+                fake_mode,
+                map_location=functools.partial(
+                    _map_precompiled_graph_device,
+                    runtime_device=device,
+                ),
+            )
             gm.recompile()
             metadata = self.call_specs[key]
             computation_type = _GraphComputationType(key)
@@ -569,7 +597,12 @@ class PrecompiledFxTraceArtifact:
             num_runtime_mesh_inputs=traced_result.num_runtime_mesh_inputs,
         )
 
-    def to_traced_result(self, example_inputs: tuple[Any, ...]) -> TracedResult:
+    def to_traced_result(
+        self,
+        example_inputs: tuple[Any, ...],
+        *,
+        device: torch.device,
+    ) -> TracedResult:
         """Deserialize back into a TracedResult.
 
         Registers CooR custom ops, then deserializes the GraphModule
@@ -586,7 +619,14 @@ class PrecompiledFxTraceArtifact:
             allow_non_fake_inputs=True,
             shape_env=ShapeEnv(),
         )
-        gm = GraphPickler.loads(self.serialized_gm, fake_mode)
+        gm = GraphPickler.loads(
+            self.serialized_gm,
+            fake_mode,
+            map_location=functools.partial(
+                _map_precompiled_graph_device,
+                runtime_device=device,
+            ),
+        )
         gm.recompile()
 
         # Provide a minimal dummy spec since user_inputs_spec is not
@@ -640,6 +680,8 @@ def precompile_fx_trace_load(
     storage: StorageAdapter,
     expected_fingerprint: ConfigFingerprint,
     example_inputs: tuple[Any, ...],
+    *,
+    device: torch.device,
 ) -> TracedResult:
     """Load a precompiled aot_fx_trace artifact.
 
@@ -664,7 +706,7 @@ def precompile_fx_trace_load(
         f"fingerprint={artifact.config_fingerprint}"
     )
 
-    return artifact.to_traced_result(example_inputs)
+    return artifact.to_traced_result(example_inputs, device=device)
 
 
 def precompile_scheduled_fwd_bwd_save(
@@ -704,6 +746,7 @@ def precompile_scheduled_fwd_bwd_load(
     expected_execution_plan: GraphExecutionPlan,
     expected_runtime_input_schema: RuntimeInputSchema,
     runtime_meshes: list[DeviceMesh],
+    device: torch.device,
 ) -> GraphTrainerScheduledFwdBwdStageGraphs:
     """Load trusted compiled SPMD accumulation graphs and bind runtime meshes.
 
@@ -741,4 +784,7 @@ def precompile_scheduled_fwd_bwd_load(
         len(artifact.serialized_modules),
         artifact.config_fingerprint,
     )
-    return artifact.to_stage_graphs(runtime_meshes=runtime_meshes)
+    return artifact.to_stage_graphs(
+        runtime_meshes=runtime_meshes,
+        device=device,
+    )

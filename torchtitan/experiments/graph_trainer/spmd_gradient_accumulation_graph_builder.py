@@ -818,6 +818,7 @@ def _build_gradient_accumulation_fwd_bwd_graphs(
                 )
             ),
             runtime_meshes=runtime_meshes,
+            device=stage.device,
         )
         return
 
