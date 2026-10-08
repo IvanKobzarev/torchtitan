@@ -333,6 +333,7 @@ class BitwiseDeterministicBase(unittest.TestCase):
                 storage,
                 expected_fingerprint="",
                 example_inputs=example_inputs,
+                device=self.inputs.device,
             )
 
         # Step 4: Run training steps using the loaded artifact

@@ -8,9 +8,10 @@ import os
 import pickle
 import tempfile
 import unittest
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import torch
 
@@ -84,6 +85,7 @@ class _StubCompileConfig:
     memory_policy: str = "default"
     full_recompute_save_ops: str = ""
     ep_overlap: EpOverlapConfig = field(default_factory=EpOverlapConfig)
+    precompile_artifact_dir: str = ""
 
 
 @dataclass
@@ -114,8 +116,8 @@ def _make_stub_model(params=None, buffers=None):
     # Use side_effect (not return_value) so each call produces a
     # fresh iterator — just like real nn.Module methods. A single
     # return_value=iter(...) would be exhausted after the first call.
-    model.named_parameters.side_effect = lambda: iter(params)
-    model.named_buffers.side_effect = lambda: iter(buffers)
+    model.named_parameters.side_effect = lambda **_kwargs: iter(params)
+    model.named_buffers.side_effect = lambda **_kwargs: iter(buffers)
     return model
 
 
@@ -125,7 +127,7 @@ class TestPrecompileMain(unittest.TestCase):
 
         events = []
         compile_config = SimpleNamespace()
-        config = SimpleNamespace(compile=compile_config)
+        config = SimpleNamespace(compile=compile_config, dist_moe=None)
         config_loader = MagicMock()
         config_loader.load.return_value = config
         setup_result = (
@@ -169,8 +171,169 @@ class TestPrecompileMain(unittest.TestCase):
 
         self.assertEqual(events, ["setup", "validate", "precompile"])
 
+    def test_single_microbatch_fingerprint_matches_runtime_load(self):
+        from torchtitan.experiments.graph_trainer.precompile import (
+            compute_config_fingerprint,
+        )
+        from torchtitan.experiments.graph_trainer.precompile_main import (
+            _compute_precompile_config_fingerprint,
+        )
+
+        compile_config = _StubCompileConfig()
+        parallelism_context = _StubParallelismContext()
+        precompile_fingerprint = _compute_precompile_config_fingerprint(
+            _make_stub_model(),
+            compile_config,
+            parallelism_context,
+            SimpleNamespace(),
+            num_microbatches=1,
+        )
+        runtime_fingerprint = compute_config_fingerprint(
+            _make_stub_model(), compile_config, parallelism_context
+        )
+        self.assertEqual(precompile_fingerprint, runtime_fingerprint)
+
+    def test_builds_inputs_from_configured_microbatches(self):
+        from torchtitan.experiments.graph_trainer.precompile_main import (
+            _build_precompile_inputs,
+        )
+
+        microbatches = []
+        for loss_counts, routing_counts in (
+            ([1, 2], [5, 6]),
+            ([3, 4], [7, 8]),
+        ):
+            microbatch = MagicMock()
+            microbatch.loss_token_counts = torch.tensor(loss_counts)
+            microbatch.routing_token_counts = torch.tensor(routing_counts)
+            microbatch.to_input_dict.return_value = {"tokens": torch.tensor([1])}
+            microbatches.append(microbatch)
+        dataloader = MagicMock()
+        dataloader.__iter__.return_value = iter(microbatches)
+        dataloader_config = MagicMock(max_num_documents=1)
+        dataloader_config.build.return_value = dataloader
+        config = SimpleNamespace(
+            dataloader=dataloader_config,
+            parallelism=object(),
+            training=SimpleNamespace(
+                max_context_length=8,
+                num_tokens_per_microbatch_per_dp_rank=4,
+                num_tokens_per_train_step=16,
+            ),
+        )
+        parallelism_context = SimpleNamespace(
+            dp_replicate=1,
+            dp_shard=2,
+            pp_enabled=False,
+            activate_spmd=nullcontext,
+        )
+        model = MagicMock()
+        model.preprocess_inputs.return_value = (
+            "inputs",
+            "labels",
+            {"aux_loss_denominators": torch.tensor([-1, -1])},
+        )
+
+        inputs, labels, loss_counts, extra_kwargs = _build_precompile_inputs(
+            config,
+            model,
+            parallelism_context,
+            torch.device("cpu"),
+            object(),
+        )
+
+        self.assertEqual(inputs, "inputs")
+        self.assertEqual(labels, "labels")
+        torch.testing.assert_close(loss_counts, torch.tensor([8, 12]))
+        torch.testing.assert_close(
+            extra_kwargs["aux_loss_denominators"], torch.tensor([24, 28])
+        )
+        microbatches[0].to_input_dict.assert_called_once_with(
+            torch.device("cpu"), non_blocking=True
+        )
+        microbatches[1].to_input_dict.assert_not_called()
+        dataloader.close.assert_called_once_with()
+        dataloader_config.build.assert_called_once_with(
+            dp_world_size=2,
+            dp_rank=0,
+            tokenizer=ANY,
+            max_context_length=8,
+            num_tokens_per_microbatch=4,
+        )
+
+    def test_closes_dataloader_when_precompile_input_iteration_fails(self):
+        from torchtitan.experiments.graph_trainer.precompile_main import (
+            _build_precompile_inputs,
+        )
+
+        dataloader = MagicMock()
+        dataloader.__iter__.return_value = iter(())
+        dataloader_config = MagicMock()
+        dataloader_config.build.return_value = dataloader
+        config = SimpleNamespace(
+            dataloader=dataloader_config,
+            training=SimpleNamespace(
+                max_context_length=8,
+                num_tokens_per_microbatch_per_dp_rank=4,
+                num_tokens_per_train_step=8,
+            ),
+        )
+        parallelism_context = SimpleNamespace(
+            dp_replicate=1,
+            dp_shard=2,
+            pp_enabled=False,
+        )
+
+        with self.assertRaises(StopIteration):
+            _build_precompile_inputs(
+                config,
+                MagicMock(),
+                parallelism_context,
+                torch.device("cpu"),
+                object(),
+            )
+        dataloader.close.assert_called_once_with()
+
 
 class TestConfigFingerprint(unittest.TestCase):
+    @staticmethod
+    def _graph_config(*, num_tokens_per_train_step: int):
+        return SimpleNamespace(
+            training=SimpleNamespace(
+                num_tokens_per_microbatch_per_dp_rank=8,
+                num_tokens_per_train_step=num_tokens_per_train_step,
+                max_context_length=8,
+                enable_cpu_offload=False,
+                dtype="bfloat16",
+                mixed_precision_param="bfloat16",
+                mixed_precision_reduce="float32",
+            ),
+            parallelism=SimpleNamespace(),
+            model=SimpleNamespace(),
+            loss=SimpleNamespace(),
+            activation_checkpoint=SimpleNamespace(),
+            dist_moe=None,
+            dataloader=SimpleNamespace(num_mtp_layers=1, max_num_documents=1),
+            debug=SimpleNamespace(
+                deterministic=True,
+                batch_invariant=False,
+                spmd_typechecking=False,
+            ),
+        )
+
+    def test_graph_config_signature_is_sensitive_to_accumulation_shape(self):
+        from torchtitan.experiments.graph_trainer.precompile import (
+            graph_config_signature,
+        )
+
+        signature_a = graph_config_signature(
+            self._graph_config(num_tokens_per_train_step=32)
+        )
+        signature_b = graph_config_signature(
+            self._graph_config(num_tokens_per_train_step=64)
+        )
+        self.assertNotEqual(signature_a, signature_b)
+
     def test_deterministic(self):
         from torchtitan.experiments.graph_trainer.precompile import (
             compute_config_fingerprint,
@@ -213,6 +376,65 @@ class TestConfigFingerprint(unittest.TestCase):
         fp_a = compute_config_fingerprint(model_a, cfg, dims)
         fp_b = compute_config_fingerprint(model_b, cfg, dims)
         self.assertNotEqual(fp_a, fp_b)
+
+    def test_model_train_state_structure_sensitivity(self):
+        from torchtitan.experiments.graph_trainer.precompile import (
+            compute_config_fingerprint,
+        )
+
+        cfg = _StubCompileConfig()
+        dims = _StubParallelismContext()
+        trainable = torch.nn.Parameter(torch.zeros(4), requires_grad=True)
+        frozen = torch.nn.Parameter(torch.zeros(4), requires_grad=False)
+        fp_trainable = compute_config_fingerprint(
+            _make_stub_model(params=[("w", trainable)], buffers=[]), cfg, dims
+        )
+        fp_frozen = compute_config_fingerprint(
+            _make_stub_model(params=[("w", frozen)], buffers=[]), cfg, dims
+        )
+        self.assertNotEqual(fp_trainable, fp_frozen)
+
+        tied = torch.nn.Parameter(torch.zeros(4))
+        fp_tied = compute_config_fingerprint(
+            _make_stub_model(params=[("a", tied), ("b", tied)], buffers=[]),
+            cfg,
+            dims,
+        )
+        fp_single = compute_config_fingerprint(
+            _make_stub_model(params=[("a", tied)], buffers=[]), cfg, dims
+        )
+        self.assertNotEqual(fp_tied, fp_single)
+
+        fp_distinct = compute_config_fingerprint(
+            _make_stub_model(
+                params=[
+                    ("a", torch.nn.Parameter(torch.zeros(4))),
+                    ("b", torch.nn.Parameter(torch.zeros(4))),
+                ],
+                buffers=[],
+            ),
+            cfg,
+            dims,
+        )
+        self.assertNotEqual(fp_tied, fp_distinct)
+
+    def test_artifact_directory_does_not_change_fingerprint(self):
+        from torchtitan.experiments.graph_trainer.precompile import (
+            compute_config_fingerprint,
+        )
+
+        dims = _StubParallelismContext()
+        fp_a = compute_config_fingerprint(
+            _make_stub_model(),
+            _StubCompileConfig(precompile_artifact_dir="/path/a"),
+            dims,
+        )
+        fp_b = compute_config_fingerprint(
+            _make_stub_model(),
+            _StubCompileConfig(precompile_artifact_dir="/path/b"),
+            dims,
+        )
+        self.assertEqual(fp_a, fp_b)
 
     def test_parallelism_sensitivity(self):
         from torchtitan.experiments.graph_trainer.precompile import (
@@ -271,6 +493,30 @@ class TestConfigFingerprint(unittest.TestCase):
         self.assertNotEqual(fp_ab, fp_ba)
 
 
+class TestRuntimeInputSchema(unittest.TestCase):
+    def test_is_stable_across_pickle_roundtrip(self):
+        from torchtitan.experiments.graph_trainer.precompile import runtime_input_schema
+
+        runtime_args = (
+            {"tokens": torch.zeros(2, 4, dtype=torch.int64)},
+            torch.ones(2, 4),
+            torch.tensor([8, 4]),
+            {"mask": None, "enabled": True},
+        )
+        schema = runtime_input_schema(runtime_args)
+        self.assertEqual(pickle.loads(pickle.dumps(schema)), schema)
+        self.assertEqual(runtime_input_schema(runtime_args), schema)
+
+    def test_detects_shape_and_stride_changes(self):
+        from torchtitan.experiments.graph_trainer.precompile import runtime_input_schema
+
+        contiguous = runtime_input_schema((torch.zeros(2, 4),))
+        different_shape = runtime_input_schema((torch.zeros(4, 2),))
+        different_stride = runtime_input_schema((torch.zeros(4, 2).T,))
+        self.assertNotEqual(contiguous, different_shape)
+        self.assertNotEqual(contiguous, different_stride)
+
+
 class TestPrecompileLossSetup(unittest.TestCase):
     def test_chunked_loss_setup_matches_trainer_boundary(self):
         from torchtitan.experiments.graph_trainer.chunked_loss import (
@@ -310,11 +556,37 @@ class TestPrecompiledFxTraceArtifact(unittest.TestCase):
         traced = minimal_fx_tracer(forward, module=model)(inputs)
         example_inputs = flatten_runtime_inputs(model, (inputs,), {})
         loaded = PrecompiledFxTraceArtifact.from_traced_result(traced).to_traced_result(
-            example_inputs
+            example_inputs,
+            device=torch.device("cpu"),
         )
         run = run_traced(loaded, module=model)
 
         self.assertTrue(torch.equal(model(inputs), run(inputs)))
+
+    def test_load_maps_graph_state_to_runtime_device(self):
+        from torch._subclasses.fake_tensor import FakeTensorMode
+
+        from torchtitan.experiments.graph_trainer.make_fx_tracer import (
+            minimal_fx_tracer,
+        )
+        from torchtitan.experiments.graph_trainer.precompile import (
+            PrecompiledFxTraceArtifact,
+        )
+
+        traced = minimal_fx_tracer(lambda value: value + 1)(torch.ones(2))
+        fake_mode = FakeTensorMode()
+        with fake_mode:
+            gpu_constant = torch.ones(2, device="cuda:0")
+        traced.gm.register_buffer("gpu_constant", gpu_constant)
+        traced.gm.register_buffer("cpu_constant", torch.ones(2))
+
+        loaded = PrecompiledFxTraceArtifact.from_traced_result(traced).to_traced_result(
+            traced.example_inputs,
+            device=torch.device("cuda:1"),
+        )
+
+        self.assertEqual(loaded.gm.gpu_constant.device, torch.device("cuda:1"))
+        self.assertEqual(loaded.gm.cpu_constant.device, torch.device("cpu"))
 
     def test_rejects_trainer_owned_gradient_state(self):
         from torchtitan.experiments.graph_trainer.make_fx_tracer import (
@@ -373,6 +645,7 @@ class TestPrecompiledFxTraceArtifact(unittest.TestCase):
                 storage,
                 expected_fingerprint="",
                 example_inputs=example_inputs,
+                device=x.device,
             )
 
         self.assertEqual(len(loaded.example_inputs), len(example_inputs))
@@ -446,6 +719,7 @@ class TestPrecompiledFxTraceArtifact(unittest.TestCase):
         from torchtitan.experiments.graph_trainer.make_fx_tracer import TracedResult
         from torchtitan.experiments.graph_trainer.precompile import (
             PrecompiledFxTraceArtifact,
+            runtime_input_schema,
         )
         from torchtitan.models.common.attention import get_causal_mask_mod
 
@@ -463,6 +737,13 @@ class TestPrecompiledFxTraceArtifact(unittest.TestCase):
         # Sanity: the raw TreeSpec itself is NOT picklable (the bug).
         with self.assertRaises((TypeError, AttributeError)):
             pickle.dumps(blockmask_spec)
+
+        second_block_mask = create_block_mask(
+            get_causal_mask_mod(), B=1, H=1, Q_LEN=128, KV_LEN=128
+        )
+        schema = runtime_input_schema((block_mask,))
+        self.assertEqual(schema, runtime_input_schema((second_block_mask,)))
+        self.assertEqual(schema, pickle.loads(pickle.dumps(schema)))
 
         # Build a TracedResult with the unpicklable spec, then create
         # the artifact via from_traced_result — this must succeed because
@@ -515,6 +796,258 @@ class TestPrecompiledFxTraceArtifact(unittest.TestCase):
                     storage,
                     expected_fingerprint="new_fp",
                     example_inputs=(),
+                    device=torch.device("cpu"),
+                )
+
+
+class TestPrecompiledScheduledFwdBwdArtifact(unittest.TestCase):
+    def test_save_load_roundtrip(self):
+        from torch._subclasses.fake_tensor import FakeTensorMode
+
+        from torchtitan.experiments.graph_trainer.common_utils import (
+            ensure_boxed_graph_module,
+        )
+        from torchtitan.experiments.graph_trainer.graph_builder import (
+            GraphExecutionPlan,
+        )
+        from torchtitan.experiments.graph_trainer.graph_builder_utils import (
+            _execute_graph_module,
+        )
+        from torchtitan.experiments.graph_trainer.graph_pp.runner import (
+            FORWARD_BACKWARD,
+            FORWARD_BACKWARD_LAST_WITH_REDUCE_GRAD,
+            FORWARD_BACKWARD_NOGRADACCUM,
+        )
+        from torchtitan.experiments.graph_trainer.precompile import (
+            precompile_scheduled_fwd_bwd_load,
+            precompile_scheduled_fwd_bwd_save,
+        )
+        from torchtitan.experiments.graph_trainer.spmd_gradient_accumulation_graph_builder import (
+            _FwdBwdCallSpec,
+            _ScheduledFwdBwdGraphs,
+            GraphTrainerScheduledFwdBwdStageGraphs,
+        )
+
+        def call_spec(grad_accumulator_input_indices=()):
+            graph_module = ensure_boxed_graph_module(
+                torch.fx.symbolic_trace(lambda value: value + 1)
+            )
+            with FakeTensorMode():
+                gpu_constant = torch.ones(2, device="cuda:0")
+            graph_module.register_buffer("gpu_constant", gpu_constant)
+            graph_module.register_buffer("cpu_constant", torch.ones(2))
+            return _FwdBwdCallSpec(
+                module=graph_module,
+                input_names=("value",),
+                flat_input_indices=(0,),
+                output_names=("add",),
+                num_param_inputs=0,
+                grad_accumulator_input_indices=grad_accumulator_input_indices,
+            )
+
+        stage_graphs = GraphTrainerScheduledFwdBwdStageGraphs(
+            graphs=_ScheduledFwdBwdGraphs(
+                call_specs={
+                    FORWARD_BACKWARD_NOGRADACCUM: call_spec(),
+                    FORWARD_BACKWARD: call_spec((0,)),
+                    FORWARD_BACKWARD_LAST_WITH_REDUCE_GRAD: call_spec((0,)),
+                },
+                repeated_computation_type=FORWARD_BACKWARD,
+            ),
+            meta=SimpleNamespace(num_param_grad_values=0),
+        )
+        plan = GraphExecutionPlan(
+            pp_enabled=False,
+            num_microbatches=2,
+            unshard=None,
+            reduce_grad=None,
+            fuse_wgrad_accumulation=False,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            storage = DiskStorageAdapter(tmpdir)
+            precompile_scheduled_fwd_bwd_save(
+                stage_graphs,
+                storage,
+                num_runtime_mesh_inputs=0,
+                config_fingerprint="test_fp",
+                execution_plan=plan,
+                runtime_input_schema=("test_spec", ()),
+            )
+            loaded = precompile_scheduled_fwd_bwd_load(
+                storage,
+                expected_fingerprint="test_fp",
+                expected_execution_plan=plan,
+                expected_runtime_input_schema=("test_spec", ()),
+                runtime_meshes=[],
+                device=torch.device("cuda:1"),
+            )
+
+        for computation_type, loaded_call_spec in loaded.graphs.call_specs.items():
+            self.assertEqual(
+                loaded_call_spec.module.gpu_constant.device,
+                torch.device("cuda:1"),
+            )
+            self.assertEqual(
+                loaded_call_spec.module.cpu_constant.device,
+                torch.device("cpu"),
+            )
+            args = [torch.tensor(2)]
+            (output,) = _execute_graph_module(loaded_call_spec.module, args)
+            torch.testing.assert_close(output, torch.tensor(3))
+            self.assertEqual(args, [])
+            self.assertEqual(
+                loaded_call_spec.grad_accumulator_input_indices,
+                stage_graphs.graphs.call_specs[
+                    computation_type
+                ].grad_accumulator_input_indices,
+            )
+
+    def test_runtime_input_schema_mismatch(self):
+        from torchtitan.experiments.graph_trainer.graph_builder import (
+            GraphExecutionPlan,
+        )
+        from torchtitan.experiments.graph_trainer.graph_pp.runner import (
+            FULL_FORWARD_BACKWARD,
+        )
+        from torchtitan.experiments.graph_trainer.precompile import (
+            precompile_scheduled_fwd_bwd_load,
+            precompile_scheduled_fwd_bwd_save,
+        )
+        from torchtitan.experiments.graph_trainer.spmd_gradient_accumulation_graph_builder import (
+            _FwdBwdCallSpec,
+            _ScheduledFwdBwdGraphs,
+            GraphTrainerScheduledFwdBwdStageGraphs,
+        )
+
+        graph_module = torch.fx.symbolic_trace(lambda value: value + 1)
+        stage_graphs = GraphTrainerScheduledFwdBwdStageGraphs(
+            graphs=_ScheduledFwdBwdGraphs(
+                call_specs={
+                    FULL_FORWARD_BACKWARD: _FwdBwdCallSpec(
+                        module=graph_module,
+                        input_names=("value",),
+                        flat_input_indices=(0,),
+                        output_names=("add",),
+                        num_param_inputs=0,
+                    )
+                },
+                repeated_computation_type=FULL_FORWARD_BACKWARD,
+            ),
+            meta=SimpleNamespace(num_param_grad_values=0),
+        )
+        plan = GraphExecutionPlan(
+            pp_enabled=False,
+            num_microbatches=2,
+            unshard=None,
+            reduce_grad=None,
+            fuse_wgrad_accumulation=False,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            storage = DiskStorageAdapter(tmpdir)
+            precompile_scheduled_fwd_bwd_save(
+                stage_graphs,
+                storage,
+                num_runtime_mesh_inputs=0,
+                config_fingerprint="test_fp",
+                execution_plan=plan,
+                runtime_input_schema=("artifact_spec", ()),
+            )
+            with self.assertRaisesRegex(ValueError, "input schema mismatch"):
+                precompile_scheduled_fwd_bwd_load(
+                    storage,
+                    expected_fingerprint="test_fp",
+                    expected_execution_plan=plan,
+                    expected_runtime_input_schema=("runtime_spec", ()),
+                    runtime_meshes=[],
+                    device=torch.device("cpu"),
+                )
+
+    def test_execution_plan_mismatch(self):
+        from torchtitan.experiments.graph_trainer.graph_builder import (
+            GraphExecutionPlan,
+        )
+        from torchtitan.experiments.graph_trainer.precompile import (
+            _SCHEDULED_FWD_BWD_ARTIFACT_KEY,
+            precompile_scheduled_fwd_bwd_load,
+            PrecompiledScheduledFwdBwdArtifact,
+        )
+
+        artifact = PrecompiledScheduledFwdBwdArtifact(
+            serialized_modules={},
+            format_version=1,
+            call_specs={},
+            repeated_computation_type="FULL_FORWARD_BACKWARD",
+            meta=SimpleNamespace(),
+            num_runtime_mesh_inputs=0,
+            config_fingerprint="test_fp",
+            execution_plan_signature=(("num_microbatches", 2),),
+            runtime_input_schema=("test_spec", ()),
+        )
+        plan = GraphExecutionPlan(
+            pp_enabled=False,
+            num_microbatches=3,
+            unshard=None,
+            reduce_grad=None,
+            fuse_wgrad_accumulation=False,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            storage = DiskStorageAdapter(tmpdir)
+            storage.save(
+                _SCHEDULED_FWD_BWD_ARTIFACT_KEY,
+                pickle.dumps(artifact),
+            )
+            with self.assertRaisesRegex(ValueError, "execution plan mismatch"):
+                precompile_scheduled_fwd_bwd_load(
+                    storage,
+                    expected_fingerprint="test_fp",
+                    expected_execution_plan=plan,
+                    expected_runtime_input_schema=("test_spec", ()),
+                    runtime_meshes=[],
+                    device=torch.device("cpu"),
+                )
+
+    def test_rejects_stale_artifact_format(self):
+        from torchtitan.experiments.graph_trainer.graph_builder import (
+            GraphExecutionPlan,
+        )
+        from torchtitan.experiments.graph_trainer.precompile import (
+            _SCHEDULED_FWD_BWD_ARTIFACT_KEY,
+            precompile_scheduled_fwd_bwd_load,
+            PrecompiledScheduledFwdBwdArtifact,
+        )
+
+        artifact = PrecompiledScheduledFwdBwdArtifact(
+            serialized_modules={},
+            format_version=0,
+            call_specs={},
+            repeated_computation_type="FULL_FORWARD_BACKWARD",
+            meta=SimpleNamespace(),
+            num_runtime_mesh_inputs=0,
+            config_fingerprint="test_fp",
+            execution_plan_signature=(),
+            runtime_input_schema=("test_spec", ()),
+        )
+        plan = GraphExecutionPlan(
+            pp_enabled=False,
+            num_microbatches=2,
+            unshard=None,
+            reduce_grad=None,
+            fuse_wgrad_accumulation=False,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            storage = DiskStorageAdapter(tmpdir)
+            storage.save(
+                _SCHEDULED_FWD_BWD_ARTIFACT_KEY,
+                pickle.dumps(artifact),
+            )
+            with self.assertRaisesRegex(ValueError, "format mismatch"):
+                precompile_scheduled_fwd_bwd_load(
+                    storage,
+                    expected_fingerprint="test_fp",
+                    expected_execution_plan=plan,
+                    expected_runtime_input_schema=("test_spec", ()),
+                    runtime_meshes=[],
+                    device=torch.device("cpu"),
                 )
 
 
