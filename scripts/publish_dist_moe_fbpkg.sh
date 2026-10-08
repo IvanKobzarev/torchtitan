@@ -242,7 +242,10 @@ mapfile -t pytorch_overlay_files < <(
 )
 for overlay_path in "${pytorch_overlay_files[@]}"; do
   case "$overlay_path" in
-    torch/distributed/pipelining/stage.py|torch/nn/attention/varlen.py)
+    torch/distributed/pipelining/stage.py|\
+    torch/nn/attention/varlen.py|\
+    torch/_inductor/fx_passes/bucketing.py|\
+    torch/_inductor/fx_passes/fsdp.py)
       if ! git -C "$PYTORCH_SOURCE" cat-file -e \
         "$pytorch_revision:$overlay_path" 2>/dev/null; then
         echo "PyTorch overlay removes its allowlisted runtime file" >&2
