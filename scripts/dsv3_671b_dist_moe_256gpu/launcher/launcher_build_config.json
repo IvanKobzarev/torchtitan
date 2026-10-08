@@ -10,6 +10,7 @@
     "mast.py",
     "mast_configs.py",
     "mount.sh",
+    "precompile_artifacts",
     "run.sh"
   ],
   "path_mapping": {},

@@ -88,6 +88,22 @@ require_file "${PLATFORM_LIB}/cuda-no-rpath-13.0/libnvtx3interop.so.1"
 require_file "${TORCHTITAN_ROOT}/assets/hf/DeepSeek-V3.1-Base/tokenizer.json"
 require_file "${TORCHTITAN_ROOT}/assets/hf/DeepSeek-V3.1-Base/tokenizer_config.json"
 
+if [[ -z "${TORCHTITAN_PRECOMPILE_ARTIFACT_DIR:-}" ]]; then
+  case "${CONFIG}" in
+    *pp1*precompile*)
+      TORCHTITAN_PRECOMPILE_ARTIFACT_DIR=${WORKSPACE_DIR}/precompile_artifacts/pp1
+      ;;
+    *pp2*precompile*)
+      TORCHTITAN_PRECOMPILE_ARTIFACT_DIR=${WORKSPACE_DIR}/precompile_artifacts/pp2
+      ;;
+  esac
+fi
+if [[ -n "${TORCHTITAN_PRECOMPILE_ARTIFACT_DIR:-}" ]]; then
+  require_file \
+    "${TORCHTITAN_PRECOMPILE_ARTIFACT_DIR}/scheduled_fwd_bwd_default.bin"
+  export TORCHTITAN_PRECOMPILE_ARTIFACT_DIR
+fi
+
 TORCHTITAN_LD_LIBRARY_PATH="${RUNTIME_ROOT}/lib:${NVIDIA_CU13_LIB}:${TRITON_CUPTI_LIB}:${RUNTIME_ROOT}/lib/python3.12/site-packages/torch/lib"
 TORCHTITAN_LD_PRELOAD="${CUDA_COMPAT_DIR}/libcuda.so.1:${PLATFORM_LIB}/libnvidia-ml.so:${CUDA_COMPAT_DIR}/libnvidia-ptxjitcompiler.so.1:${RDMA_LIB_DIR}/libibverbs.so.1:${RDMA_LIB_DIR}/libmlx5-rdmav57.so:${PLATFORM_LIB}/cuda-no-rpath-13.0/libnvtx3interop.so.1"
 export TRITON_LIBCUDA_PATH=${CUDA_COMPAT_DIR}
