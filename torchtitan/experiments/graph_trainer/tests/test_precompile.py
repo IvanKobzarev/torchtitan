@@ -131,7 +131,11 @@ class TestPrecompileMain(unittest.TestCase):
 
         events = []
         compile_config = SimpleNamespace()
-        config = SimpleNamespace(compile=compile_config, dist_moe=None)
+        config = SimpleNamespace(
+            compile=compile_config,
+            dist_moe=None,
+            parallelism=SimpleNamespace(pipeline_parallel_degree=1),
+        )
         config_loader = MagicMock()
         config_loader.load.return_value = config
         setup_result = (
@@ -202,6 +206,91 @@ class TestPrecompileMain(unittest.TestCase):
                     outer_cudagraphs_enabled=outer_cudagraphs_enabled,
                 )
                 self.assertEqual(precompile_fingerprint, runtime_fingerprint)
+
+    def test_graph_pp_fingerprints_trainer_owned_config(self):
+        from torchtitan.experiments.graph_trainer import (
+            graph_builder,
+            precompile,
+            precompile_main,
+        )
+        from torchtitan.experiments.graph_trainer.graph_pp import (
+            precompile as graph_pp_precompile,
+            runner,
+        )
+
+        class FakeGraphRuntime:
+            pass
+
+        class FakeStageGraphProvider:
+            pass
+
+        stage = SimpleNamespace(stage_index=0)
+        schedule = SimpleNamespace(_stages=[stage], _n_microbatches=32)
+        provider = FakeStageGraphProvider()
+        provider.plan = object()
+        provider.stage_runtime_input_schemas = {0: ("schema", ())}
+        runtime = FakeGraphRuntime()
+        runtime.schedule = schedule
+        runtime.graph_provider = provider
+
+        pp_mesh = MagicMock()
+        pp_mesh.get_local_rank.return_value = 0
+        parallelism_context = MagicMock()
+        parallelism_context.get_mesh.return_value = pp_mesh
+        engine = SimpleNamespace(
+            pp_schedule=runtime,
+            parallelism_context=parallelism_context,
+        )
+        trainer_config = SimpleNamespace(
+            compile=SimpleNamespace(precompile_artifact_dir="trainer-artifacts"),
+            parallelism=SimpleNamespace(pipeline_parallel_schedule="Interleaved1F1B"),
+        )
+        trainer = MagicMock(config=trainer_config, engine=engine)
+        trainer.microbatch_generator.return_value = object()
+        caller_config = SimpleNamespace(
+            comm=SimpleNamespace(backend="real_pp_fake_spmd"),
+            compile=SimpleNamespace(precompile_artifact_dir="caller-artifacts"),
+            training=SimpleNamespace(disable_cuda_graphs=False, steps=10),
+            validator=object(),
+            build=MagicMock(return_value=trainer),
+        )
+
+        with (
+            patch.object(runner, "GraphRuntime", FakeGraphRuntime),
+            patch.object(
+                graph_builder,
+                "GraphTrainerStageGraphProvider",
+                FakeStageGraphProvider,
+            ),
+            patch.object(precompile_main, "_register_coor_ops"),
+            patch.object(
+                precompile,
+                "get_spmd_precompile_meshes",
+                return_value=[],
+            ),
+            patch.object(
+                graph_pp_precompile,
+                "ensure_graph_pp_schedule_precompilable",
+            ),
+            patch.object(
+                graph_pp_precompile,
+                "graph_pp_stage_config_fingerprint",
+                return_value="fingerprint",
+            ) as fingerprint,
+            patch.object(
+                graph_pp_precompile,
+                "save_graph_pp_rank_artifact",
+            ) as save,
+            patch.object(precompile_main.dist, "barrier"),
+            patch.object(precompile_main.dist, "is_initialized", return_value=False),
+        ):
+            precompile_main._precompile_graph_pp(caller_config)
+
+        self.assertIs(fingerprint.call_args.kwargs["config"], trainer_config)
+        storage = save.call_args.args[1]
+        self.assertEqual(storage.base_dir.name, "trainer-artifacts")
+        trainer.train_step.assert_called_once()
+        trainer.close.assert_called_once()
 
     def test_builds_inputs_from_configured_microbatches(self):
         from torchtitan.experiments.graph_trainer.precompile_main import (

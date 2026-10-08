@@ -4,13 +4,11 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""
-Single-process precompile entry point for graph_trainer.
+"""Precompile entry point for GraphTrainer.
 
-Uses compile-on-one-rank (CooR) to generate a rank-agnostic compiled
-artifact from a single process, which can then be loaded by all ranks
-during torchrun training. This avoids the need to run torchrun with N
-GPUs just for precompilation.
+SPMD uses compile-on-one-rank (CooR) to generate a rank-agnostic artifact
+from one process. GraphPP runs one physical process per pipeline rank and uses
+CooR for the remaining SPMD axes, producing one bundle for each PP rank.
 
 Usage:
     python -m torchtitan.experiments.graph_trainer.precompile_main \
@@ -46,6 +44,104 @@ from torchtitan.tools import utils
 
 
 logger = logging.getLogger(__name__)
+
+
+def _precompile_graph_pp(config) -> None:
+    """Generate one stage-graph bundle on each real pipeline rank."""
+    import torch.compiler.config as compiler_config
+
+    from torchtitan.experiments.graph_trainer.graph_builder import (
+        GraphTrainerStageGraphProvider,
+    )
+    from torchtitan.experiments.graph_trainer.graph_pp.precompile import (
+        ensure_graph_pp_schedule_precompilable,
+        graph_pp_stage_config_fingerprint,
+        save_graph_pp_rank_artifact,
+    )
+    from torchtitan.experiments.graph_trainer.graph_pp.runner import GraphRuntime
+    from torchtitan.experiments.graph_trainer.precompile import (
+        get_spmd_precompile_meshes,
+    )
+
+    if config.comm.backend != "real_pp_fake_spmd":
+        raise ValueError(
+            "GraphPP precompile requires comm.backend='real_pp_fake_spmd' "
+            "and one physical process per pipeline rank."
+        )
+    if not config.compile.precompile_artifact_dir:
+        raise ValueError(
+            "precompile_main requires compile.precompile_artifact_dir in the recipe."
+        )
+
+    # The outer full-step graph is independent of the saved stage graphs and
+    # would turn artifact generation into a multi-step CUDA capture warmup.
+    config.training.disable_cuda_graphs = True
+    config.training.steps = 1
+    config.validator = None
+    original_compile_on_one_rank = compiler_config.compile_on_one_rank
+    compiler_config.compile_on_one_rank = False
+    _register_coor_ops()
+
+    trainer = None
+    try:
+        trainer = config.build()
+        # Model initialization uses DTensor RNG and must run outside CooR.
+        # Stage tracing is lazy, so enable CooR only for the schedule step.
+        compiler_config.compile_on_one_rank = True
+        trainer_config = trainer.config
+        engine = trainer.engine
+        graph_runtime = engine.pp_schedule
+        if not isinstance(graph_runtime, GraphRuntime):
+            raise ValueError("GraphPP precompile requires a GraphRuntime schedule.")
+        graph_provider = graph_runtime.graph_provider
+        if not isinstance(graph_provider, GraphTrainerStageGraphProvider):
+            raise ValueError(
+                "GraphPP precompile requires the GraphTrainer stage graph provider."
+            )
+        ensure_graph_pp_schedule_precompilable(graph_runtime.schedule)
+        graph_provider.load_precompiled_artifact = False
+        graph_provider.runtime_meshes = get_spmd_precompile_meshes(
+            engine.parallelism_context
+        )
+
+        # A real schedule step supplies stage metadata, DistMoE activation-slot
+        # ownership, and the configured TrainingMicrobatch contract. It also
+        # verifies every pipeline action after the provider builds the graphs.
+        data_iterator = trainer.microbatch_generator(trainer.dataloader)
+        trainer.train_step(data_iterator)
+
+        stages = list(graph_runtime.schedule._stages)
+        pp_rank = engine.parallelism_context.get_mesh("pp").get_local_rank()
+        schedule_name = trainer_config.parallelism.pipeline_parallel_schedule
+        fingerprints = {
+            stage.stage_index: graph_pp_stage_config_fingerprint(
+                stage,
+                config=trainer_config,
+                parallelism_context=engine.parallelism_context,
+                execution_plan=graph_provider.plan,
+                schedule_name=schedule_name,
+                num_microbatches=graph_runtime.schedule._n_microbatches,
+            )
+            for stage in stages
+        }
+        save_graph_pp_rank_artifact(
+            stages,
+            DiskStorageAdapter(trainer_config.compile.precompile_artifact_dir),
+            pp_rank=pp_rank,
+            schedule_name=schedule_name,
+            num_microbatches=graph_runtime.schedule._n_microbatches,
+            num_runtime_mesh_inputs=len(graph_provider.runtime_meshes),
+            execution_plan=graph_provider.plan,
+            config_fingerprints=fingerprints,
+            runtime_input_schemas=graph_provider.stage_runtime_input_schemas,
+        )
+        dist.barrier(group=engine.parallelism_context.get_mesh("pp").get_group())
+    finally:
+        if trainer is not None:
+            trainer.close()
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        compiler_config.compile_on_one_rank = original_compile_on_one_rank
 
 
 def _num_spmd_microbatches(config, parallelism_context: ParallelismContext) -> int:
@@ -458,6 +554,10 @@ def _precompile_aot_fx_trace(
 def main():
     init_logger()
     config = ConfigLoader().load()
+
+    if config.parallelism.pipeline_parallel_degree > 1:
+        _precompile_graph_pp(config)
+        return
 
     (
         model,
