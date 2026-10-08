@@ -6091,17 +6091,18 @@ class TestSelectiveActivationRematPass(TestCase):
         inp2 = graph.placeholder("inp2")
         a = graph.call_function(torch.ops.aten.clone.default, args=(inp1,))
         b = graph.call_function(torch.ops.aten.clone.default, args=(inp2,))
-        bwd_loss = graph.call_function(torch.ops.aten.add.Tensor, args=(a, a))
+        shared = graph.call_function(torch.ops.aten.clone.default, args=(inp1,))
+        bwd_loss = graph.call_function(torch.ops.aten.add.Tensor, args=(a, shared))
         sep = graph.call_function(torch.ops.aten.neg.default, args=(inp1,))
-        bwd_layer = graph.call_function(torch.ops.aten.mul.Tensor, args=(b, b))
+        bwd_layer = graph.call_function(torch.ops.aten.mul.Tensor, args=(b, shared))
         graph.output((bwd_loss, sep, bwd_layer))
-        for node in (a, b):
+        for node in (a, b, shared):
             node.meta["recompute"] = CheckpointPolicy.MUST_RECOMPUTE
         bwd_loss.meta["autograd_backward"] = True
         bwd_loss.meta["custom"] = {"module_fqn": "loss"}
         bwd_layer.meta["autograd_backward"] = True
         bwd_layer.meta["custom"] = {"module_fqn": "layers.0.attention"}
-        a_name, b_name = a.name, b.name
+        a_name, b_name, shared_name = a.name, b.name, shared.name
 
         gm = torch.fx.GraphModule(torch.nn.Module(), graph)
         result = selective_activation_remat_pass(gm)
@@ -6110,15 +6111,24 @@ class TestSelectiveActivationRematPass(TestCase):
         node_names = [n.name for n in nodes]
         dups = {n.name for n in nodes if n.name.endswith("_recomputed")}
         # Only the model-layer region's input is rematerialized.
-        self.assertEqual(dups, {b_name + "_recomputed"})
-        for inp in bwd_layer.all_input_nodes:
-            self.assertEqual(inp.name, b_name + "_recomputed")
+        self.assertEqual(
+            dups,
+            {b_name + "_recomputed", shared_name + "_recomputed"},
+        )
+        self.assertEqual(
+            {node.name for node in bwd_layer.all_input_nodes},
+            {b_name + "_recomputed", shared_name + "_recomputed"},
+        )
         self.assertNotIn(b_name, node_names)
         # The loss region is untouched: its recompute input stays and is still
         # read directly (not remat'd, not erased).
         self.assertIn(a_name, node_names)
-        for inp in bwd_loss.all_input_nodes:
-            self.assertEqual(inp.name, a_name)
+        self.assertIn(shared_name, node_names)
+        self.assertEqual(
+            {node.name for node in bwd_loss.all_input_nodes},
+            {a_name, shared_name},
+        )
+        result.graph.lint()
 
     def test_multiple_model_layer_regions_recompute_errors(self):
         # Two disjoint *model-layer* backward regions that both need remat is

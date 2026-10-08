@@ -376,11 +376,12 @@ def selective_activation_remat_pass(
     # to read from the dup. Backward consumers of offloaded forward nodes
     # were already redirected to their reload chain by the CPU offload
     # pass, so the offload branch of remat_input is a no-op here.
+    remat_bwd_nodes = set(bwd_nodes)
     direct_bwd_consumers = {
         user
         for fwd_node in recomputed_nodes
         for user in fwd_node.users
-        if _is_backward_node(user)
+        if user in remat_bwd_nodes
     }
     for bwd_node in direct_bwd_consumers:
         bwd_node.args = torch.fx.map_arg(bwd_node.args, remat_input)
