@@ -78,6 +78,14 @@ def is_reduce_grad_collective(node: fx.Node) -> bool:
     return is_reduce_scatter_tensor(node) or is_all_reduce(node)
 
 
+def reduce_grad_collective_input(node: fx.Node) -> fx.Node | None:
+    """Return the tensor input of an FSDP reduce-gradient collective."""
+    if not is_reduce_grad_collective(node) or not node.args:
+        return None
+    tensor_input = node.args[0]
+    return tensor_input if isinstance(tensor_input, fx.Node) else None
+
+
 def fsdp_param_fqns(node: fx.Node) -> tuple[str, ...]:
     """Return the SimpleFSDP parameter provenance attached to a graph node."""
     return node.meta.get("custom", {}).get(FSDP_PARAM_FQNS_META, ())
@@ -95,7 +103,9 @@ def _find_last_all_gather_in_chain(start_node: fx.Node) -> fx.Node | None:
         if len(node.users) != 1:
             break
         user = next(iter(node.users))
-        if len(user.all_input_nodes) > 1:
+        if len(user.all_input_nodes) > 1 and not (
+            is_all_gather_into_tensor(user) and user.args and user.args[0] is node
+        ):
             break
         node = user
     return last_all_gather
@@ -211,7 +221,11 @@ def _find_fsdp_unshard_outputs(
     outputs: list[fx.Node] = []
     seen: set[fx.Node] = set()
     for user in param_placeholder.users:
-        if len(user.all_input_nodes) > 1:
+        if len(user.all_input_nodes) > 1 and not (
+            is_all_gather_into_tensor(user)
+            and user.args
+            and user.args[0] is param_placeholder
+        ):
             continue
         last_all_gather = _find_last_all_gather_in_chain(user)
         if last_all_gather is None:
@@ -438,14 +452,17 @@ def find_fsdp_reduce_grad_input(param_grad_output: Any) -> fx.Node | None:
 
     node = param_grad_output
     reduce_grad_input = None
-    while isinstance(node, fx.Node) and len(node.all_input_nodes) == 1:
-        input_node = node.all_input_nodes[0]
+    while isinstance(node, fx.Node):
+        input_node = reduce_grad_collective_input(node)
+        if input_node is not None:
+            reduce_grad_input = input_node
+        elif len(node.all_input_nodes) == 1:
+            input_node = node.all_input_nodes[0]
+        else:
+            break
         if len(input_node.users) > 1:
             break
-        previous_node = node
         node = input_node
-        if is_reduce_grad_collective(previous_node):
-            reduce_grad_input = node
     # The collective scan identifies ``packed_grad`` in code shaped like:
     #
     #   cast_grad = grad.to(reduce_dtype)
@@ -487,18 +504,20 @@ def _parameter_gradient_matches_fsdp_parameter(
 
 def _has_matching_reduce_grad_collective_ancestor(
     node: fx.Node,
-    fsdp_param_fqns: tuple[str, ...],
+    expected_param_fqns: tuple[str, ...],
 ) -> bool:
     """Return whether an FSDP collective exists in this gradient epilogue."""
     pending = [node]
     seen: set[fx.Node] = set()
     while pending:
         current = pending.pop()
-        current_fqns = _fsdp_param_fqns(current)
-        if current in seen or (current_fqns and current_fqns != fsdp_param_fqns):
+        current_fqns = fsdp_param_fqns(current)
+        if current in seen or (
+            current_fqns and current_fqns != expected_param_fqns
+        ):
             continue
         seen.add(current)
-        if is_reduce_grad_collective(current) and current_fqns == fsdp_param_fqns:
+        if is_reduce_grad_collective(current) and current_fqns == expected_param_fqns:
             return True
         pending.extend(current.all_input_nodes)
     return False
