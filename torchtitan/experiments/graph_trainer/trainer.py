@@ -102,6 +102,25 @@ class GraphTrainingEngine(TrainingEngine):
                 "GraphTrainer does not support fsdp_defer_gradient_reduction."
             )
 
+        if self.parallelism_context.pp_enabled:
+            graph_runtime = self.pp_schedule
+            assert isinstance(graph_runtime, GraphRuntime)
+            graph_provider = graph_runtime.graph_provider
+            if graph_provider is not None:
+                from torchtitan.experiments.graph_trainer.graph_builder import (
+                    GraphTrainerStageGraphProvider,
+                )
+
+                if not isinstance(graph_provider, GraphTrainerStageGraphProvider):
+                    raise ValueError(
+                        "GraphTrainer GraphPP requires its stage graph provider."
+                    )
+                graph_provider.config = self.config
+                graph_provider.parallelism_context = self.parallelism_context
+                graph_provider.load_precompiled_artifact = bool(
+                    self.config.compile.precompile_artifact_dir
+                )
+
         if self.config.dist_moe is not None:
             graph_runtime = None
             if self.parallelism_context.pp_enabled:

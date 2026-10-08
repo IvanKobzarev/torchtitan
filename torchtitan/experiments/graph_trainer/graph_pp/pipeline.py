@@ -196,11 +196,6 @@ def _validate_graph_pp_config(
     compile_config: GraphTrainerCompileConfig,
     parallelism: ParallelismConfig,
 ) -> None:
-    if compile_config.precompile_artifact_dir:
-        raise ValueError(
-            "GraphPP does not support compile.precompile_artifact_dir yet. "
-            "Trace and graph construction are stage-local runtime operations."
-        )
     if parallelism.fsdp_reshard_after_forward == "always":
         raise ValueError(
             "GraphPP assumes ZeRO-2 style FSDP with "

@@ -18,6 +18,7 @@ from collections.abc import Callable
 from typing import Any, cast, Literal, TYPE_CHECKING
 
 import torch
+from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.pipelining import PipelineStageInfo
 from torch.distributed.pipelining.schedules import (
     _PipelineContext,
@@ -61,6 +62,7 @@ from torchtitan.experiments.graph_trainer.spmd_graph_builder import (
 
 
 if TYPE_CHECKING:
+    from torchtitan.experiments.graph_trainer.precompile import RuntimeInputSchema
     from torchtitan.experiments.graph_trainer.trainer import GraphTrainer
     from torchtitan.models.common.dist_moe.runtime import _DistMoeForwardContext
 
@@ -183,6 +185,11 @@ class GraphTrainerStageGraphProvider:
     config: "GraphTrainer.Config | GraphTrainerConfigView"
     plan: GraphExecutionPlan
     parallelism_context: ParallelismContext | None = None
+    runtime_meshes: list[DeviceMesh] | None = None
+    load_precompiled_artifact: bool = False
+    stage_runtime_input_schemas: dict[int, RuntimeInputSchema] = dataclasses.field(
+        default_factory=dict
+    )
     # Calling convention:
     # key = (forward_stage_index, backward_stage_index); the graph is reused
     # across microbatches for that stage pair.
@@ -270,15 +277,97 @@ class GraphTrainerStageGraphProvider:
                     )
             return {}
 
+        stage_trace_inputs: dict[int, tuple[Any, ...]] = {}
+        if self.load_precompiled_artifact or any(
+            stage.graphs is None for stage in graph_stages
+        ):
+            stage_trace_inputs = {
+                stage.stage_index: (
+                    stage_builder._trace_args_for_stage(stage, trace_ctx),
+                    _trace_kwargs_from_context(trace_ctx),
+                    stage_builder._trace_target_from_context(stage, trace_ctx),
+                    loss_kwargs,
+                    _resolve_dist_moe_activation_slot(
+                        dist_moe_forward_context,
+                        stage_index=stage.stage_index,
+                    ),
+                )
+                for stage in graph_stages
+            }
+            from torchtitan.experiments.graph_trainer.precompile import (
+                runtime_input_schema,
+            )
+
+            self.stage_runtime_input_schemas = {
+                stage_index: runtime_input_schema(trace_inputs)
+                for stage_index, trace_inputs in stage_trace_inputs.items()
+            }
+
+        if self.load_precompiled_artifact:
+            from torchtitan.experiments.graph_trainer.graph_pp.precompile import (
+                ensure_graph_pp_schedule_precompilable,
+                graph_pp_stage_config_fingerprint,
+                load_graph_pp_rank_artifact,
+            )
+            from torchtitan.experiments.graph_trainer.precompile import (
+                get_spmd_precompile_meshes,
+            )
+            from torchtitan.experiments.graph_trainer.storage import (
+                DiskStorageAdapter,
+            )
+
+            if isinstance(self.config, GraphTrainerConfigView):
+                raise ValueError(
+                    "GraphPP precompile loading requires the full Trainer config."
+                )
+            if self.parallelism_context is None:
+                raise ValueError(
+                    "GraphPP precompile loading requires a parallelism context."
+                )
+            ensure_graph_pp_schedule_precompilable(schedule)
+            runtime_meshes = self.runtime_meshes
+            if runtime_meshes is None:
+                runtime_meshes = get_spmd_precompile_meshes(
+                    self.parallelism_context
+                )
+                self.runtime_meshes = runtime_meshes
+            pp_rank = self.parallelism_context.get_mesh("pp").get_local_rank()
+            schedule_name = self.config.parallelism.pipeline_parallel_schedule
+            fingerprints = {
+                stage.stage_index: graph_pp_stage_config_fingerprint(
+                    stage,
+                    config=cast("GraphTrainer.Config", self.config),
+                    parallelism_context=self.parallelism_context,
+                    execution_plan=self.plan,
+                    schedule_name=schedule_name,
+                    num_microbatches=schedule._n_microbatches,
+                )
+                for stage in graph_stages
+            }
+            stage_graphs = load_graph_pp_rank_artifact(
+                DiskStorageAdapter(self.config.compile.precompile_artifact_dir),
+                pp_rank=pp_rank,
+                schedule_name=schedule_name,
+                num_microbatches=schedule._n_microbatches,
+                runtime_meshes=runtime_meshes,
+                execution_plan=self.plan,
+                expected_stage_indices=tuple(
+                    stage.stage_index for stage in graph_stages
+                ),
+                expected_config_fingerprints=fingerprints,
+                expected_runtime_input_schemas=self.stage_runtime_input_schemas,
+            )
+            for stage in graph_stages:
+                stage.graphs = stage_graphs[stage.stage_index]
+            self._overlap_graphs = {}
+            return {}
+
         for stage in graph_stages:
             if stage.graphs is not None:
                 continue
             _build_stage_graphs(
                 stage,
-                stage_builder._trace_args_for_stage(stage, trace_ctx),
-                _trace_kwargs_from_context(trace_ctx),
-                stage_builder._trace_target_from_context(stage, trace_ctx),
-                loss_kwargs,
+                *stage_trace_inputs[stage.stage_index][:4],
                 loss_fn=self.loss_fn,
                 config=self.config,
                 parallelism_context=self.parallelism_context,
@@ -287,10 +376,8 @@ class GraphTrainerStageGraphProvider:
                 extract_fsdp_grad_reduction=self.plan.extract_fsdp_grad_reduction,
                 gradient_accumulation=self.plan.has_gradient_accumulation,
                 fuse_wgrad_accumulation=self.plan.fuse_wgrad_accumulation,
-                activation_slot_id_1=_resolve_dist_moe_activation_slot(
-                    dist_moe_forward_context,
-                    stage_index=stage.stage_index,
-                ),
+                activation_slot_id_1=stage_trace_inputs[stage.stage_index][4],
+                runtime_meshes=self.runtime_meshes,
             )
 
         required_overlap_pairs = stage_builder._required_multiplex_pairs(schedule)

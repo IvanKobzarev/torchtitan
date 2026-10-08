@@ -1,0 +1,181 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+import pickle
+import tempfile
+import unittest
+from types import SimpleNamespace
+
+import torch
+
+from torchtitan.experiments.graph_trainer.common_utils import ensure_boxed_graph_module
+from torchtitan.experiments.graph_trainer.graph_builder import GraphExecutionPlan
+from torchtitan.experiments.graph_trainer.graph_builder_utils import (
+    _execute_graph_module,
+)
+from torchtitan.experiments.graph_trainer.graph_pp.pp_graph_builder import (
+    _StageGraphModules,
+    GraphTrainerStageGraphs,
+)
+from torchtitan.experiments.graph_trainer.graph_pp.precompile import (
+    graph_pp_rank_artifact_key,
+    load_graph_pp_rank_artifact,
+    PrecompiledGraphPPRankArtifact,
+    save_graph_pp_rank_artifact,
+)
+from torchtitan.experiments.graph_trainer.storage import DiskStorageAdapter
+
+
+def _make_boxed_graph_module():
+    return ensure_boxed_graph_module(torch.fx.symbolic_trace(lambda value: value + 1))
+
+
+def _make_stage(stage_index: int):
+    graph_module = _make_boxed_graph_module()
+    stage_graphs = GraphTrainerStageGraphs(
+        modules=_StageGraphModules(
+            fw=graph_module,
+            full_bw_repeat=graph_module,
+            full_bw_first=graph_module,
+            bw_di=graph_module,
+            bw_dw_repeat=graph_module,
+            bw_dw_first=graph_module,
+            unshard_launch=None,
+            unshard_wait=None,
+            reduce_grad=None,
+        ),
+        meta=SimpleNamespace(
+            num_fw_param_inputs=0,
+            fwd_input_names=("value",),
+            fwd_flat_input_indices=(0,),
+            unshard_runtime_mesh_indices=(),
+            reduce_grad_runtime_mesh_indices=(),
+        ),
+        compiled=True,
+        full_bw_grad_accumulator_indices=(0,),
+        bw_dw_grad_accumulator_indices=(1,),
+    )
+    return SimpleNamespace(stage_index=stage_index, graphs=stage_graphs)
+
+
+def _make_plan() -> GraphExecutionPlan:
+    return GraphExecutionPlan(
+        pp_enabled=True,
+        num_microbatches=32,
+        unshard="schedule",
+        reduce_grad="schedule",
+        fuse_wgrad_accumulation=True,
+    )
+
+
+class TestGraphPPPrecompileArtifact(unittest.TestCase):
+    def test_rank_bundle_roundtrip_preserves_all_local_stages(self) -> None:
+        stage_indices = tuple(range(0, 16, 2))
+        stages = [_make_stage(stage_index) for stage_index in stage_indices]
+        fingerprints = {
+            stage_index: f"fingerprint-{stage_index}" for stage_index in stage_indices
+        }
+        schemas = {
+            stage_index: (f"schema-{stage_index}", ()) for stage_index in stage_indices
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            storage = DiskStorageAdapter(tmpdir)
+            save_graph_pp_rank_artifact(
+                stages,
+                storage,
+                pp_rank=0,
+                schedule_name="Interleaved1F1B",
+                num_microbatches=32,
+                num_runtime_mesh_inputs=0,
+                execution_plan=_make_plan(),
+                config_fingerprints=fingerprints,
+                runtime_input_schemas=schemas,
+            )
+            loaded = load_graph_pp_rank_artifact(
+                storage,
+                pp_rank=0,
+                schedule_name="Interleaved1F1B",
+                num_microbatches=32,
+                runtime_meshes=[],
+                execution_plan=_make_plan(),
+                expected_stage_indices=stage_indices,
+                expected_config_fingerprints=fingerprints,
+                expected_runtime_input_schemas=schemas,
+            )
+
+        self.assertEqual(tuple(loaded), stage_indices)
+        for stage_index, graphs in loaded.items():
+            self.assertTrue(graphs.compiled)
+            self.assertEqual(graphs.full_bw_grad_accumulator_indices, (0,))
+            self.assertEqual(graphs.bw_dw_grad_accumulator_indices, (1,))
+            self.assertIsNotNone(graphs.modules.full_bw_first)
+            self.assertIsNotNone(graphs.modules.bw_di)
+            self.assertIsNotNone(graphs.modules.bw_dw_repeat)
+            self.assertIsNotNone(graphs.modules.bw_dw_first)
+            args = [torch.tensor(stage_index)]
+            (output,) = _execute_graph_module(graphs.modules.fw, args)
+            torch.testing.assert_close(output, torch.tensor(stage_index + 1))
+            self.assertEqual(args, [])
+
+    def test_load_rejects_stale_stage_runtime_schema(self) -> None:
+        stage = _make_stage(1)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            storage = DiskStorageAdapter(tmpdir)
+            save_graph_pp_rank_artifact(
+                [stage],
+                storage,
+                pp_rank=1,
+                schedule_name="Interleaved1F1B",
+                num_microbatches=32,
+                num_runtime_mesh_inputs=0,
+                execution_plan=_make_plan(),
+                config_fingerprints={1: "fingerprint"},
+                runtime_input_schemas={1: ("artifact-schema", ())},
+            )
+            with self.assertRaisesRegex(ValueError, "runtime input schema mismatch"):
+                load_graph_pp_rank_artifact(
+                    storage,
+                    pp_rank=1,
+                    schedule_name="Interleaved1F1B",
+                    num_microbatches=32,
+                    runtime_meshes=[],
+                    execution_plan=_make_plan(),
+                    expected_stage_indices=(1,),
+                    expected_config_fingerprints={1: "fingerprint"},
+                    expected_runtime_input_schemas={1: ("runtime-schema", ())},
+                )
+
+    def test_load_rejects_wrong_rank_even_if_storage_key_matches(self) -> None:
+        stage = _make_stage(1)
+        artifact = PrecompiledGraphPPRankArtifact.from_stages(
+            [stage],
+            pp_rank=0,
+            schedule_name="Interleaved1F1B",
+            num_microbatches=32,
+            num_runtime_mesh_inputs=0,
+            execution_plan=_make_plan(),
+            config_fingerprints={1: "fingerprint"},
+            runtime_input_schemas={1: ("schema", ())},
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            storage = DiskStorageAdapter(tmpdir)
+            storage.save(graph_pp_rank_artifact_key(1), pickle.dumps(artifact))
+            with self.assertRaisesRegex(ValueError, "rank contract mismatch"):
+                load_graph_pp_rank_artifact(
+                    storage,
+                    pp_rank=1,
+                    schedule_name="Interleaved1F1B",
+                    num_microbatches=32,
+                    runtime_meshes=[],
+                    execution_plan=_make_plan(),
+                    expected_stage_indices=(1,),
+                    expected_config_fingerprints={1: "fingerprint"},
+                    expected_runtime_input_schemas={1: ("schema", ())},
+                )
+
+
+if __name__ == "__main__":
+    unittest.main()

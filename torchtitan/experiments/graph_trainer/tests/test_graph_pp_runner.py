@@ -749,6 +749,90 @@ class GraphRuntimeTraceTest(unittest.TestCase):
         info = forward_context.resolve_activation_slot.call_args.args[0]
         self.assertEqual((info.stage_index, info.microbatch_index), (0, 0))
 
+    def test_provider_loads_rank_local_precompiled_stage_graphs(self) -> None:
+        loaded_graphs = object()
+        stage = types.SimpleNamespace(
+            stage_index=0,
+            graphs=None,
+            is_first=True,
+            is_last=False,
+            submod=nn.Linear(2, 2),
+        )
+        schedule = types.SimpleNamespace(
+            _n_microbatches=32,
+            _stages=[stage],
+            rank=0,
+            pipeline_order_with_comms={0: []},
+        )
+        value = torch.randn(2, 2)
+        ctx = _PipelineContext(
+            schedule,
+            [(value,)] * 32,
+            [{} for _ in range(32)],
+            None,
+            [],
+        )
+        pp_mesh = mock.Mock()
+        pp_mesh.get_local_rank.return_value = 0
+        parallelism_context = mock.Mock()
+        parallelism_context.get_mesh.return_value = pp_mesh
+        provider = GraphTrainerStageGraphProvider(
+            loss_fn=lambda pred, target: pred.sum(),
+            config=types.SimpleNamespace(
+                compile=GraphTrainerCompileConfig(precompile_artifact_dir="artifacts"),
+                parallelism=ParallelismConfig(
+                    pipeline_parallel_schedule="Interleaved1F1B",
+                ),
+            ),
+            plan=GraphExecutionPlan(
+                pp_enabled=True,
+                num_microbatches=32,
+                unshard="schedule",
+                reduce_grad="schedule",
+                fuse_wgrad_accumulation=False,
+            ),
+            parallelism_context=parallelism_context,
+            runtime_meshes=[mock.Mock()],
+            load_precompiled_artifact=True,
+        )
+
+        with (
+            mock.patch(
+                "torchtitan.experiments.graph_trainer.graph_pp.precompile."
+                "ensure_graph_pp_schedule_precompilable"
+            ),
+            mock.patch(
+                "torchtitan.experiments.graph_trainer.graph_pp.precompile."
+                "graph_pp_stage_config_fingerprint",
+                return_value="fingerprint",
+            ),
+            mock.patch(
+                "torchtitan.experiments.graph_trainer.graph_pp.precompile."
+                "load_graph_pp_rank_artifact",
+                return_value={0: loaded_graphs},
+            ) as load,
+            mock.patch(
+                "torchtitan.experiments.graph_trainer.graph_builder."
+                "_build_stage_graphs"
+            ) as build,
+            mock.patch(
+                "torchtitan.experiments.graph_trainer.graph_builder."
+                "_compile_stage_graphs"
+            ) as compile_graphs,
+        ):
+            provider.prepare_graphs(schedule, ctx, loss_kwargs={})
+
+        self.assertIs(stage.graphs, loaded_graphs)
+        build.assert_not_called()
+        compile_graphs.assert_not_called()
+        self.assertEqual(load.call_args.kwargs["pp_rank"], 0)
+        self.assertEqual(load.call_args.kwargs["num_microbatches"], 32)
+        self.assertEqual(load.call_args.kwargs["expected_stage_indices"], (0,))
+        self.assertEqual(
+            set(load.call_args.kwargs["expected_runtime_input_schemas"]),
+            {0},
+        )
+
     def test_dist_moe_slot_is_an_explicit_stage_graph_input(self) -> None:
         """The exact BF16 and MXFP8 forward schemas consume one slot input."""
         for op, slot_index in _dist_moe_forward_slot_arguments():
