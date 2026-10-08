@@ -6,6 +6,8 @@
 
 """Expose and specialize recipes archived in the pinned TorchTitan runtime."""
 
+import os
+
 from scripts.dsv3_671b_dist_moe_256gpu import mast_configs as _mast_configs
 from scripts.dsv3_671b_dist_moe_256gpu.mast_configs import *  # noqa: F401, F403
 
@@ -47,3 +49,46 @@ def graph_trainer_deepseek_v3_671b_dist_moe_mxfp8_sanket_final_mtp1_256gpu_full_
     )
     config.parallelism.pp_num_unshard_lookahead_factor = "full"
     return config
+
+
+def _configure_precompile(config):
+    """Load the artifact embedded in the immutable launcher package."""
+    config.compile.precompile_artifact_dir = os.environ[
+        "TORCHTITAN_PRECOMPILE_ARTIFACT_DIR"
+    ]
+    return config
+
+
+def graph_trainer_deepseek_v3_671b_dist_moe_mxfp8_chien_chin_mtp1_pp1_64gpu_numerics():
+    """Verify PP1 precompile geometry on 64 GB300s before full scale."""
+    config = (
+        _mast_configs.graph_trainer_deepseek_v3_671b_dist_moe_mxfp8_chien_chin_mtp1_256gpu_numerics()
+    )
+    config.parallelism.data_parallel_shard_degree = 64
+    config.training.num_tokens_per_train_step = 4096 * 64 * 16
+    config.training.steps = 10
+    return config
+
+
+def graph_trainer_deepseek_v3_671b_dist_moe_mxfp8_chien_chin_mtp1_pp1_precompile_64gpu_numerics():
+    """Load the PP1 artifact on the matched 64-GB300 geometry."""
+    config = (
+        graph_trainer_deepseek_v3_671b_dist_moe_mxfp8_chien_chin_mtp1_pp1_64gpu_numerics()
+    )
+    return _configure_precompile(config)
+
+
+def graph_trainer_deepseek_v3_671b_dist_moe_mxfp8_chien_chin_mtp1_pp1_precompile_256gpu_performance():
+    """Profile precompiled PP1 MTP1 at the final 256-GPU geometry."""
+    config = (
+        _mast_configs.graph_trainer_deepseek_v3_671b_dist_moe_mxfp8_chien_chin_mtp1_256gpu_performance()
+    )
+    return _configure_precompile(config)
+
+
+def graph_trainer_deepseek_v3_671b_dist_moe_mxfp8_chien_chin_mtp1_pp1_precompile_256gpu_numerics():
+    """Record full-precision metrics for precompiled PP1 at full scale."""
+    config = (
+        _mast_configs.graph_trainer_deepseek_v3_671b_dist_moe_mxfp8_chien_chin_mtp1_256gpu_numerics()
+    )
+    return _configure_precompile(config)

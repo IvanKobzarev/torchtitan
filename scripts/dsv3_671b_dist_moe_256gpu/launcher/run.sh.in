@@ -15,6 +15,8 @@ set -euo pipefail
 EXPECTED_WORLD_SIZE=256
 if [[ "${PREFLIGHT_ONLY:-0}" == 1 || "${INTEGRATION_TEST_ONLY:-0}" == 1 ]]; then
   EXPECTED_WORLD_SIZE=4
+elif [[ "${SCALE_VERIFICATION_ONLY:-0}" == 1 ]]; then
+  EXPECTED_WORLD_SIZE=64
 elif [[ "${DISTRIBUTED_SMOKE_ONLY:-0}" == 1 ]]; then
   case "${WORLD_SIZE}" in
     8|256) EXPECTED_WORLD_SIZE=${WORLD_SIZE} ;;
@@ -90,8 +92,14 @@ require_file "${TORCHTITAN_ROOT}/assets/hf/DeepSeek-V3.1-Base/tokenizer_config.j
 
 if [[ -z "${TORCHTITAN_PRECOMPILE_ARTIFACT_DIR:-}" ]]; then
   case "${CONFIG}" in
-    *pp1*precompile*)
-      TORCHTITAN_PRECOMPILE_ARTIFACT_DIR=${WORKSPACE_DIR}/precompile_artifacts/pp1
+    *pp1*precompile*4gpu*)
+      TORCHTITAN_PRECOMPILE_ARTIFACT_DIR=${WORKSPACE_DIR}/precompile_artifacts/pp1-4gpu
+      ;;
+    *pp1*precompile*64gpu*)
+      TORCHTITAN_PRECOMPILE_ARTIFACT_DIR=${WORKSPACE_DIR}/precompile_artifacts/pp1-64gpu
+      ;;
+    *pp1*precompile*256gpu*)
+      TORCHTITAN_PRECOMPILE_ARTIFACT_DIR=${WORKSPACE_DIR}/precompile_artifacts/pp1-256gpu
       ;;
     *pp2*precompile*)
       TORCHTITAN_PRECOMPILE_ARTIFACT_DIR=${WORKSPACE_DIR}/precompile_artifacts/pp2
