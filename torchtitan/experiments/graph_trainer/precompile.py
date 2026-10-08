@@ -239,6 +239,7 @@ def compute_config_fingerprint(
     parallelism_context: ParallelismContext,
     *,
     graph_signature: tuple[Any, ...] | None = None,
+    outer_cudagraphs_enabled: bool = False,
 ) -> ConfigFingerprint:
     """
     Compute a fingerprint that captures everything affecting the compiled output:
@@ -275,6 +276,11 @@ def compute_config_fingerprint(
         skipped_fields=frozenset({"precompile_artifact_dir"}),
     )
     h.update(f"compile:{compile_signature}\n".encode())
+    if (
+        compile_config.coda_passes_enabled
+        and compile_config.coda_compile_time_benchmark
+    ):
+        h.update(f"outer_cudagraphs_enabled:{outer_cudagraphs_enabled}\n".encode())
     if graph_signature is not None:
         h.update(f"trainer_graph:{graph_signature}\n".encode())
     h.update(f"torch_version:{torch.__version__}\n".encode())

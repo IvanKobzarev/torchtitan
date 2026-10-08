@@ -25,6 +25,7 @@ from torchtitan.config import TrainingConfig
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed import ParallelismContext
 from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
+from torchtitan.distributed.cuda_graph import cuda_graphs_supported
 from torchtitan.distributed.pipeline_parallel import (
     _build_get_mesh_callback,
     _build_pipeline_schedule,
@@ -876,6 +877,9 @@ def graph_pipeline_llm(
             compile=compile_config,
             parallelism=parallelism,
             model=model_config,
+            outer_cudagraphs_enabled=(
+                not training.disable_cuda_graphs and cuda_graphs_supported()
+            ),
         ),
         loss_fn=loss_fn,
     )

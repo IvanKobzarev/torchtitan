@@ -70,6 +70,7 @@ def _configured_pattern_pass(
     *,
     compile_time_benchmark,
     coda_autotune=False,
+    benchmark_cuda_graph_replay=False,
     benchmark_graph_processor=None,
 ):
     return coda_passes._configured_coda_pass(
@@ -77,6 +78,7 @@ def _configured_pattern_pass(
         compile_time_benchmark=compile_time_benchmark,
         benchmark_strict=False,
         coda_autotune=coda_autotune,
+        benchmark_cuda_graph_replay=benchmark_cuda_graph_replay,
         benchmark_graph_processor=benchmark_graph_processor,
     )
 

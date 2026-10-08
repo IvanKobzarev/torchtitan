@@ -30,6 +30,9 @@ from torchtitan.experiments.graph_trainer.graph_pp.stage import (
     GraphPipelineStage,
     JointStageGraphs,
 )
+from torchtitan.experiments.graph_trainer.graph_builder_utils import (
+    _outer_cudagraphs_enabled,
+)
 from torchtitan.experiments.graph_trainer.make_fx_tracer import (
     minimal_fx_tracer,
     run_traced,
@@ -206,6 +209,7 @@ def _trace_joint_stage_graph(
     loss_fn: Callable,
     compile_config: GraphTrainerCompileConfig,
     parallelism_context: ParallelismContext,
+    outer_cudagraphs_enabled: bool,
 ) -> tuple[TracedResult, list[DeviceMesh] | None]:
     """Trace or load the joint forward/backward graph for either SPMD path."""
     runtime_meshes: list[DeviceMesh] | None = None
@@ -226,6 +230,7 @@ def _trace_joint_stage_graph(
                 stage.submod,
                 compile_config,
                 parallelism_context,
+                outer_cudagraphs_enabled=outer_cudagraphs_enabled,
             ),
             example_inputs=flatten_runtime_inputs(
                 stage.submod,
@@ -287,6 +292,7 @@ def _trace_spmd_stage_graph(
     loss_fn: Callable,
     compile_config: GraphTrainerCompileConfig,
     parallelism_context: ParallelismContext,
+    outer_cudagraphs_enabled: bool,
 ) -> tuple[TracedResult, list[DeviceMesh] | None, int]:
     """Trace the joint graph for either SPMD path.
 
@@ -314,6 +320,7 @@ def _trace_spmd_stage_graph(
         loss_fn=loss_fn,
         compile_config=compile_config,
         parallelism_context=parallelism_context,
+        outer_cudagraphs_enabled=outer_cudagraphs_enabled,
     )
     num_param_grads: int = sum(
         parameter.requires_grad
@@ -343,6 +350,7 @@ def _build_fwd_bwd_graphs(
         loss_fn=loss_fn,
         compile_config=trainer_config.compile,
         parallelism_context=parallelism_context,
+        outer_cudagraphs_enabled=_outer_cudagraphs_enabled(trainer_config),
     )
     _bind_direct_joint_stage_graph(
         stage,

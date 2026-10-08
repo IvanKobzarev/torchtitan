@@ -37,6 +37,7 @@ from collections.abc import Callable
 
 import torch
 
+from torchtitan.distributed.cuda_graph import cuda_graphs_supported
 from torchtitan.distributed.fsdp import get_fsdp_reshard_after_forward_policy
 from torchtitan.experiments.graph_trainer.configs import (
     GraphTrainerCompileConfig,
@@ -157,6 +158,7 @@ def compile_time_passes(
     traced_result: "TracedResult",
     config: "GraphTrainer.Config",
     *,
+    outer_cudagraphs_enabled: bool = False,
     parallelism_context=None,
     include_inductor: bool = True,
     include_mandatory_normalization: bool = True,
@@ -406,6 +408,7 @@ def compile_time_passes(
                 compile_time_benchmark=config.compile.coda_compile_time_benchmark,
                 benchmark_strict=False,
                 coda_autotune=config.compile.coda_compile_time_autotune,
+                benchmark_cuda_graph_replay=outer_cudagraphs_enabled,
                 benchmark_graph_processor=functools.partial(
                     apply_graph_passes,
                     passes=terminal_inductor_passes,
@@ -501,6 +504,9 @@ def construct_default_graph_passes(
     return compile_time_passes(
         traced_result,
         config,
+        outer_cudagraphs_enabled=(
+            not config.training.disable_cuda_graphs and cuda_graphs_supported()
+        ),
         parallelism_context=parallelism_context,
     )
 
