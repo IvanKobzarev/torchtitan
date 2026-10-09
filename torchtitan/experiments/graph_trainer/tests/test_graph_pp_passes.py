@@ -19,6 +19,7 @@ import torch
 import torch.distributed as dist
 import torch.fx as fx
 import torch.utils._pytree as pytree
+from torch._inductor.fx_passes.bucketing import is_fsdp_reduce_scatter
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.symbolic_shapes import find_symbol_binding_fx_nodes, ShapeEnv
 from torch.nn.attention.flex_attention import flex_attention
@@ -1391,22 +1392,33 @@ def _make_multilayer_unbucketed_action_graph(collective: str) -> fx.GraphModule:
     return _make_graph_module(graph)
 
 
-def _make_dynamic_unpad_reduce_grad_action_graph() -> fx.GraphModule:
+def _make_mixed_dynamic_unpad_reduce_grad_action_graph() -> fx.GraphModule:
     graph = fx.Graph()
     first = graph.placeholder("first")
     second = graph.placeholder("second")
-    slice_end = graph.placeholder("slice_end")
+    third = graph.placeholder("third")
+    slice_shape = graph.placeholder("slice_shape")
     with FakeTensorMode() as fake_mode:
         first_value = fake_mode.from_tensor(torch.empty(4))
         second_value = fake_mode.from_tensor(torch.empty(5))
+        third_value = fake_mode.from_tensor(torch.empty(6))
         sliced_value = fake_mode.from_tensor(torch.empty(3))
     first.meta["val"] = first_value
     second.meta["val"] = second_value
-    slice_end.meta["val"] = 3
+    third.meta["val"] = third_value
+    slice_shape.meta["val"] = sliced_value
+    slice_end = graph.call_function(
+        torch.ops.aten.sym_size.int,
+        args=(slice_shape, 0),
+    )
 
     outputs = []
-    for index, (value, fake_value) in enumerate(
-        ((first, first_value), (second, second_value))
+    for index, (value, fake_value, annotated) in enumerate(
+        (
+            (first, first_value, True),
+            (second, second_value, True),
+            (third, third_value, False),
+        )
     ):
         reduce_scatter = graph.call_function(
             torch.ops._c10d_functional.reduce_scatter_tensor.default,
@@ -1420,11 +1432,10 @@ def _make_dynamic_unpad_reduce_grad_action_graph() -> fx.GraphModule:
         for node in (reduce_scatter, wait):
             node.meta["val"] = fake_value
             node.meta["autograd_backward"] = True
-            node.meta["custom"] = {
-                _MODULE_FQN: module_fqn,
-                FSDP_PARAM_FQNS_META: (f"{module_fqn}.weight",),
-            }
-        if index == 0:
+            node.meta["custom"] = {_MODULE_FQN: module_fqn}
+            if annotated:
+                node.meta["custom"][FSDP_PARAM_FQNS_META] = (f"{module_fqn}.weight",)
+        if index != 1:
             output = graph.call_function(
                 torch.ops.aten.slice.Tensor,
                 args=(wait, 0, 0, slice_end),
@@ -2523,15 +2534,34 @@ class GraphPPActionBucketingTest(unittest.TestCase):
                 1,
             )
 
-    def test_extracted_action_buckets_dynamic_unpad_reduce_scatter(self) -> None:
+    def test_extracted_action_buckets_only_annotated_dynamic_reduce_scatter(
+        self,
+    ) -> None:
         scoped_pass = functools.partial(
             joint_transformer_block_bucketing_reordering_pass,
             module_bucket_plans=["layers.0"],
             bucket_mode="custom_ops",
         )
-        gm = _make_dynamic_unpad_reduce_grad_action_graph()
-        inputs = (torch.arange(4.0), torch.arange(5.0), 3)
+        gm = _make_mixed_dynamic_unpad_reduce_grad_action_graph()
+        inputs = (
+            torch.arange(4.0),
+            torch.arange(5.0),
+            torch.arange(6.0),
+            torch.empty(3),
+        )
         expected = _FakeCollectiveInterpreter(gm).run(*inputs)
+        source_reductions = gm.graph.find_nodes(
+            op="call_function",
+            target=torch.ops._c10d_functional.reduce_scatter_tensor.default,
+        )
+        self.assertFalse(is_fsdp_reduce_scatter(source_reductions[0]))
+        self.assertTrue(source_reductions[0].meta["custom"][FSDP_PARAM_FQNS_META])
+        self.assertTrue(is_fsdp_reduce_scatter(source_reductions[1]))
+        self.assertFalse(is_fsdp_reduce_scatter(source_reductions[2]))
+        self.assertNotIn(
+            FSDP_PARAM_FQNS_META,
+            source_reductions[2].meta["custom"],
+        )
 
         with (
             patch(
@@ -2551,11 +2581,23 @@ class GraphPPActionBucketingTest(unittest.TestCase):
                 fallback_passes=[merge_all_reduce_scatters],
             )
 
+        reductions = gm.graph.find_nodes(
+            op="call_function",
+            target=torch.ops._c10d_functional.reduce_scatter_tensor.default,
+        )
+        self.assertEqual(len(reductions), 2)
+        self.assertEqual(
+            sum(
+                FSDP_PARAM_FQNS_META not in node.meta.get("custom", {})
+                for node in reductions
+            ),
+            1,
+        )
         self.assertEqual(
             len(
                 gm.graph.find_nodes(
                     op="call_function",
-                    target=torch.ops._c10d_functional.reduce_scatter_tensor.default,
+                    target=torch.ops.bucketing._pre_bucket_reduce_scatter.default,
                 )
             ),
             1,
