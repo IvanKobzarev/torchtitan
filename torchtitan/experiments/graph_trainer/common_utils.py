@@ -242,6 +242,14 @@ def is_view_like(node: torch.fx.Node) -> bool:
     )
 
 
+def view_like_tensor_input(node: torch.fx.Node) -> torch.fx.Node | None:
+    """Return the tensor operand of a view-like node."""
+    if not is_view_like(node) or not node.args:
+        return None
+    tensor_input = node.args[0]
+    return tensor_input if isinstance(tensor_input, torch.fx.Node) else None
+
+
 def same_tensor_metadata(lhs: torch.fx.Node, rhs: torch.fx.Node) -> bool:
     """Return whether two nodes have the same tensor metadata."""
     lhs_value = node_tensor_meta(lhs)

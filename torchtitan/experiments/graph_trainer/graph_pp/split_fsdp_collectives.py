@@ -21,6 +21,7 @@ from torchtitan.experiments.graph_trainer.common_utils import (
     node_tensor_meta,
     PARAMETER_GRADIENT_FQNS_META,
     same_tensor_metadata,
+    view_like_tensor_input,
     walk_up_unary_chain,
 )
 from torchtitan.experiments.graph_trainer.debug_utils import tlparse_log_graph_pass
@@ -86,7 +87,9 @@ def _unary_reduce_grad_chain(
         if is_reduce_grad_collective(node):
             found_collective = True
             next_node = reduce_grad_collective_input(node)
-        elif not is_wait_tensor(node) and not is_view_like(node):
+        elif is_view_like(node):
+            next_node = view_like_tensor_input(node)
+        elif not is_wait_tensor(node):
             return None
         else:
             inputs = node.all_input_nodes

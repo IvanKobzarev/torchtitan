@@ -2113,6 +2113,56 @@ def _make_backward_graph_with_reduce_grad_layout(
     return _make_graph_module(graph)
 
 
+def _make_backward_graph_with_dynamic_reduce_grad_slice(
+    *, num_contributions: int = 1
+) -> fx.GraphModule:
+    graph = fx.Graph()
+    slice_shape = graph.placeholder("slice_shape")
+    slice_shape.meta["val"] = torch.empty(4, dtype=torch.bfloat16)
+    slice_end = graph.call_function(
+        torch.ops.aten.sym_size.int,
+        args=(slice_shape, 0),
+    )
+    local_grads = []
+    persistent_grads = []
+    for index in range(num_contributions):
+        local_grad = graph.placeholder(f"local_grad_{index}")
+        local_grad.meta["val"] = torch.empty(4, dtype=torch.bfloat16)
+        local_grads.append(local_grad)
+        reduce_scatter = graph.call_function(
+            torch.ops._c10d_functional.reduce_scatter_tensor.default,
+            args=(local_grad, "sum", 1, _FAKE_PG),
+        )
+        reduce_scatter.meta["val"] = torch.empty(4, dtype=torch.bfloat16)
+        wait = graph.call_function(
+            torch.ops._c10d_functional.wait_tensor.default,
+            args=(reduce_scatter,),
+        )
+        wait.meta["val"] = reduce_scatter.meta["val"]
+        sliced = graph.call_function(
+            torch.ops.aten.slice.Tensor,
+            args=(wait, 0, 0, slice_end),
+        )
+        sliced.meta["val"] = wait.meta["val"]
+        persistent_grad = graph.call_function(
+            torch.ops.aten._to_copy.default,
+            args=(sliced,),
+            kwargs={"dtype": torch.float32},
+        )
+        persistent_grad.meta["val"] = torch.empty(4, dtype=torch.float32)
+        for node in (reduce_scatter, wait, sliced, persistent_grad):
+            node.meta["custom"] = {FSDP_PARAM_FQNS_META: ("weight",)}
+        persistent_grads.append(persistent_grad)
+
+    grad = persistent_grads[0]
+    for contribution in persistent_grads[1:]:
+        grad = graph.call_function(torch.ops.aten.add.Tensor, args=(grad, contribution))
+        grad.meta["val"] = persistent_grads[0].meta["val"]
+    grad.meta.setdefault("custom", {})[PARAMETER_GRADIENT_FQNS_META] = ("weight",)
+    graph.output((grad,))
+    return _make_graph_module(graph)
+
+
 def _make_backward_graph_with_zero_collective_fsdp_cast(
     *,
     fsdp_param_fqns: tuple[str, ...] = ("w13.weight",),
@@ -3653,6 +3703,78 @@ class GraphPPFSDPCollectiveSplitTest(unittest.TestCase):
             compute_output.meta["custom"][PARAMETER_GRADIENT_FQNS_META],
             ("weight",),
         )
+
+    def test_backward_split_extracts_reduce_grad_with_dynamic_slice(self) -> None:
+        gm = _make_backward_graph_with_dynamic_reduce_grad_slice()
+        output = gm.graph.find_nodes(op="output")[0].args[0][0]
+        local_grad = next(
+            node
+            for node in gm.graph.find_nodes(op="placeholder")
+            if node.name == "local_grad_0"
+        )
+
+        self.assertIs(find_fsdp_reduce_grad_input(output), local_grad)
+        split = extract_fsdp_reduce_grad_graph(gm, num_param_grads=1)
+
+        self.assertIsNotNone(split.reduce_grad_module)
+        if split.reduce_grad_module is None:
+            self.fail("Expected dynamic-slice reduce-grad graph")
+        self.assertNotIn(
+            torch.ops._c10d_functional.reduce_scatter_tensor.default,
+            _call_targets(split.compute_module),
+        )
+        reduce_grad_targets = _call_targets(split.reduce_grad_module)
+        self.assertIn(torch.ops.aten.sym_size.int, reduce_grad_targets)
+        self.assertIn(torch.ops.aten.slice.Tensor, reduce_grad_targets)
+        self.assertIn(
+            torch.ops._c10d_functional.reduce_scatter_tensor.default,
+            reduce_grad_targets,
+        )
+        self.assertEqual(split.reduce_grad_input_names, ("local_grad_0",))
+        self.assertEqual(split.reduce_grad_runtime_input_names, ("slice_shape",))
+
+        local_grad_value = torch.arange(4, dtype=torch.bfloat16)
+        slice_shape_value = torch.empty(3, dtype=torch.bfloat16)
+        (raw_grad,) = _FakeCollectiveInterpreter(split.compute_module).run(
+            local_grad_value,
+        )
+        (actual,) = _FakeCollectiveInterpreter(split.reduce_grad_module).run(
+            raw_grad,
+            slice_shape_value,
+        )
+        self.assertTrue(torch.equal(actual, local_grad_value[:3].float()))
+
+    def test_coalesces_reduce_grad_with_shared_dynamic_slice_bound(self) -> None:
+        gm = _make_backward_graph_with_dynamic_reduce_grad_slice(num_contributions=2)
+        coalesce_fsdp_reduce_grad_add_pass(gm, ())
+        split = extract_fsdp_reduce_grad_graph(gm, num_param_grads=1)
+
+        self.assertIsNotNone(split.reduce_grad_module)
+        if split.reduce_grad_module is None:
+            self.fail("Expected coalesced dynamic-slice reduce-grad graph")
+        self.assertEqual(
+            sum(
+                node.target == torch.ops._c10d_functional.reduce_scatter_tensor.default
+                for node in split.reduce_grad_module.graph.nodes
+            ),
+            1,
+        )
+        self.assertEqual(split.compute_input_names, ("local_grad_0", "local_grad_1"))
+        self.assertEqual(len(split.reduce_grad_input_names), 1)
+        self.assertEqual(split.reduce_grad_runtime_input_names, ("slice_shape",))
+
+        slice_shape_value = torch.empty(3, dtype=torch.bfloat16)
+        lhs = torch.arange(4, dtype=torch.bfloat16)
+        rhs = torch.arange(4, 8, dtype=torch.bfloat16)
+        raw_grad = _FakeCollectiveInterpreter(split.compute_module).run(
+            lhs,
+            rhs,
+        )
+        (actual,) = _FakeCollectiveInterpreter(split.reduce_grad_module).run(
+            *raw_grad,
+            slice_shape_value,
+        )
+        self.assertTrue(torch.equal(actual, (lhs + rhs)[:3].float()))
 
     def test_backward_split_coalesces_reduce_grad_add(self) -> None:
         contributions = (

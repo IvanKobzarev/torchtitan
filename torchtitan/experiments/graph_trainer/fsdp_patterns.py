@@ -27,8 +27,10 @@ import torch.fx as fx
 import torch.utils._pytree as pytree
 
 from torchtitan.experiments.graph_trainer.common_utils import (
+    is_view_like,
     node_tensor_meta,
     PARAMETER_GRADIENT_FQNS_META,
+    view_like_tensor_input,
 )
 from torchtitan.experiments.graph_trainer.mutation_utils import (
     base_tensor_for_mutation_target,
@@ -456,6 +458,10 @@ def find_fsdp_reduce_grad_input(param_grad_output: Any) -> fx.Node | None:
         input_node = reduce_grad_collective_input(node)
         if input_node is not None:
             reduce_grad_input = input_node
+        elif is_view_like(node):
+            input_node = view_like_tensor_input(node)
+            if input_node is None:
+                break
         elif len(node.all_input_nodes) == 1:
             input_node = node.all_input_nodes[0]
         else:
@@ -512,9 +518,7 @@ def _has_matching_reduce_grad_collective_ancestor(
     while pending:
         current = pending.pop()
         current_fqns = fsdp_param_fqns(current)
-        if current in seen or (
-            current_fqns and current_fqns != expected_param_fqns
-        ):
+        if current in seen or (current_fqns and current_fqns != expected_param_fqns):
             continue
         seen.add(current)
         if is_reduce_grad_collective(current) and current_fqns == expected_param_fqns:
