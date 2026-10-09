@@ -392,6 +392,37 @@ def graph_trainer_deepseek_v3_16b_dist_moe_mxfp8_sanket_pp2_verification_4gpu() 
     return config
 
 
+def graph_trainer_deepseek_v3_16b_dist_moe_mxfp8_sanket_pp2_precompile_4gpu() -> (
+    GraphTrainer.Config
+):
+    """Verify a rank-local precompiled PP2 artifact on four GB300s."""
+    config = graph_trainer_deepseek_v3_16b_dist_moe_mxfp8_sanket_pp2_verification_4gpu()
+    config.compile.precompile_artifact_dir = os.environ[
+        "TORCHTITAN_PRECOMPILE_ARTIFACT_DIR"
+    ]
+    return config
+
+
+def graph_trainer_deepseek_v3_16b_dist_moe_mxfp8_sanket_pp2_numerics_4gpu() -> (
+    GraphTrainer.Config
+):
+    """Record full-precision PP2 runtime-build loss and gradient metrics."""
+    config = graph_trainer_deepseek_v3_16b_dist_moe_mxfp8_sanket_pp2_verification_4gpu()
+    config.metrics.enable_tensorboard = True
+    return config
+
+
+def graph_trainer_deepseek_v3_16b_dist_moe_mxfp8_sanket_pp2_precompile_numerics_4gpu() -> (
+    GraphTrainer.Config
+):
+    """Record full-precision PP2 precompile loss and gradient metrics."""
+    config = (
+        graph_trainer_deepseek_v3_16b_dist_moe_mxfp8_sanket_pp2_precompile_4gpu()
+    )
+    config.metrics.enable_tensorboard = True
+    return config
+
+
 def deepseek_v3_16b_dist_moe_mxfp8_sanket_pp2_verification_4gpu() -> Trainer.Config:
     """Verify eager PP2/VPP8 in-place WGrad and outer CUDA graphs locally."""
     _prepare_outer_cuda_graph_capture()
