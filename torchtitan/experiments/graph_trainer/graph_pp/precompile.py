@@ -8,16 +8,19 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 import pickle
 from dataclasses import dataclass
 from typing import Any, TYPE_CHECKING
 
+import torch
 import torch.fx as fx
 from torch.distributed.device_mesh import DeviceMesh
 
 from torchtitan.experiments.graph_trainer.precompile import (
     _execution_plan_signature,
+    _map_precompiled_graph_device,
     _register_coor_ops,
     _validate_config_fingerprint,
     compute_config_fingerprint,
@@ -126,7 +129,11 @@ def _serialize_graph_module(graph_module: fx.GraphModule) -> bytes:
     )
 
 
-def _deserialize_graph_module(data: bytes) -> fx.GraphModule:
+def _deserialize_graph_module(
+    data: bytes,
+    *,
+    device: torch.device,
+) -> fx.GraphModule:
     from torch._subclasses import FakeTensorMode
     from torch.fx._graph_pickler import GraphPickler
     from torch.fx.experimental.symbolic_shapes import ShapeEnv
@@ -136,7 +143,14 @@ def _deserialize_graph_module(data: bytes) -> fx.GraphModule:
         allow_non_fake_inputs=True,
         shape_env=ShapeEnv(),
     )
-    graph_module = GraphPickler.loads(data, fake_mode)
+    graph_module = GraphPickler.loads(
+        data,
+        fake_mode,
+        map_location=functools.partial(
+            _map_precompiled_graph_device,
+            runtime_device=device,
+        ),
+    )
     graph_module.recompile()
     return graph_module
 
@@ -200,6 +214,7 @@ class PrecompiledGraphPPStageArtifact:
         self,
         *,
         runtime_meshes: list[DeviceMesh],
+        device: torch.device,
     ) -> GraphTrainerStageGraphs:
         from torchtitan.experiments.graph_trainer.graph_pp.pp_graph_builder import (
             _StageGraphModules,
@@ -208,7 +223,7 @@ class PrecompiledGraphPPStageArtifact:
 
         modules = {
             name: (
-                _deserialize_graph_module(data)
+                _deserialize_graph_module(data, device=device)
                 if (data := self.serialized_modules.get(name)) is not None
                 else None
             )
@@ -335,6 +350,7 @@ def load_graph_pp_rank_artifact(
     expected_stage_indices: tuple[int, ...],
     expected_config_fingerprints: dict[int, ConfigFingerprint],
     expected_runtime_input_schemas: dict[int, RuntimeInputSchema],
+    stage_devices: dict[int, torch.device],
 ) -> dict[int, GraphTrainerStageGraphs]:
     """Load and validate a trusted rank-local GraphPP artifact."""
     data = storage.load(graph_pp_rank_artifact_key(pp_rank))
@@ -385,6 +401,11 @@ def load_graph_pp_rank_artifact(
             "Expected GraphPP runtime schemas must cover exactly the local "
             f"stages: {expected_stage_indices}"
         )
+    if set(stage_devices) != set(expected_stage_indices):
+        raise ValueError(
+            "GraphPP stage devices must cover exactly the local stages: "
+            f"{expected_stage_indices}"
+        )
 
     stage_graphs = {}
     for stage in artifact.stages:
@@ -400,7 +421,8 @@ def load_graph_pp_rank_artifact(
                 f"runtime={expected_schema}"
             )
         stage_graphs[stage.stage_index] = stage.to_stage_graphs(
-            runtime_meshes=runtime_meshes
+            runtime_meshes=runtime_meshes,
+            device=stage_devices[stage.stage_index],
         )
     logger.info(
         "GraphPP precompile artifact loaded: pp_rank=%s, stages=%s",

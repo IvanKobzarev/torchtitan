@@ -360,6 +360,9 @@ class GraphTrainerStageGraphProvider:
                 ),
                 expected_config_fingerprints=fingerprints,
                 expected_runtime_input_schemas=self.stage_runtime_input_schemas,
+                stage_devices={
+                    stage.stage_index: stage.device for stage in graph_stages
+                },
             )
             for stage in graph_stages:
                 stage.graphs = stage_graphs[stage.stage_index]

@@ -26,6 +26,7 @@ from torchtitan.experiments.graph_trainer.graph_pp.precompile import (
     graph_pp_stage_config_fingerprint,
     load_graph_pp_rank_artifact,
     PrecompiledGraphPPRankArtifact,
+    PrecompiledGraphPPStageArtifact,
     save_graph_pp_rank_artifact,
 )
 from torchtitan.experiments.graph_trainer.storage import DiskStorageAdapter
@@ -60,7 +61,11 @@ def _make_stage(stage_index: int):
         full_bw_grad_accumulator_indices=(0,),
         bw_dw_grad_accumulator_indices=(1,),
     )
-    return SimpleNamespace(stage_index=stage_index, graphs=stage_graphs)
+    return SimpleNamespace(
+        stage_index=stage_index,
+        device=torch.device("cpu"),
+        graphs=stage_graphs,
+    )
 
 
 def _make_plan() -> GraphExecutionPlan:
@@ -138,6 +143,9 @@ class TestGraphPPPrecompileArtifact(unittest.TestCase):
                 expected_stage_indices=stage_indices,
                 expected_config_fingerprints=fingerprints,
                 expected_runtime_input_schemas=schemas,
+                stage_devices={
+                    stage_index: torch.device("cpu") for stage_index in stage_indices
+                },
             )
 
         self.assertEqual(tuple(loaded), stage_indices)
@@ -180,6 +188,7 @@ class TestGraphPPPrecompileArtifact(unittest.TestCase):
                     expected_stage_indices=(1,),
                     expected_config_fingerprints={1: "fingerprint"},
                     expected_runtime_input_schemas={1: ("runtime-schema", ())},
+                    stage_devices={1: torch.device("cpu")},
                 )
 
     def test_load_rejects_wrong_rank_even_if_storage_key_matches(self) -> None:
@@ -208,7 +217,36 @@ class TestGraphPPPrecompileArtifact(unittest.TestCase):
                     expected_stage_indices=(1,),
                     expected_config_fingerprints={1: "fingerprint"},
                     expected_runtime_input_schemas={1: ("schema", ())},
+                    stage_devices={1: torch.device("cpu")},
                 )
+
+    def test_stage_load_maps_graph_state_to_runtime_device(self) -> None:
+        from torch._subclasses.fake_tensor import FakeTensorMode
+
+        stage = _make_stage(0)
+        with FakeTensorMode():
+            gpu_constant = torch.ones(2, device="cuda:0")
+        stage.graphs.modules.fw.register_buffer("gpu_constant", gpu_constant)
+        stage.graphs.modules.fw.register_buffer("cpu_constant", torch.ones(2))
+
+        artifact = PrecompiledGraphPPStageArtifact.from_stage(
+            stage,
+            config_fingerprint="fingerprint",
+            runtime_input_schema=("schema", ()),
+        )
+        loaded = artifact.to_stage_graphs(
+            runtime_meshes=[],
+            device=torch.device("cuda:1"),
+        )
+
+        self.assertEqual(
+            loaded.modules.fw.gpu_constant.device,
+            torch.device("cuda:1"),
+        )
+        self.assertEqual(
+            loaded.modules.fw.cpu_constant.device,
+            torch.device("cpu"),
+        )
 
 
 if __name__ == "__main__":

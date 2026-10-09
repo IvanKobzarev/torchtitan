@@ -760,6 +760,7 @@ class GraphRuntimeTraceTest(unittest.TestCase):
             is_first=True,
             is_last=False,
             submod=nn.Linear(2, 2),
+            device=torch.device("cuda:1"),
         )
         schedule = types.SimpleNamespace(
             _n_microbatches=32,
@@ -832,6 +833,10 @@ class GraphRuntimeTraceTest(unittest.TestCase):
         self.assertEqual(load.call_args.kwargs["pp_rank"], 0)
         self.assertEqual(load.call_args.kwargs["num_microbatches"], 32)
         self.assertEqual(load.call_args.kwargs["expected_stage_indices"], (0,))
+        self.assertEqual(
+            load.call_args.kwargs["stage_devices"],
+            {0: torch.device("cuda:1")},
+        )
         self.assertTrue(
             graph_pp_stage_config_fingerprint.call_args.kwargs[
                 "outer_cudagraphs_enabled"
