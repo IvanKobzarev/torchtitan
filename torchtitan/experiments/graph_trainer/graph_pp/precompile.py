@@ -69,6 +69,7 @@ def graph_pp_stage_config_fingerprint(
     execution_plan: GraphExecutionPlan,
     schedule_name: str,
     num_microbatches: int,
+    outer_cudagraphs_enabled: bool,
 ) -> ConfigFingerprint:
     """Fingerprint one stage and the complete GraphPP graph contract."""
     graph_signature = (
@@ -91,6 +92,7 @@ def graph_pp_stage_config_fingerprint(
         config.compile,
         parallelism_context,
         graph_signature=graph_signature,
+        outer_cudagraphs_enabled=outer_cudagraphs_enabled,
     )
 
 

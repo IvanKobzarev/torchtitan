@@ -179,11 +179,14 @@ class GraphTrainerStageGraphProvider:
         config: Full Trainer configuration for SPMD, or its compile,
             parallelism, and model fields for PP.
         plan: Resolved FSDP placement and gradient accumulation choices.
+        outer_cudagraphs_enabled: Whether the training step is captured by its
+            caller. This is fixed before precompile temporarily disables capture.
     """
 
     loss_fn: Callable
     config: "GraphTrainer.Config | GraphTrainerConfigView"
     plan: GraphExecutionPlan
+    outer_cudagraphs_enabled: bool
     parallelism_context: ParallelismContext | None = None
     runtime_meshes: list[DeviceMesh] | None = None
     load_precompiled_artifact: bool = False
@@ -341,6 +344,7 @@ class GraphTrainerStageGraphProvider:
                     execution_plan=self.plan,
                     schedule_name=schedule_name,
                     num_microbatches=schedule._n_microbatches,
+                    outer_cudagraphs_enabled=self.outer_cudagraphs_enabled,
                 )
                 for stage in graph_stages
             }
@@ -378,6 +382,7 @@ class GraphTrainerStageGraphProvider:
                 fuse_wgrad_accumulation=self.plan.fuse_wgrad_accumulation,
                 activation_slot_id_1=stage_trace_inputs[stage.stage_index][4],
                 runtime_meshes=self.runtime_meshes,
+                outer_cudagraphs_enabled=self.outer_cudagraphs_enabled,
             )
 
         required_overlap_pairs = stage_builder._required_multiplex_pairs(schedule)

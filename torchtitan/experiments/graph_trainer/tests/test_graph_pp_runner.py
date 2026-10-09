@@ -212,6 +212,7 @@ def _build_test_stage_graphs(
         extract_fsdp_grad_reduction=extract_fsdp_grad_reduction,
         gradient_accumulation=gradient_accumulation,
         fuse_wgrad_accumulation=fuse_wgrad_accumulation,
+        outer_cudagraphs_enabled=False,
     )
 
 
@@ -715,6 +716,7 @@ class GraphRuntimeTraceTest(unittest.TestCase):
                 reduce_grad="schedule",
                 fuse_wgrad_accumulation=False,
             ),
+            outer_cudagraphs_enabled=False,
         )
 
         slot = torch.tensor([0])
@@ -746,6 +748,7 @@ class GraphRuntimeTraceTest(unittest.TestCase):
         self.assertEqual(compile_graphs.call_count, 1)
         self.assertIs(stage.graphs, graph)
         self.assertEqual(build.call_args.kwargs["activation_slot_id_1"], slot)
+        self.assertFalse(build.call_args.kwargs["outer_cudagraphs_enabled"])
         info = forward_context.resolve_activation_slot.call_args.args[0]
         self.assertEqual((info.stage_index, info.microbatch_index), (0, 0))
 
@@ -791,6 +794,7 @@ class GraphRuntimeTraceTest(unittest.TestCase):
                 reduce_grad="schedule",
                 fuse_wgrad_accumulation=False,
             ),
+            outer_cudagraphs_enabled=True,
             parallelism_context=parallelism_context,
             runtime_meshes=[mock.Mock()],
             load_precompiled_artifact=True,
@@ -805,7 +809,7 @@ class GraphRuntimeTraceTest(unittest.TestCase):
                 "torchtitan.experiments.graph_trainer.graph_pp.precompile."
                 "graph_pp_stage_config_fingerprint",
                 return_value="fingerprint",
-            ),
+            ) as graph_pp_stage_config_fingerprint,
             mock.patch(
                 "torchtitan.experiments.graph_trainer.graph_pp.precompile."
                 "load_graph_pp_rank_artifact",
@@ -828,6 +832,11 @@ class GraphRuntimeTraceTest(unittest.TestCase):
         self.assertEqual(load.call_args.kwargs["pp_rank"], 0)
         self.assertEqual(load.call_args.kwargs["num_microbatches"], 32)
         self.assertEqual(load.call_args.kwargs["expected_stage_indices"], (0,))
+        self.assertTrue(
+            graph_pp_stage_config_fingerprint.call_args.kwargs[
+                "outer_cudagraphs_enabled"
+            ]
+        )
         self.assertEqual(
             set(load.call_args.kwargs["expected_runtime_input_schemas"]),
             {0},
@@ -885,6 +894,7 @@ class GraphRuntimeTraceTest(unittest.TestCase):
             loss_fn=lambda pred, target: pred.sum(),
             config=types.SimpleNamespace(compile=GraphTrainerCompileConfig()),
             plan=_make_test_pp_plan(),
+            outer_cudagraphs_enabled=False,
         )
 
         with (
@@ -1167,17 +1177,6 @@ class GraphRuntimeTraceTest(unittest.TestCase):
             compile_config=GraphTrainerCompileConfig(),
             parallelism=ParallelismConfig(pipeline_parallel_schedule="Interleaved1F1B"),
         )
-
-    def test_graph_pp_rejects_precompile_artifacts(self) -> None:
-        with self.assertRaisesRegex(ValueError, "does not support"):
-            _validate_graph_pp_config(
-                compile_config=GraphTrainerCompileConfig(
-                    precompile_artifact_dir="artifacts"
-                ),
-                parallelism=ParallelismConfig(
-                    pipeline_parallel_schedule="Interleaved1F1B"
-                ),
-            )
 
     def test_split_fsdp_boundaries_reject_dense_region_overlap(self) -> None:
         compile_config = GraphTrainerCompileConfig(

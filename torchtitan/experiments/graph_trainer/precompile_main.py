@@ -73,6 +73,9 @@ def _precompile_graph_pp(config) -> None:
             "precompile_main requires compile.precompile_artifact_dir in the recipe."
         )
 
+    target_outer_cudagraphs_enabled = (
+        not config.training.disable_cuda_graphs and cuda_graphs_supported()
+    )
     # The outer full-step graph is independent of the saved stage graphs and
     # would turn artifact generation into a multi-step CUDA capture warmup.
     config.training.disable_cuda_graphs = True
@@ -100,6 +103,7 @@ def _precompile_graph_pp(config) -> None:
             )
         ensure_graph_pp_schedule_precompilable(graph_runtime.schedule)
         graph_provider.load_precompiled_artifact = False
+        graph_provider.outer_cudagraphs_enabled = target_outer_cudagraphs_enabled
         graph_provider.runtime_meshes = get_spmd_precompile_meshes(
             engine.parallelism_context
         )
@@ -121,6 +125,7 @@ def _precompile_graph_pp(config) -> None:
                 execution_plan=graph_provider.plan,
                 schedule_name=schedule_name,
                 num_microbatches=graph_runtime.schedule._n_microbatches,
+                outer_cudagraphs_enabled=(graph_provider.outer_cudagraphs_enabled),
             )
             for stage in stages
         }

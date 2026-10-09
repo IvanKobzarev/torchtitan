@@ -857,6 +857,7 @@ def _build_stage_graphs(
     fuse_wgrad_accumulation: bool = False,
     activation_slot_id_1: torch.Tensor | None = None,
     runtime_meshes: list[DeviceMesh] | None = None,
+    outer_cudagraphs_enabled: bool,
 ) -> None:
     """Trace one stage-local train step and attach bound GraphPP graphs."""
     compile_config: GraphTrainerCompileConfig = config.compile
@@ -1057,6 +1058,7 @@ def _build_stage_graphs(
         parallelism_context=parallelism_context,
         split_fsdp_param_unshard=extract_fsdp_param_unshard,
         split_fsdp_grad_reduction=extract_fsdp_grad_reduction,
+        outer_cudagraphs_enabled=outer_cudagraphs_enabled,
     )
     fwd_output_values = graph_pp_value_spec(
         traced.output_subclass_layouts,

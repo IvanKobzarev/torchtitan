@@ -46,6 +46,7 @@ from torchtitan.experiments.graph_trainer.graph_builder import (
     UnshardPlacement,
 )
 from torchtitan.experiments.graph_trainer.graph_builder_utils import (
+    _outer_cudagraphs_enabled,
     GraphTrainerConfigView,
 )
 from torchtitan.experiments.graph_trainer.graph_pp.runner import (
@@ -430,6 +431,7 @@ def _register_graph_runtime(
         loss_fn=loss_fn,
         config=config,
         plan=plan,
+        outer_cudagraphs_enabled=_outer_cudagraphs_enabled(config),
         parallelism_context=parallelism_context,
     )
     return register_graph_schedule(

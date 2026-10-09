@@ -508,6 +508,7 @@ def _extract_fwd_bwd_action_graphs(
             parallelism_context=parallelism_context,
             split_fsdp_param_unshard=plan.split_fsdp_param_unshard,
             split_fsdp_grad_reduction=plan.split_fsdp_grad_reduction,
+            outer_cudagraphs_enabled=_outer_cudagraphs_enabled(trainer_config),
         )
     )
     params: list[nn.Parameter] = [

@@ -228,6 +228,7 @@ class TestPrecompileMain(unittest.TestCase):
         schedule = SimpleNamespace(_stages=[stage], _n_microbatches=32)
         provider = FakeStageGraphProvider()
         provider.plan = object()
+        provider.outer_cudagraphs_enabled = False
         provider.stage_runtime_input_schemas = {0: ("schema", ())}
         runtime = FakeGraphRuntime()
         runtime.schedule = schedule
@@ -264,6 +265,11 @@ class TestPrecompileMain(unittest.TestCase):
             ),
             patch.object(precompile_main, "_register_coor_ops"),
             patch.object(
+                precompile_main,
+                "cuda_graphs_supported",
+                return_value=True,
+            ),
+            patch.object(
                 precompile,
                 "get_spmd_precompile_meshes",
                 return_value=[],
@@ -287,6 +293,9 @@ class TestPrecompileMain(unittest.TestCase):
             precompile_main._precompile_graph_pp(caller_config)
 
         self.assertIs(fingerprint.call_args.kwargs["config"], trainer_config)
+        self.assertTrue(fingerprint.call_args.kwargs["outer_cudagraphs_enabled"])
+        self.assertTrue(provider.outer_cudagraphs_enabled)
+        self.assertTrue(caller_config.training.disable_cuda_graphs)
         storage = save.call_args.args[1]
         self.assertEqual(storage.base_dir.name, "trainer-artifacts")
         trainer.train_step.assert_called_once()

@@ -102,6 +102,10 @@ class GraphTrainingEngine(TrainingEngine):
                 "GraphTrainer does not support fsdp_defer_gradient_reduction."
             )
 
+        self._outer_cudagraphs_enabled = (
+            not self.config.training.disable_cuda_graphs and cuda_graphs_supported()
+        )
+
         if self.parallelism_context.pp_enabled:
             graph_runtime = self.pp_schedule
             assert isinstance(graph_runtime, GraphRuntime)
@@ -117,6 +121,7 @@ class GraphTrainingEngine(TrainingEngine):
                     )
                 graph_provider.config = self.config
                 graph_provider.parallelism_context = self.parallelism_context
+                graph_provider.outer_cudagraphs_enabled = self._outer_cudagraphs_enabled
                 graph_provider.load_precompiled_artifact = bool(
                     self.config.compile.precompile_artifact_dir
                 )
@@ -214,7 +219,7 @@ class GraphTrainingEngine(TrainingEngine):
                 defer_fsdp_gradient_reduction=False,
             )
 
-        if not self.config.training.disable_cuda_graphs and cuda_graphs_supported():
+        if self._outer_cudagraphs_enabled:
             self._run_forward_backward = wrap_fwd_bwd_with_cuda_graph(
                 self._run_forward_backward,
                 parameters=(

@@ -8,6 +8,7 @@ import pickle
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -22,6 +23,7 @@ from torchtitan.experiments.graph_trainer.graph_pp.pp_graph_builder import (
 )
 from torchtitan.experiments.graph_trainer.graph_pp.precompile import (
     graph_pp_rank_artifact_key,
+    graph_pp_stage_config_fingerprint,
     load_graph_pp_rank_artifact,
     PrecompiledGraphPPRankArtifact,
     save_graph_pp_rank_artifact,
@@ -72,6 +74,38 @@ def _make_plan() -> GraphExecutionPlan:
 
 
 class TestGraphPPPrecompileArtifact(unittest.TestCase):
+    def test_stage_fingerprint_uses_target_outer_cudagraph_state(self) -> None:
+        stage = SimpleNamespace(
+            stage_index=0,
+            is_first=True,
+            is_last=False,
+            submod=torch.nn.Linear(2, 2),
+        )
+        with (
+            mock.patch(
+                "torchtitan.experiments.graph_trainer.graph_pp.precompile."
+                "graph_config_signature",
+                return_value=(),
+            ),
+            mock.patch(
+                "torchtitan.experiments.graph_trainer.graph_pp.precompile."
+                "compute_config_fingerprint",
+                return_value="fingerprint",
+            ) as compute,
+        ):
+            fingerprint = graph_pp_stage_config_fingerprint(
+                stage,
+                config=SimpleNamespace(compile=object()),
+                parallelism_context=object(),
+                execution_plan=_make_plan(),
+                schedule_name="Interleaved1F1B",
+                num_microbatches=32,
+                outer_cudagraphs_enabled=True,
+            )
+
+        self.assertEqual(fingerprint, "fingerprint")
+        self.assertTrue(compute.call_args.kwargs["outer_cudagraphs_enabled"])
+
     def test_rank_bundle_roundtrip_preserves_all_local_stages(self) -> None:
         stage_indices = tuple(range(0, 16, 2))
         stages = [_make_stage(stage_index) for stage_index in stage_indices]

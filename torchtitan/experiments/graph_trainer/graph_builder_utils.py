@@ -280,6 +280,7 @@ def _apply_graph_pp_pre_partition_or_extraction_passes(
     parallelism_context: ParallelismContext | None,
     split_fsdp_param_unshard: bool,
     split_fsdp_grad_reduction: bool,
+    outer_cudagraphs_enabled: bool,
 ) -> Callable | None:
     """Apply graph invariants before GraphPP partitioning or extraction.
 
@@ -327,7 +328,7 @@ def _apply_graph_pp_pre_partition_or_extraction_passes(
         traced,
         config,
         parallelism_context=parallelism_context,
-        outer_cudagraphs_enabled=_outer_cudagraphs_enabled(config),
+        outer_cudagraphs_enabled=outer_cudagraphs_enabled,
         include_inductor=False,
         include_mandatory_normalization=False,
     )
