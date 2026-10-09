@@ -101,14 +101,28 @@ if [[ -z "${TORCHTITAN_PRECOMPILE_ARTIFACT_DIR:-}" ]]; then
     *pp1*precompile*256gpu*)
       TORCHTITAN_PRECOMPILE_ARTIFACT_DIR=${WORKSPACE_DIR}/precompile_artifacts/pp1-256gpu
       ;;
-    *pp2*precompile*)
-      TORCHTITAN_PRECOMPILE_ARTIFACT_DIR=${WORKSPACE_DIR}/precompile_artifacts/pp2
+    *pp2*precompile*4gpu*)
+      TORCHTITAN_PRECOMPILE_ARTIFACT_DIR=${WORKSPACE_DIR}/precompile_artifacts/pp2-4gpu
+      ;;
+    *pp2*precompile*64gpu*)
+      TORCHTITAN_PRECOMPILE_ARTIFACT_DIR=${WORKSPACE_DIR}/precompile_artifacts/pp2-64gpu
+      ;;
+    *pp2*precompile*256gpu*)
+      TORCHTITAN_PRECOMPILE_ARTIFACT_DIR=${WORKSPACE_DIR}/precompile_artifacts/pp2-256gpu
       ;;
   esac
 fi
 if [[ -n "${TORCHTITAN_PRECOMPILE_ARTIFACT_DIR:-}" ]]; then
-  require_file \
-    "${TORCHTITAN_PRECOMPILE_ARTIFACT_DIR}/scheduled_fwd_bwd_default.bin"
+  case "${CONFIG}" in
+    *pp1*precompile*)
+      require_file \
+        "${TORCHTITAN_PRECOMPILE_ARTIFACT_DIR}/scheduled_fwd_bwd_default.bin"
+      ;;
+    *pp2*precompile*)
+      require_file "${TORCHTITAN_PRECOMPILE_ARTIFACT_DIR}/graph_pp_pp0.bin"
+      require_file "${TORCHTITAN_PRECOMPILE_ARTIFACT_DIR}/graph_pp_pp1.bin"
+      ;;
+  esac
   export TORCHTITAN_PRECOMPILE_ARTIFACT_DIR
 fi
 

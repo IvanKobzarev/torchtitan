@@ -92,3 +92,39 @@ def graph_trainer_deepseek_v3_671b_dist_moe_mxfp8_chien_chin_mtp1_pp1_precompile
         _mast_configs.graph_trainer_deepseek_v3_671b_dist_moe_mxfp8_chien_chin_mtp1_256gpu_numerics()
     )
     return _configure_precompile(config)
+
+
+def graph_trainer_deepseek_v3_671b_dist_moe_mxfp8_sanket_final_mtp1_pp2_64gpu_numerics():
+    """Verify the final PP2 topology on 64 GB300s before full scale."""
+    config = (
+        _mast_configs.graph_trainer_deepseek_v3_671b_dist_moe_mxfp8_sanket_final_mtp1_256gpu_numerics()
+    )
+    config.parallelism.data_parallel_shard_degree = 32
+    config.parallelism.expert_parallel_degree = 32
+    config.training.num_tokens_per_train_step = 4096 * 32 * 120
+    config.training.steps = 10
+    return config
+
+
+def graph_trainer_deepseek_v3_671b_dist_moe_mxfp8_sanket_final_mtp1_pp2_precompile_64gpu_numerics():
+    """Load the PP2 bundles on the matched 64-GB300 geometry."""
+    config = (
+        graph_trainer_deepseek_v3_671b_dist_moe_mxfp8_sanket_final_mtp1_pp2_64gpu_numerics()
+    )
+    return _configure_precompile(config)
+
+
+def graph_trainer_deepseek_v3_671b_dist_moe_mxfp8_sanket_final_mtp1_pp2_precompile_256gpu_performance():
+    """Profile precompiled PP2/VPP8 MTP1 at the final 256-GPU geometry."""
+    config = (
+        _mast_configs.graph_trainer_deepseek_v3_671b_dist_moe_mxfp8_sanket_final_mtp1_256gpu_performance()
+    )
+    return _configure_precompile(config)
+
+
+def graph_trainer_deepseek_v3_671b_dist_moe_mxfp8_sanket_final_mtp1_pp2_precompile_256gpu_numerics():
+    """Record full-precision metrics for precompiled PP2 at full scale."""
+    config = (
+        _mast_configs.graph_trainer_deepseek_v3_671b_dist_moe_mxfp8_sanket_final_mtp1_256gpu_numerics()
+    )
+    return _configure_precompile(config)

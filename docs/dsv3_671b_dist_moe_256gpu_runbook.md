@@ -749,6 +749,50 @@ for mutable_id, immutable_id in replacements.items():
             f"{text.count(mutable_id)}"
         )
     text = text.replace(mutable_id, immutable_id)
+integration_needle = """    integration_test_only = (
+        env is not None and env.get(\"INTEGRATION_TEST_ONLY\") == \"1\"
+    )
+    full_run = nodes == 64 and nproc_per_node == 4
+"""
+integration_replacement = """    integration_test_only = (
+        env is not None and env.get(\"INTEGRATION_TEST_ONLY\") == \"1\"
+    )
+    scale_verification_only = (
+        env is not None and env.get(\"SCALE_VERIFICATION_ONLY\") == \"1\"
+    )
+    full_run = nodes == 64 and nproc_per_node == 4
+    scale_verification_run = (
+        scale_verification_only and nodes == 16 and nproc_per_node == 4
+    )
+"""
+if text.count(integration_needle) != 1:
+    raise RuntimeError("expected one launcher validation setup")
+text = text.replace(integration_needle, integration_replacement)
+validation_needle = (
+    "    if not (full_run or smoke_run or distributed_smoke_run or "
+    "integration_test_run):\n"
+)
+validation_replacement = (
+    "    if not (\n"
+    "        full_run\n"
+    "        or scale_verification_run\n"
+    "        or smoke_run\n"
+    "        or distributed_smoke_run\n"
+    "        or integration_test_run\n"
+    "    ):\n"
+)
+if text.count(validation_needle) != 1:
+    raise RuntimeError("expected one launcher validation condition")
+text = text.replace(validation_needle, validation_replacement)
+error_needle = '            "use 64x4 for a full run, 1x4 with PREFLIGHT_ONLY=1, or 2x4 "\n'
+error_replacement = (
+    '            "use 64x4 for a full run, 16x4 with "\n'
+    '            "SCALE_VERIFICATION_ONLY=1, 1x4 with PREFLIGHT_ONLY=1, "\n'
+    '            "or 2x4 "\n'
+)
+if text.count(error_needle) != 1:
+    raise RuntimeError("expected one launcher validation error")
+text = text.replace(error_needle, error_replacement)
 role_needle = "    role = job_spec.roles[0]\n"
 role_replacement = role_needle + """    runner_prefix = "torchx_torchrun:"
     runner_id = "torchx_torchrun:5b856b7bf0ff472baad17a127e73dc3a"
