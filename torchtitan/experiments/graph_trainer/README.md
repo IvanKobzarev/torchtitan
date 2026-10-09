@@ -105,8 +105,9 @@ live `param.grad`. Internal values remain flat because they never leave GraphPP
 graph execution: saved-for-backward tensors, unsharded FSDP params, raw grad
 leaves, reduce-grad inputs, and multiplexed intermediate outputs.
 
-Current limitations: GraphPP does not load precompile artifacts yet, and
-EP-overlap annotations will be composed with GraphPP in a later PR.
+Current limitations: GraphPP precompile does not support schedules containing
+`OVERLAP_F_B` actions, and EP-overlap annotations will be composed with GraphPP
+in a later PR.
 
 ### Compiler Optimizations
 
@@ -196,13 +197,19 @@ lowerings from the manual parallelization path. This can change numerics, so
 AutoParallel numerics tests check tight agreement with the eager baseline rather
 than requiring bitwise-identical losses.
 
-### Pre-compile (Compile-on-One-Rank)
+### Pre-compile
 
-Pre-compile lets you compile AOT graphs on a single GPU and save them to disk,
-then load them on all ranks during training — skipping compilation entirely.
-This uses compile-on-one-rank (CooR) to produce a rank-agnostic artifact.
-Setting `compile.precompile_artifact_dir` in the selected recipe enables
-precompile in both steps.
+Pre-compile saves AOT graphs to disk and loads them during training, skipping
+runtime tracing and compilation. Setting `compile.precompile_artifact_dir` in
+the selected recipe enables artifact generation and loading.
+
+Non-pipeline recipes use compile-on-one-rank (CooR) to produce one
+rank-agnostic artifact on a single GPU. GraphPP recipes instead run one real
+process per PP rank with `comm.backend="real_pp_fake_spmd"`. The remaining
+SPMD axes are represented by fake process groups. Each PP rank writes a bundle
+containing its stage-local graphs; training loads the bundle matching its PP
+rank. Artifact generation and training must use the same logical world size,
+parallelism, schedule, and number of microbatches.
 
 **Artifact ephemerality:** Precompiled artifacts are tied to the exact PyTorch
 version, CUDA version, model architecture, and parallelism configuration used
@@ -211,9 +218,8 @@ Stale artifacts are detected automatically via config fingerprinting and
 will raise an error at load time. Delete old artifacts and re-run
 precompile when upgrading PyTorch or changing the model/parallelism setup.
 
-The integration runner contains complete Llama 3 and DeepSeek V3 precompile
-recipes and runs both the single-process compile and distributed training
-phases:
+The integration runner contains complete Llama 3 and DeepSeek V3 recipes for
+both CooR and GraphPP. It runs artifact generation followed by training:
 
 ```bash
 python -m torchtitan.experiments.graph_trainer.tests.run_precompile_tests \
@@ -230,6 +236,28 @@ CooR because the precompiled artifact was compiled on a single process
 targeting `cuda:0`, and CooR handles rank-specific computation dynamically
 at runtime via `_runtime_compute_coordinate_on_dim`.
 </details>
+
+For GraphPP, do not pass `--virtual-local-rank`. Launch one process per PP
+rank for both phases and preserve the logical world size through `NGPU`:
+
+```bash
+NGPU=4 torchrun --standalone --nproc-per-node=2 \
+    -m torchtitan.experiments.graph_trainer.precompile_main \
+    --module torchtitan_recipes.tests.graph_trainer.precompile \
+    --config deepseek_v3_dist_moe_precompile_fsdp2_ep2_pp2 \
+    --comm-backend real_pp_fake_spmd
+
+NGPU=4 torchrun --standalone --nproc-per-node=2 \
+    -m torchtitan.train \
+    --module torchtitan_recipes.tests.graph_trainer.precompile \
+    --config deepseek_v3_dist_moe_precompile_fsdp2_ep2_pp2 \
+    --comm-backend real_pp_fake_spmd
+```
+
+Both commands also require `TORCHTITAN_PRECOMPILE_ARTIFACT_DIR` to name the
+same artifact directory. GraphPP validates the PP rank, stage assignment,
+schedule, microbatch count, input schemas, and configuration fingerprint
+before using a bundle.
 
 Pre-compile works with any compiler pass that produces serializable output,
 including `full_inductor_compilation` and `regional_inductor`. Use a shared

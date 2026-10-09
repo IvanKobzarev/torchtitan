@@ -8,10 +8,9 @@
 Separate test runner for CooR precompile integration tests.
 
 Each test has two steps:
-1. Run precompile_main.py on a single process to generate a rank-agnostic
-   compiled artifact.
-2. Run training via graph_trainer/run_train_precompile.sh (which passes
-   --virtual-local-rank to torchrun) to load and train with the artifact.
+1. Generate either a rank-agnostic CooR artifact on one process or rank-local
+   GraphPP bundles on one real process per PP rank.
+2. Run training with the matching launch mode and load the artifact.
 
 Usage:
     python -m torchtitan.experiments.graph_trainer.tests.run_precompile_tests \
@@ -31,6 +30,7 @@ from dataclasses import dataclass
 from tests.integration_tests import get_importable_config_module
 
 from torchtitan_recipes.tests.graph_trainer.precompile import (
+    deepseek_v3_dist_moe_precompile_fsdp2_ep2_pp2,
     deepseek_v3_precompile_fsdp_tp_ep,
     llama3_precompile_fsdp_tp,
 )
@@ -50,6 +50,8 @@ class PrecompileTestDefinition:
     test_name: str
     ngpu: int = 8
     disabled: bool = False
+    pp_degree: int = 1
+    logical_world_size: int | None = None
 
 
 def _build_precompile_tests() -> list[PrecompileTestDefinition]:
@@ -81,6 +83,15 @@ def _build_precompile_tests() -> list[PrecompileTestDefinition]:
             test_name="aot_fx_trace_deepseek_v3_precompile_fsdp_tp_ep",
             ngpu=8,
             disabled=True,
+        ),
+        PrecompileTestDefinition(
+            config=deepseek_v3_dist_moe_precompile_fsdp2_ep2_pp2,
+            artifact_dir=tempfile.mkdtemp(prefix="dsv3_graph_pp_precompile_"),
+            test_descr="aot_fx_trace deepseek_v3 GraphPP precompile FSDP+EP+PP",
+            test_name="aot_fx_trace_deepseek_v3_graph_pp_precompile",
+            ngpu=2,
+            pp_degree=2,
+            logical_world_size=4,
         ),
     ]
 
@@ -114,10 +125,22 @@ def run_precompile_tests(args):
             f"--module {get_importable_config_module(test.config)} "
             f"--config {test.config.__name__}"
         )
-        precompile_command = (
-            "python -m torchtitan.experiments.graph_trainer.precompile_main "
-            + config_args
-        )
+        comm_backend_arg = ""
+        if test.pp_degree > 1:
+            comm_backend_arg = " --comm-backend real_pp_fake_spmd"
+            assert test.logical_world_size is not None
+            env["NGPU"] = str(test.logical_world_size)
+            precompile_command = (
+                f"torchrun --standalone --nnodes 1 --nproc-per-node "
+                f"{test.pp_degree} "
+                "-m torchtitan.experiments.graph_trainer.precompile_main "
+                f"{config_args}{comm_backend_arg}"
+            )
+        else:
+            precompile_command = (
+                "python -m torchtitan.experiments.graph_trainer.precompile_main "
+                + config_args
+            )
 
         # Step 1: precompile
         logger.info(
@@ -134,10 +157,18 @@ def run_precompile_tests(args):
             )
 
         # Step 2: training with the precompiled artifact
-        cmd = f"NGPU={test.ngpu} LOG_RANK={all_ranks} " f"./{RUN_TRAIN_SCRIPT}"
+        if test.pp_degree > 1:
+            cmd = (
+                f"torchrun --standalone --nnodes 1 --nproc-per-node "
+                f"{test.pp_degree} --local-ranks-filter {all_ranks} "
+                f"--role rank --tee 3 -m torchtitan.train {config_args} "
+                f"{comm_backend_arg} {output_dir_arg}"
+            )
+        else:
+            cmd = f"NGPU={test.ngpu} LOG_RANK={all_ranks} ./{RUN_TRAIN_SCRIPT}"
+            cmd += " " + output_dir_arg
+            cmd += " " + config_args
         cmd = f'TORCH_TRACE="{args.output_dir}/{test.test_name}/compile_trace" ' + cmd
-        cmd += " " + output_dir_arg
-        cmd += " " + config_args
 
         logger.info(
             f"===== {time.strftime('%Y-%m-%d %H:%M:%S')} "
