@@ -92,28 +92,28 @@ require_file "${TORCHTITAN_ROOT}/assets/hf/DeepSeek-V3.1-Base/tokenizer_config.j
 
 if [[ -z "${TORCHTITAN_PRECOMPILE_ARTIFACT_DIR:-}" ]]; then
   case "${CONFIG}" in
-    *pp1*precompile*4gpu*)
+    *pp1_precompile_4gpu*)
       TORCHTITAN_PRECOMPILE_ARTIFACT_DIR=${WORKSPACE_DIR}/precompile_artifacts/pp1-4gpu
       ;;
-    *pp1*precompile*64gpu*)
+    *pp1_precompile_64gpu*)
       TORCHTITAN_PRECOMPILE_ARTIFACT_DIR=${WORKSPACE_DIR}/precompile_artifacts/pp1-64gpu
       ;;
-    *pp1*precompile*256gpu*numerics*)
+    *pp1_precompile_256gpu_numerics*)
       TORCHTITAN_PRECOMPILE_ARTIFACT_DIR=${WORKSPACE_DIR}/precompile_artifacts/pp1-256gpu-numerics
       ;;
-    *pp1*precompile*256gpu*)
+    *pp1_precompile_256gpu*)
       TORCHTITAN_PRECOMPILE_ARTIFACT_DIR=${WORKSPACE_DIR}/precompile_artifacts/pp1-256gpu-performance
       ;;
-    *pp2*precompile*4gpu*)
+    *pp2_precompile_4gpu*)
       TORCHTITAN_PRECOMPILE_ARTIFACT_DIR=${WORKSPACE_DIR}/precompile_artifacts/pp2-4gpu
       ;;
-    *pp2*precompile*64gpu*)
+    *pp2_precompile_64gpu*)
       TORCHTITAN_PRECOMPILE_ARTIFACT_DIR=${WORKSPACE_DIR}/precompile_artifacts/pp2-64gpu
       ;;
-    *pp2*precompile*256gpu*numerics*)
+    *pp2_precompile_256gpu_numerics*)
       TORCHTITAN_PRECOMPILE_ARTIFACT_DIR=${WORKSPACE_DIR}/precompile_artifacts/pp2-256gpu-numerics
       ;;
-    *pp2*precompile*256gpu*)
+    *pp2_precompile_256gpu*)
       TORCHTITAN_PRECOMPILE_ARTIFACT_DIR=${WORKSPACE_DIR}/precompile_artifacts/pp2-256gpu-performance
       ;;
   esac
