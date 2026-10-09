@@ -1391,6 +1391,53 @@ def _make_multilayer_unbucketed_action_graph(collective: str) -> fx.GraphModule:
     return _make_graph_module(graph)
 
 
+def _make_dynamic_unpad_reduce_grad_action_graph() -> fx.GraphModule:
+    graph = fx.Graph()
+    first = graph.placeholder("first")
+    second = graph.placeholder("second")
+    slice_end = graph.placeholder("slice_end")
+    with FakeTensorMode() as fake_mode:
+        first_value = fake_mode.from_tensor(torch.empty(4))
+        second_value = fake_mode.from_tensor(torch.empty(5))
+        sliced_value = fake_mode.from_tensor(torch.empty(3))
+    first.meta["val"] = first_value
+    second.meta["val"] = second_value
+    slice_end.meta["val"] = 3
+
+    outputs = []
+    for index, (value, fake_value) in enumerate(
+        ((first, first_value), (second, second_value))
+    ):
+        reduce_scatter = graph.call_function(
+            torch.ops._c10d_functional.reduce_scatter_tensor.default,
+            args=(value, "sum", 1, _FAKE_PG),
+        )
+        wait = graph.call_function(
+            torch.ops._c10d_functional.wait_tensor.default,
+            args=(reduce_scatter,),
+        )
+        module_fqn = f"layers.0.part{index}"
+        for node in (reduce_scatter, wait):
+            node.meta["val"] = fake_value
+            node.meta["autograd_backward"] = True
+            node.meta["custom"] = {
+                _MODULE_FQN: module_fqn,
+                FSDP_PARAM_FQNS_META: (f"{module_fqn}.weight",),
+            }
+        if index == 0:
+            output = graph.call_function(
+                torch.ops.aten.slice.Tensor,
+                args=(wait, 0, 0, slice_end),
+            )
+            output.meta.update(wait.meta)
+            output.meta["val"] = sliced_value
+        else:
+            output = wait
+        outputs.append(output)
+    graph.output(tuple(outputs))
+    return _make_graph_module(graph)
+
+
 def _make_interleaved_reduce_grad_action_graph() -> fx.GraphModule:
     graph = fx.Graph()
     outputs = []
@@ -2475,6 +2522,46 @@ class GraphPPActionBucketingTest(unittest.TestCase):
                 sum(node.target == bucket_target for node in fallback.graph.nodes),
                 1,
             )
+
+    def test_extracted_action_buckets_dynamic_unpad_reduce_scatter(self) -> None:
+        scoped_pass = functools.partial(
+            joint_transformer_block_bucketing_reordering_pass,
+            module_bucket_plans=["layers.0"],
+            bucket_mode="custom_ops",
+        )
+        gm = _make_dynamic_unpad_reduce_grad_action_graph()
+        inputs = (torch.arange(4.0), torch.arange(5.0), 3)
+        expected = _FakeCollectiveInterpreter(gm).run(*inputs)
+
+        with (
+            patch(
+                "torch.distributed.distributed_c10d._resolve_process_group",
+                return_value=object(),
+            ),
+            patch("torch.distributed.get_process_group_ranks", return_value=[0]),
+            patch("torch.distributed.get_rank", return_value=0),
+        ):
+            gm = _bucket_extracted_fsdp_action(
+                gm,
+                scoped_pass,
+                compile_config=GraphTrainerCompileConfig(),
+                bucket_all_gathers=False,
+                bucket_reduce_scatters=True,
+                bucket_all_reduces=False,
+                fallback_passes=[merge_all_reduce_scatters],
+            )
+
+        self.assertEqual(
+            len(
+                gm.graph.find_nodes(
+                    op="call_function",
+                    target=torch.ops._c10d_functional.reduce_scatter_tensor.default,
+                )
+            ),
+            1,
+        )
+        actual = _FakeCollectiveInterpreter(gm).run(*inputs)
+        _assert_tensor_sequence_equal(self, actual, expected)
 
     def test_standalone_reduce_grad_does_not_prefetch_between_process_groups(
         self,

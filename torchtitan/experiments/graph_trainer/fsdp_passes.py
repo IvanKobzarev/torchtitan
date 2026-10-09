@@ -27,8 +27,11 @@ from torch._dynamo.graph_deduplication import _stable_topological_sort
 from torch._inductor.fx_passes.bucketing import (
     _resolve_group_name,
     BucketMode,
+    get_full_bucket_key,
     is_all_gather_into_tensor as is_all_gather,
     is_all_reduce_tensor,
+    is_fsdp_all_gather,
+    is_fsdp_reduce_scatter,
     is_reduce_scatter_tensor,
     is_wait_tensor,
     merge_all_gather_bucket,
@@ -41,6 +44,13 @@ try:
     from torch._inductor.fx_passes.overlap_manual_scheduling import _move_overlap_nodes
 except ImportError:
     _move_overlap_nodes = None
+
+try:
+    from torch._inductor.fx_passes.overlap_manual_scheduling import (
+        _move_wait_users_after_latest_inputs,
+    )
+except ImportError:
+    _move_wait_users_after_latest_inputs = None
 
 from torch._inductor.fx_passes.overlap_manual_scheduling import (
     manual_overlap_bucketing,
@@ -588,6 +598,57 @@ class FSDPParamOrderBucketer(ManualOverlapPreservingBucketer):
         if self.fsdp_param_module_order:
             coll_nodes = sorted(coll_nodes, key=self._param_order_key)
         return super()._bucket_group(coll_nodes)
+
+    def manual_bucket_collectives(self, nodes: list[fx.Node]) -> None:
+        """Bucket annotated FSDP reductions with dynamic scalar epilogues.
+
+        The upstream structural matcher treats every FX input as tensor data.
+        An uneven FSDP shard can instead have a dynamic scalar slice bound
+        after its reduce-scatter, so that matcher rejects a reduction which is
+        explicitly identified by GraphTrainer's FSDP parameter provenance.
+        """
+        collectives = [node for node in nodes if node in self.collective_info]
+        if not any(
+            is_reduce_scatter_tensor(node)
+            and bool(fsdp_param_fqns(node))
+            and not is_fsdp_reduce_scatter(node)
+            for node in collectives
+        ):
+            return super().manual_bucket_collectives(nodes)
+
+        grouped_collectives: dict[object, OrderedSet[fx.Node]] = defaultdict(OrderedSet)
+        for node in collectives:
+            is_fsdp_reduction = is_reduce_scatter_tensor(node) and (
+                is_fsdp_reduce_scatter(node) or bool(fsdp_param_fqns(node))
+            )
+            if not (
+                is_fsdp_all_gather(node, self.node_ancestors)
+                or is_fsdp_reduction
+                or is_all_reduce_tensor(node)
+            ):
+                continue
+            key = get_full_bucket_key(node, "custom_ops")
+            if key is not None:
+                grouped_collectives[key].add(node)
+
+        sub_buckets: list[list[fx.Node]] = []
+        for key_nodes in grouped_collectives.values():
+            sub_buckets.extend(self._split_independent_collectives(key_nodes, nodes))
+
+        replacements: dict[fx.Node, fx.Node] = {}
+        replaced_users: dict[fx.Node, list[fx.Node]] = {}
+        for sub_bucket in sub_buckets:
+            group_replacements, group_replaced_users = self._bucket_group(sub_bucket)
+            replacements.update(group_replacements)
+            replaced_users.update(group_replaced_users)
+
+        if replacements:
+            assert _move_wait_users_after_latest_inputs is not None
+            _move_wait_users_after_latest_inputs(
+                self.graph,
+                replacements,
+                replaced_users,
+            )
 
 
 class JointManualOverlapScheduler(ManualOverlapScheduler):
