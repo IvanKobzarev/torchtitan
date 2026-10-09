@@ -193,6 +193,11 @@ def _reorder_overlap_nodes(
         _stable_topological_sort(graph, overlap_deps)
     else:
         _move_overlap_nodes(graph, overlap_deps, bucketed_node_types)
+        # Multiple prefetched collectives can share a computed process-group
+        # input. The upstream mover visits each collective independently and
+        # may move that shared producer after an earlier consumer. Preserve the
+        # selected overlap dependencies while restoring dataflow order.
+        _stable_topological_sort(graph, overlap_deps)
 
 
 def _get_or_create_extra_pg(

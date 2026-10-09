@@ -75,6 +75,7 @@ from torchtitan.experiments.graph_trainer.ep_process_group_pass import (
 )
 from torchtitan.experiments.graph_trainer.fsdp_passes import (
     _FSDP_BUCKET_META,
+    _reorder_overlap_nodes,
     _validate_transformer_block_bucket_counts,
     deduplicate_fsdp_unshard_chains_pass,
     get_transformer_block_bucket_counts,
@@ -729,6 +730,37 @@ class TestReorderHSDPGradCollectivesPass(TestCase):
             {first_reduce_scatter_wait: OrderedSet([second_reduce_scatter])},
         )
         self.assertNotIn(hsdp_wait, overlap_deps)
+
+    def test_prefetch_keeps_shared_runtime_group_before_all_consumers(self) -> None:
+        graph = torch.fx.Graph()
+        value = graph.placeholder("value")
+        wait = graph.call_function(torch.ops.aten.relu.default, (value,))
+        shared_group = graph.call_function(torch.ops.aten.neg.default, (value,))
+        first_group = graph.call_function(torch.ops.aten.sin.default, (shared_group,))
+        first_all_gather = graph.call_function(
+            torch.ops.aten.cos.default, (first_group,)
+        )
+        second_group = graph.call_function(torch.ops.aten.tanh.default, (shared_group,))
+        second_all_gather = graph.call_function(
+            torch.ops.aten.abs.default, (second_group,)
+        )
+        graph.output((wait, first_all_gather, second_all_gather))
+
+        _reorder_overlap_nodes(
+            graph,
+            {wait: OrderedSet([first_all_gather, second_all_gather])},
+            {
+                first_all_gather: "bucketed_all_gather",
+                second_all_gather: "bucketed_all_gather",
+            },
+        )
+
+        graph.lint()
+        positions = {node: index for index, node in enumerate(graph.nodes)}
+        self.assertLess(positions[shared_group], positions[first_group])
+        self.assertLess(positions[shared_group], positions[second_group])
+        self.assertLess(positions[first_all_gather], positions[wait])
+        self.assertLess(positions[second_all_gather], positions[wait])
 
 
 class ToyModel(Module):
