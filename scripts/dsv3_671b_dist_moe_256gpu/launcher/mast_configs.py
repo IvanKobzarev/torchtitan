@@ -9,6 +9,9 @@
 import os
 
 from scripts.dsv3_671b_dist_moe_256gpu import mast_configs as _mast_configs
+
+from torchtitan.components.data import ConcatThenSplitPackingConfig
+from torchtitan.hf_datasets.text_datasets import DATASETS
 from scripts.dsv3_671b_dist_moe_256gpu.mast_configs import *  # noqa: F401, F403
 
 
@@ -56,6 +59,23 @@ def _configure_precompile(config):
     config.compile.precompile_artifact_dir = os.environ[
         "TORCHTITAN_PRECOMPILE_ARTIFACT_DIR"
     ]
+    return config
+
+
+def _configure_local_precompile_inputs(config):
+    """Use packaged local inputs while preserving the graph fingerprint.
+
+    Precompile executes one real step to establish the runtime input schema,
+    but dataset identity and tokenizer location do not affect the saved graph.
+    Keep the graph-affecting MTP depth and document-count contract unchanged.
+    """
+    config.dataloader.dataset = ConcatThenSplitPackingConfig(
+        dataset=DATASETS["c4_test"]
+    )
+    config.dataloader.shuffle = False
+    config.dataloader.repeat = True
+    config.dataloader.max_num_documents = 1
+    config.hf_assets_path = "./tests/assets/tokenizer"
     return config
 
 
@@ -114,6 +134,14 @@ def graph_trainer_deepseek_v3_671b_dist_moe_mxfp8_sanket_final_mtp1_pp2_precompi
     return _configure_precompile(config)
 
 
+def graph_trainer_deepseek_v3_671b_dist_moe_mxfp8_sanket_final_mtp1_pp2_precompile_generate_64gpu_numerics():
+    """Generate the PP2-64 numerics bundles without the cluster C4 mount."""
+    config = (
+        graph_trainer_deepseek_v3_671b_dist_moe_mxfp8_sanket_final_mtp1_pp2_precompile_64gpu_numerics()
+    )
+    return _configure_local_precompile_inputs(config)
+
+
 def graph_trainer_deepseek_v3_671b_dist_moe_mxfp8_sanket_final_mtp1_pp2_precompile_256gpu_performance():
     """Profile precompiled PP2/VPP8 MTP1 at the final 256-GPU geometry."""
     config = (
@@ -128,3 +156,19 @@ def graph_trainer_deepseek_v3_671b_dist_moe_mxfp8_sanket_final_mtp1_pp2_precompi
         _mast_configs.graph_trainer_deepseek_v3_671b_dist_moe_mxfp8_sanket_final_mtp1_256gpu_numerics()
     )
     return _configure_precompile(config)
+
+
+def graph_trainer_deepseek_v3_671b_dist_moe_mxfp8_sanket_final_mtp1_pp2_precompile_generate_256gpu_performance():
+    """Generate the PP2-256 performance bundles without the C4 mount."""
+    config = (
+        graph_trainer_deepseek_v3_671b_dist_moe_mxfp8_sanket_final_mtp1_pp2_precompile_256gpu_performance()
+    )
+    return _configure_local_precompile_inputs(config)
+
+
+def graph_trainer_deepseek_v3_671b_dist_moe_mxfp8_sanket_final_mtp1_pp2_precompile_generate_256gpu_numerics():
+    """Generate the PP2-256 numerics bundles without the C4 mount."""
+    config = (
+        graph_trainer_deepseek_v3_671b_dist_moe_mxfp8_sanket_final_mtp1_pp2_precompile_256gpu_numerics()
+    )
+    return _configure_local_precompile_inputs(config)

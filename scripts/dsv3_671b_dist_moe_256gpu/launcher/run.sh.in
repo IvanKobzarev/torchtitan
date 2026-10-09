@@ -98,8 +98,11 @@ if [[ -z "${TORCHTITAN_PRECOMPILE_ARTIFACT_DIR:-}" ]]; then
     *pp1*precompile*64gpu*)
       TORCHTITAN_PRECOMPILE_ARTIFACT_DIR=${WORKSPACE_DIR}/precompile_artifacts/pp1-64gpu
       ;;
+    *pp1*precompile*256gpu*numerics*)
+      TORCHTITAN_PRECOMPILE_ARTIFACT_DIR=${WORKSPACE_DIR}/precompile_artifacts/pp1-256gpu-numerics
+      ;;
     *pp1*precompile*256gpu*)
-      TORCHTITAN_PRECOMPILE_ARTIFACT_DIR=${WORKSPACE_DIR}/precompile_artifacts/pp1-256gpu
+      TORCHTITAN_PRECOMPILE_ARTIFACT_DIR=${WORKSPACE_DIR}/precompile_artifacts/pp1-256gpu-performance
       ;;
     *pp2*precompile*4gpu*)
       TORCHTITAN_PRECOMPILE_ARTIFACT_DIR=${WORKSPACE_DIR}/precompile_artifacts/pp2-4gpu
@@ -107,8 +110,11 @@ if [[ -z "${TORCHTITAN_PRECOMPILE_ARTIFACT_DIR:-}" ]]; then
     *pp2*precompile*64gpu*)
       TORCHTITAN_PRECOMPILE_ARTIFACT_DIR=${WORKSPACE_DIR}/precompile_artifacts/pp2-64gpu
       ;;
+    *pp2*precompile*256gpu*numerics*)
+      TORCHTITAN_PRECOMPILE_ARTIFACT_DIR=${WORKSPACE_DIR}/precompile_artifacts/pp2-256gpu-numerics
+      ;;
     *pp2*precompile*256gpu*)
-      TORCHTITAN_PRECOMPILE_ARTIFACT_DIR=${WORKSPACE_DIR}/precompile_artifacts/pp2-256gpu
+      TORCHTITAN_PRECOMPILE_ARTIFACT_DIR=${WORKSPACE_DIR}/precompile_artifacts/pp2-256gpu-performance
       ;;
   esac
 fi
