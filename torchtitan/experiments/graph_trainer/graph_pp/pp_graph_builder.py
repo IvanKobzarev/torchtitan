@@ -136,6 +136,45 @@ class _ReduceGradRuntimeInputSource:
     saved_for_backward_index: int | None
 
 
+def _reduce_grad_runtime_input_source(
+    name: str,
+    *,
+    flat_index_by_name: dict[str, int],
+    saved_value_index_by_name: dict[str, int],
+    runtime_mesh_flat_start: int,
+    runtime_mesh_flat_end: int,
+) -> _ReduceGradRuntimeInputSource:
+    """Resolve one deferred reduction input to its runtime value source."""
+    flat_index = flat_index_by_name.get(name)
+    if (
+        flat_index is not None
+        and runtime_mesh_flat_start <= flat_index < runtime_mesh_flat_end
+    ):
+        return _ReduceGradRuntimeInputSource(
+            runtime_mesh_index=flat_index - runtime_mesh_flat_start,
+            saved_for_backward_index=None,
+        )
+
+    saved_value_index = saved_value_index_by_name.get(name)
+    if saved_value_index is not None:
+        return _ReduceGradRuntimeInputSource(
+            runtime_mesh_index=None,
+            saved_for_backward_index=saved_value_index,
+        )
+
+    if flat_index is not None:
+        raise ValueError(
+            "GraphPP gradient reduction has a non-state runtime input outside "
+            "the precompile mesh range: "
+            f"flat index {flat_index}, mesh range "
+            f"[{runtime_mesh_flat_start}, {runtime_mesh_flat_end})"
+        )
+    raise ValueError(
+        "GraphPP gradient reduction runtime input is neither a traced runtime "
+        f"mesh nor a forward-saved value: {name}"
+    )
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class _StageGraphMeta:
     """GraphTrainer metadata for one bound GraphPP stage graph executor.
@@ -1243,28 +1282,15 @@ def _build_stage_graphs(
     }
     reduce_grad_runtime_input_sources = []
     for name in fsdp_bw.reduce_grad_runtime_input_names:
-        if name in flat_index_by_name:
-            reduce_grad_runtime_input_sources.append(
-                _ReduceGradRuntimeInputSource(
-                    runtime_mesh_index=runtime_mesh_index(
-                        flat_index_by_name[name],
-                        graph_name="GraphPP gradient reduction",
-                    ),
-                    saved_for_backward_index=None,
-                )
+        reduce_grad_runtime_input_sources.append(
+            _reduce_grad_runtime_input_source(
+                name,
+                flat_index_by_name=flat_index_by_name,
+                saved_value_index_by_name=saved_value_index_by_name,
+                runtime_mesh_flat_start=runtime_mesh_flat_start,
+                runtime_mesh_flat_end=runtime_mesh_flat_end,
             )
-        elif name in saved_value_index_by_name:
-            reduce_grad_runtime_input_sources.append(
-                _ReduceGradRuntimeInputSource(
-                    runtime_mesh_index=None,
-                    saved_for_backward_index=saved_value_index_by_name[name],
-                )
-            )
-        else:
-            raise ValueError(
-                "GraphPP gradient reduction runtime input is neither a traced "
-                f"runtime mesh nor a forward-saved value: {name}"
-            )
+        )
     didw_split = stage_builder._split_stage_backward_graph(
         full_bw_repeat,
         num_param_grads=num_param_grad_values,

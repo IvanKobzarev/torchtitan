@@ -63,6 +63,7 @@ from torchtitan.experiments.graph_trainer.graph_pp.pp_graph_builder import (
     _build_graph_pp_overlap_graphs,
     _build_stage_graphs,
     _dist_moe_forward_slot_arguments,
+    _reduce_grad_runtime_input_source,
     _ReduceGradRuntimeInputSource,
     _rewrite_dist_moe_activation_slot_input,
     GraphTrainerStageGraphs,
@@ -284,6 +285,40 @@ def _trace_mask_mod_replay(mask0: Any, mask1: Any) -> tuple[bool, bool]:
 
 
 class GraphRuntimeTraceTest(unittest.TestCase):
+    def test_forward_saved_reduce_grad_input_wins_over_user_input(self) -> None:
+        source = _reduce_grad_runtime_input_source(
+            "shape_source",
+            flat_index_by_name={"x": 0, "shape_source": 1},
+            saved_value_index_by_name={"x": 0, "shape_source": 1},
+            runtime_mesh_flat_start=0,
+            runtime_mesh_flat_end=0,
+        )
+
+        self.assertEqual(
+            source,
+            _ReduceGradRuntimeInputSource(
+                runtime_mesh_index=None,
+                saved_for_backward_index=1,
+            ),
+        )
+
+    def test_reduce_grad_runtime_mesh_wins_over_saved_value(self) -> None:
+        source = _reduce_grad_runtime_input_source(
+            "process_group",
+            flat_index_by_name={"x": 0, "process_group": 1},
+            saved_value_index_by_name={"process_group": 0},
+            runtime_mesh_flat_start=1,
+            runtime_mesh_flat_end=2,
+        )
+
+        self.assertEqual(
+            source,
+            _ReduceGradRuntimeInputSource(
+                runtime_mesh_index=0,
+                saved_for_backward_index=None,
+            ),
+        )
+
     def test_spmd_runtime_skips_upstream_stage_initialization(self) -> None:
         stage = mock.Mock(spec=GraphPipelineStage)
         stage.num_stages = 1
