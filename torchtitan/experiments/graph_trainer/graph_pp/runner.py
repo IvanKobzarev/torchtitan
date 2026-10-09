@@ -520,6 +520,7 @@ class GraphRuntime:
         stage.state.unsharded_param_values = []
         stage.state.unshard_wait_pending = False
         stage.state.unsharded_param_grads = []
+        stage.state.reduce_grad_runtime_inputs = ()
         stage.state.sharded_param_grads = []
         stage._graph_pp_grads_scaled = False
 
@@ -531,6 +532,7 @@ class GraphRuntime:
         graphs = self.stage_graphs[stage.stage_index]
         stage.state.sharded_param_grads = graphs.reduce_grads(
             stage.state.unsharded_param_grads,
+            runtime_inputs=stage.state.reduce_grad_runtime_inputs,
             runtime_validate=stage._runtime_validate,
         )
         _scale_graph_pp_sharded_grads(stage, self.schedule)
@@ -746,6 +748,12 @@ class GraphRuntime:
             saved_values_for_backward,
             output_grads_from_next,
         ) = _prepare_backward_values(stage, mb_index)
+        stage.state.reduce_grad_runtime_inputs = (
+            graphs.select_reduce_grad_runtime_inputs(
+                saved_values_for_backward,
+                runtime_validate=stage._runtime_validate,
+            )
+        )
         input_grads, param_grads = graphs.full_backward(
             saved_values_for_backward,
             output_grads_from_next,
@@ -788,6 +796,12 @@ class GraphRuntime:
             saved_values_for_backward,
             output_grads_from_next,
         ) = _prepare_backward_values(stage, mb_index)
+        stage.state.reduce_grad_runtime_inputs = (
+            graphs.select_reduce_grad_runtime_inputs(
+                saved_values_for_backward,
+                runtime_validate=stage._runtime_validate,
+            )
+        )
         input_grads, saved_values_for_backward_weight = graphs.backward_input(
             saved_values_for_backward,
             output_grads_from_next,
@@ -920,6 +934,12 @@ class GraphRuntime:
             bw_saved_values_for_backward,
             output_grads_from_next,
         ) = _prepare_backward_values(bw_stage, bw_mb_index)
+        bw_stage.state.reduce_grad_runtime_inputs = (
+            bw_graphs.select_reduce_grad_runtime_inputs(
+                bw_saved_values_for_backward,
+                runtime_validate=bw_stage._runtime_validate,
+            )
+        )
         (
             input_grads,
             param_grads,

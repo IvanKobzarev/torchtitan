@@ -45,7 +45,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_GRAPH_PP_FORMAT_VERSION = 1
+_GRAPH_PP_FORMAT_VERSION = 2
 _GRAPH_PP_MODULE_NAMES = (
     "fw",
     "full_bw_repeat",

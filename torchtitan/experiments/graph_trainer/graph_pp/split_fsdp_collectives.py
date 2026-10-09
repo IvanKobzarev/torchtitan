@@ -512,6 +512,8 @@ class FSDPUnshardExtraction:
             inputs supplied by ``unshard_module``.
         compute_output_names (tuple[str, ...]): ``compute_module`` output
             names.
+        compute_input_names (tuple[str, ...]): ``compute_module`` placeholder
+            names after reduction-only runtime inputs are removed.
     """
 
     unshard_module: fx.GraphModule | None
@@ -568,6 +570,7 @@ class FSDPReduceGradExtraction:
 
     compute_module: fx.GraphModule
     reduce_grad_module: fx.GraphModule | None
+    compute_input_names: tuple[str, ...]
     compute_output_names: tuple[str, ...]
     reduce_grad_input_names: tuple[str, ...]
     reduce_grad_runtime_input_names: tuple[str, ...] = ()
@@ -1110,6 +1113,7 @@ def extract_fsdp_reduce_grad_graph(
         return FSDPReduceGradExtraction(
             compute_module=graph_module,
             reduce_grad_module=None,
+            compute_input_names=placeholder_names(graph_module),
             compute_output_names=output_names(graph_module),
             reduce_grad_input_names=(),
         )
@@ -1132,6 +1136,7 @@ def extract_fsdp_reduce_grad_graph(
         return FSDPReduceGradExtraction(
             compute_module=kept_module,
             reduce_grad_module=None,
+            compute_input_names=placeholder_names(kept_module),
             compute_output_names=output_names(kept_module),
             reduce_grad_input_names=(),
             reduction_node_names=frozenset(reduction_node_names),
@@ -1203,6 +1208,7 @@ def extract_fsdp_reduce_grad_graph(
     return FSDPReduceGradExtraction(
         compute_module=compute_module,
         reduce_grad_module=reduce_grad_module,
+        compute_input_names=placeholder_names(compute_module),
         compute_output_names=output_names(compute_module),
         # The reduction graph's placeholders are the unique reduction inputs.
         reduce_grad_input_names=tuple(node.name for node in unique_reduce_grad_inputs),

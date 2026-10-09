@@ -63,6 +63,7 @@ from torchtitan.experiments.graph_trainer.graph_pp.pp_graph_builder import (
     _build_graph_pp_overlap_graphs,
     _build_stage_graphs,
     _dist_moe_forward_slot_arguments,
+    _ReduceGradRuntimeInputSource,
     _rewrite_dist_moe_activation_slot_input,
     GraphTrainerStageGraphs,
 )
@@ -592,6 +593,7 @@ class GraphRuntimeTraceTest(unittest.TestCase):
                 self,
                 grads: list[Any],
                 *,
+                runtime_inputs: tuple[Any, ...] = (),
                 runtime_validate: bool = False,
             ) -> list[Any]:
                 self.num_reductions += 1
@@ -967,6 +969,7 @@ class GraphRuntimeTraceTest(unittest.TestCase):
         stage = types.SimpleNamespace(
             state=GraphPPStageRuntimeState(
                 unsharded_param_grads=[torch.ones(1)],
+                reduce_grad_runtime_inputs=(object(),),
             ),
             clear_runtime_states=mock.Mock(),
         )
@@ -1001,6 +1004,7 @@ class GraphRuntimeTraceTest(unittest.TestCase):
                 buffer_values=[object()],
                 unsharded_param_values=[object()],
                 unsharded_param_grads=[torch.ones(1)],
+                reduce_grad_runtime_inputs=(object(),),
                 sharded_param_grads=[torch.ones(1)],
                 trainable_params=[torch.nn.Parameter(torch.ones(1))],
             ),
@@ -1752,6 +1756,29 @@ class GraphRuntimeTraceTest(unittest.TestCase):
         self.assertEqual(actions[0].microbatch_index, 0)
         self.assertIsNone(actions[0].sub_actions)
 
+    def test_spmd_reduction_accepts_common_runtime_input_signature(self) -> None:
+        grad = torch.ones(2)
+        joint_graphs = GraphTrainerJointStageGraphs.__new__(
+            GraphTrainerJointStageGraphs
+        )
+        self.assertEqual(
+            joint_graphs.reduce_grads([grad], runtime_inputs=()),
+            [grad],
+        )
+
+        scheduled_graphs = GraphTrainerScheduledFwdBwdStageGraphs.__new__(
+            GraphTrainerScheduledFwdBwdStageGraphs
+        )
+        scheduled_graphs.meta = types.SimpleNamespace(num_param_grad_values=1)
+        self.assertEqual(
+            scheduled_graphs.reduce_grads(
+                [grad],
+                runtime_inputs=(),
+                runtime_validate=True,
+            ),
+            [grad],
+        )
+
     def test_spmd_schedule_fuses_fsdp_boundaries_into_edge_microbatches(
         self,
     ) -> None:
@@ -2367,7 +2394,7 @@ class GraphRuntimeTraceTest(unittest.TestCase):
                 fwd_input_names=("unsharded_weight", "x"),
                 fwd_flat_input_indices=(2,),
                 unshard_runtime_mesh_indices=(),
-                reduce_grad_runtime_mesh_indices=(),
+                reduce_grad_runtime_input_sources=(),
                 uses_dist_moe_activation_slot=False,
                 is_last_stage=False,
             ),
@@ -2421,7 +2448,13 @@ class GraphRuntimeTraceTest(unittest.TestCase):
                 num_param_grad_values=2,
                 bw_no_fsdp_output_names=("grad0", "grad1"),
                 reduce_grad_input_names=("grad0",),
-                reduce_grad_runtime_mesh_indices=(1,),
+                reduce_grad_runtime_input_sources=(
+                    _ReduceGradRuntimeInputSource(
+                        runtime_mesh_index=1,
+                        saved_for_backward_index=None,
+                    ),
+                ),
+                num_saved_for_backward=1,
             ),
             runtime_meshes=(dense_mesh, sparse_mesh),
         )
@@ -2435,11 +2468,105 @@ class GraphRuntimeTraceTest(unittest.TestCase):
             [unshard_output],
         )
         self.assertEqual(unshard.args, (param1, dense_mesh))
+        runtime_inputs = graphs.select_reduce_grad_runtime_inputs((object(),))
+        self.assertEqual(runtime_inputs, (sparse_mesh,))
         self.assertEqual(
-            graphs.reduce_grads([grad0, grad1]),
+            graphs.reduce_grads([grad0, grad1], runtime_inputs=runtime_inputs),
             [reduce_output],
         )
         self.assertEqual(reduce_grad.args, (grad0, sparse_mesh))
+
+    def test_reduce_grad_retains_forward_derived_runtime_input(self) -> None:
+        class BoxedRecorder:
+            def __init__(self) -> None:
+                self.args: tuple[object, ...] = ()
+
+            def __call__(self, args: list[object]) -> tuple[object, ...]:
+                self.args = tuple(args)
+                args.clear()
+                return (object(),)
+
+        reduce_grad = BoxedRecorder()
+        graphs = GraphTrainerStageGraphs(
+            modules=types.SimpleNamespace(
+                unshard_launch=None,
+                reduce_grad=reduce_grad,
+            ),
+            meta=types.SimpleNamespace(
+                num_fw_param_inputs=0,
+                fwd_input_names=(),
+                fwd_flat_input_indices=(),
+                unshard_runtime_mesh_indices=(),
+                reduce_grad_runtime_input_sources=(
+                    _ReduceGradRuntimeInputSource(
+                        runtime_mesh_index=None,
+                        saved_for_backward_index=1,
+                    ),
+                ),
+                num_saved_for_backward=2,
+                num_param_grad_values=1,
+                bw_no_fsdp_output_names=("grad",),
+                reduce_grad_input_names=("grad",),
+            ),
+        )
+        grad = object()
+        derived_mesh = object()
+
+        runtime_inputs = graphs.select_reduce_grad_runtime_inputs(
+            (object(), derived_mesh),
+            runtime_validate=True,
+        )
+        graphs.reduce_grads(
+            [grad],
+            runtime_inputs=runtime_inputs,
+            runtime_validate=True,
+        )
+
+        self.assertEqual(runtime_inputs, (derived_mesh,))
+        self.assertEqual(reduce_grad.args, (grad, derived_mesh))
+
+    def test_backward_compute_omits_reduction_only_runtime_input(self) -> None:
+        class BoxedRecorder:
+            def __init__(self) -> None:
+                self.args: tuple[object, ...] = ()
+
+            def __call__(self, args: list[object]) -> tuple[object, ...]:
+                self.args = tuple(args)
+                args.clear()
+                return (object(),)
+
+        backward = BoxedRecorder()
+        graphs = GraphTrainerStageGraphs(
+            modules=types.SimpleNamespace(
+                unshard_launch=None,
+                full_bw_first=None,
+                full_bw_repeat=backward,
+            ),
+            meta=types.SimpleNamespace(
+                num_fw_param_inputs=0,
+                fwd_input_names=(),
+                fwd_flat_input_indices=(),
+                unshard_runtime_mesh_indices=(),
+                reduce_grad_runtime_input_sources=(),
+                num_saved_for_backward=2,
+                is_last_stage=True,
+                partition=types.SimpleNamespace(
+                    saved_for_backward_names=("tensor", "derived_group"),
+                    backward_grad_input_names=(),
+                    backward_grad_input_indices=(),
+                ),
+                bw_no_fsdp_input_names=("tensor",),
+                num_param_grad_values=1,
+                input_grad_values=types.SimpleNamespace(
+                    wrap_flat_values=lambda values: values
+                ),
+            ),
+        )
+        tensor = torch.ones(2)
+
+        graphs.full_backward((tensor, object()), ())
+
+        self.assertEqual(backward.args, (tensor,))
 
     def test_stage_trace_preserves_buffers_and_forward_keeps_mutations(self) -> None:
         class BufferCountingStage(nn.Module):
@@ -2633,6 +2760,97 @@ class GraphRuntimeTraceTest(unittest.TestCase):
         torch.testing.assert_close(
             param_grads1[1],
             expected_bias_grad + expected_bias_grad,
+        )
+
+    def test_overlap_handler_retains_reduce_grad_runtime_inputs(self) -> None:
+        derived_group = object()
+        backward_saved = (object(), derived_group)
+        fw_stage = types.SimpleNamespace(
+            stage_index=0,
+            _runtime_validate=False,
+            state=GraphPPStageRuntimeState(
+                unsharded_param_values=[object()],
+                buffer_values=[],
+            ),
+        )
+        bw_stage = types.SimpleNamespace(
+            stage_index=1,
+            has_backward=True,
+            _runtime_validate=True,
+            state=GraphPPStageRuntimeState(),
+        )
+        fw_graphs = object()
+        bw_graphs = types.SimpleNamespace(
+            select_reduce_grad_runtime_inputs=mock.Mock(return_value=(derived_group,))
+        )
+        overlap_graph = types.SimpleNamespace(
+            forward_backward=mock.Mock(return_value=([], [], object(), ()))
+        )
+        runner = GraphRuntime.__new__(GraphRuntime)
+        runner.schedule = object()
+        runner.stage_graphs = {0: fw_graphs, 1: bw_graphs}
+        runner.overlap_graphs = {(0, 1): overlap_graph}
+        runner.loss_kwargs = {}
+        runner.ensure_ready = mock.Mock()
+        runner._resolve_dist_moe_activation_slot = mock.Mock(return_value=None)
+        runner._accumulate_split_stage_backward_grads = mock.Mock()
+        action = _Action(
+            -1,
+            OVERLAP_F_B,
+            None,
+            (
+                _Action(0, FORWARD, 0, None),
+                _Action(1, BACKWARD, 0, None),
+            ),
+        )
+
+        with (
+            mock.patch(
+                "torchtitan.experiments.graph_trainer.graph_pp.runner."
+                "_prepare_fwd_common",
+                return_value=({}, fw_stage, 0, False),
+            ),
+            mock.patch(
+                "torchtitan.experiments.graph_trainer.graph_pp.runner."
+                "_prepare_backward_common",
+                return_value=({}, bw_stage, 0, False),
+            ),
+            mock.patch(
+                "torchtitan.experiments.graph_trainer.graph_pp.runner."
+                "_prepare_fwd_user_args",
+                return_value=((), {}, None),
+            ),
+            mock.patch(
+                "torchtitan.experiments.graph_trainer.graph_pp.runner."
+                "_prepare_backward_values",
+                return_value=(backward_saved, ()),
+            ),
+            mock.patch(
+                "torchtitan.experiments.graph_trainer.graph_pp.runner."
+                "_ensure_unshard_launched"
+            ),
+            mock.patch(
+                "torchtitan.experiments.graph_trainer.graph_pp.runner."
+                "_wait_unsharded_param_values"
+            ),
+            mock.patch(
+                "torchtitan.experiments.graph_trainer.graph_pp.runner."
+                "_post_fwd_common"
+            ),
+            mock.patch(
+                "torchtitan.experiments.graph_trainer.graph_pp.runner."
+                "_post_backward_common"
+            ),
+        ):
+            runner._handle_overlap_fw_bw(action, types.SimpleNamespace())
+
+        self.assertEqual(
+            bw_stage.state.reduce_grad_runtime_inputs,
+            (derived_group,),
+        )
+        bw_graphs.select_reduce_grad_runtime_inputs.assert_called_once_with(
+            backward_saved,
+            runtime_validate=True,
         )
 
     def test_last_stage_graphs_return_loss_and_input_grad(self) -> None:

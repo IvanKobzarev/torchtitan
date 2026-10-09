@@ -445,8 +445,10 @@ class GraphTrainerScheduledFwdBwdStageGraphs(JointStageGraphs):
         self,
         unsharded_param_grads: list[Any],
         *,
+        runtime_inputs: tuple[Any, ...] = (),
         runtime_validate: bool = False,
     ) -> list[Any]:
+        del runtime_inputs
         if runtime_validate and len(unsharded_param_grads) != (
             self.meta.num_param_grad_values
         ):

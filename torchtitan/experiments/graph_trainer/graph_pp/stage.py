@@ -52,6 +52,7 @@ class StageGraphs(Protocol):
         self,
         unsharded_param_grads: list[Any],
         *,
+        runtime_inputs: tuple[Any, ...] = (),
         runtime_validate: bool = False,
     ) -> list[Any]:
         """Reduce raw parameter gradients after graph execution."""
@@ -214,10 +215,19 @@ class SplitStageGraphs(StageGraphs, Protocol):
             list[Any]: Flat unsharded parameter-gradient values.
         """
 
+    def select_reduce_grad_runtime_inputs(
+        self,
+        saved_values_for_backward: tuple[Any, ...],
+        *,
+        runtime_validate: bool = False,
+    ) -> tuple[Any, ...]:
+        """Select non-gradient inputs retained for deferred reduction."""
+
     def reduce_grads(
         self,
         unsharded_param_grads: list[Any],
         *,
+        runtime_inputs: tuple[Any, ...] = (),
         runtime_validate: bool = False,
     ) -> list[Any]:
         """Reduce unsharded parameter gradients.
@@ -225,6 +235,8 @@ class SplitStageGraphs(StageGraphs, Protocol):
         Args:
             unsharded_param_grads (list[Any]): Flat accumulated unsharded
                 parameter gradients.
+            runtime_inputs (tuple[Any, ...]): Non-gradient inputs selected
+                while the corresponding backward values were live.
             runtime_validate (bool): Whether to run repeated per-microbatch
                 validation before executing the graph.
 
@@ -416,6 +428,8 @@ class GraphPPStageRuntimeState:
             SPMD with gradient accumulation retain the latest gradient outputs
             when reduction is deferred. SPMD without gradient accumulation
             does not use it; reduced gradients go directly to ``param.grad``.
+        reduce_grad_runtime_inputs (tuple[Any, ...]): Non-gradient values
+            retained from backward inputs until deferred gradient reduction.
         sharded_param_grads (list[Any]): Flat reduced gradients after
             ``reduce_grads``.
         trainable_params (list[torch.Tensor]): Stage parameters that receive
@@ -428,6 +442,7 @@ class GraphPPStageRuntimeState:
     unsharded_param_values: list[Any] = dataclasses.field(default_factory=list)
     unshard_wait_pending: bool = False
     unsharded_param_grads: list[Any] = dataclasses.field(default_factory=list)
+    reduce_grad_runtime_inputs: tuple[Any, ...] = ()
     sharded_param_grads: list[Any] = dataclasses.field(default_factory=list)
     trainable_params: list[torch.Tensor] = dataclasses.field(default_factory=list)
 
@@ -439,6 +454,7 @@ class GraphPPStageRuntimeState:
         self.unsharded_param_values = []
         self.unshard_wait_pending = False
         self.unsharded_param_grads = []
+        self.reduce_grad_runtime_inputs = ()
         self.sharded_param_grads = []
         self.trainable_params = []
 

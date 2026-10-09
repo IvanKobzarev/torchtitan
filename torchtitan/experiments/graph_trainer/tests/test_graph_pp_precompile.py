@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import dataclasses
 import pickle
 import tempfile
 import unittest
@@ -18,6 +19,7 @@ from torchtitan.experiments.graph_trainer.graph_builder_utils import (
     _execute_graph_module,
 )
 from torchtitan.experiments.graph_trainer.graph_pp.pp_graph_builder import (
+    _ReduceGradRuntimeInputSource,
     _StageGraphModules,
     GraphTrainerStageGraphs,
 )
@@ -55,7 +57,13 @@ def _make_stage(stage_index: int):
             fwd_input_names=("value",),
             fwd_flat_input_indices=(0,),
             unshard_runtime_mesh_indices=(),
-            reduce_grad_runtime_mesh_indices=(),
+            reduce_grad_runtime_input_sources=(
+                _ReduceGradRuntimeInputSource(
+                    runtime_mesh_index=None,
+                    saved_for_backward_index=0,
+                ),
+            ),
+            num_saved_for_backward=1,
         ),
         compiled=True,
         full_bw_grad_accumulator_indices=(0,),
@@ -189,6 +197,36 @@ class TestGraphPPPrecompileArtifact(unittest.TestCase):
                     expected_config_fingerprints={1: "fingerprint"},
                     expected_runtime_input_schemas={1: ("runtime-schema", ())},
                     stage_devices={1: torch.device("cpu")},
+                )
+
+    def test_load_rejects_previous_metadata_format(self) -> None:
+        stage = _make_stage(0)
+        artifact = PrecompiledGraphPPRankArtifact.from_stages(
+            [stage],
+            pp_rank=0,
+            schedule_name="Interleaved1F1B",
+            num_microbatches=32,
+            num_runtime_mesh_inputs=0,
+            execution_plan=_make_plan(),
+            config_fingerprints={0: "fingerprint"},
+            runtime_input_schemas={0: ("schema", ())},
+        )
+        artifact = dataclasses.replace(artifact, format_version=1)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            storage = DiskStorageAdapter(tmpdir)
+            storage.save(graph_pp_rank_artifact_key(0), pickle.dumps(artifact))
+            with self.assertRaisesRegex(ValueError, "format mismatch"):
+                load_graph_pp_rank_artifact(
+                    storage,
+                    pp_rank=0,
+                    schedule_name="Interleaved1F1B",
+                    num_microbatches=32,
+                    runtime_meshes=[],
+                    execution_plan=_make_plan(),
+                    expected_stage_indices=(0,),
+                    expected_config_fingerprints={0: "fingerprint"},
+                    expected_runtime_input_schemas={0: ("schema", ())},
+                    stage_devices={0: torch.device("cpu")},
                 )
 
     def test_load_rejects_wrong_rank_even_if_storage_key_matches(self) -> None:

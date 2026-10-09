@@ -130,8 +130,10 @@ class GraphTrainerJointStageGraphs(JointStageGraphs):
         self,
         unsharded_param_grads: list[Any],
         *,
+        runtime_inputs: tuple[Any, ...] = (),
         runtime_validate: bool = False,
     ) -> list[Any]:
+        del runtime_inputs
         return list(unsharded_param_grads)
 
     def _model_input(self, args: tuple[Any, ...]) -> Any:

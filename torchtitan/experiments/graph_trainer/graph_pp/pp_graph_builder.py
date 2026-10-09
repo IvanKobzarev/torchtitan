@@ -129,6 +129,14 @@ class _StageGraphModules:
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
+class _ReduceGradRuntimeInputSource:
+    """Source of one non-gradient input to a deferred reduction graph."""
+
+    runtime_mesh_index: int | None
+    saved_for_backward_index: int | None
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
 class _StageGraphMeta:
     """GraphTrainer metadata for one bound GraphPP stage graph executor.
 
@@ -167,11 +175,12 @@ class _StageGraphMeta:
     fwd_input_names: tuple[str, ...]
     fwd_flat_input_indices: tuple[int, ...]
     uses_dist_moe_activation_slot: bool = False
+    bw_no_fsdp_input_names: tuple[str, ...] = ()
     bw_no_fsdp_output_names: tuple[str, ...] = ()
     reduce_grad_input_names: tuple[str, ...] = ()
     unshard_flat_param_indices: tuple[int, ...] = ()
     unshard_runtime_mesh_indices: tuple[int, ...] = ()
-    reduce_grad_runtime_mesh_indices: tuple[int, ...] = ()
+    reduce_grad_runtime_input_sources: tuple[_ReduceGradRuntimeInputSource, ...] = ()
     num_fw_param_inputs: int = 0
     num_unshard_launch_values: int = 0
     is_last_stage: bool = False
@@ -211,10 +220,7 @@ class GraphTrainerStageGraphs(SplitStageGraphs):
                 f"num_params={num_param_inputs}, "
                 f"flat_indices={self.meta.fwd_flat_input_indices}"
             )
-        for graph_name, indices in (
-            ("unshard", self.meta.unshard_runtime_mesh_indices),
-            ("reduce-grad", self.meta.reduce_grad_runtime_mesh_indices),
-        ):
+        for graph_name, indices in (("unshard", self.meta.unshard_runtime_mesh_indices),):
             invalid_indices = tuple(
                 index
                 for index in indices
@@ -224,6 +230,31 @@ class GraphTrainerStageGraphs(SplitStageGraphs):
                 raise ValueError(
                     f"GraphPP {graph_name} runtime mesh indices are out of "
                     f"range: {invalid_indices} for {len(self.runtime_meshes)} meshes"
+                )
+        for source in self.meta.reduce_grad_runtime_input_sources:
+            has_runtime_mesh = source.runtime_mesh_index is not None
+            has_saved_value = source.saved_for_backward_index is not None
+            if has_runtime_mesh == has_saved_value:
+                raise ValueError(
+                    "GraphPP reduce-grad runtime input must have exactly one source"
+                )
+            if has_runtime_mesh and not (
+                0 <= cast(int, source.runtime_mesh_index) < len(self.runtime_meshes)
+            ):
+                raise ValueError(
+                    "GraphPP reduce-grad runtime mesh index is out of range: "
+                    f"{source.runtime_mesh_index} for "
+                    f"{len(self.runtime_meshes)} meshes"
+                )
+            if has_saved_value and not (
+                0
+                <= cast(int, source.saved_for_backward_index)
+                < self.meta.num_saved_for_backward
+            ):
+                raise ValueError(
+                    "GraphPP reduce-grad saved-value index is out of range: "
+                    f"{source.saved_for_backward_index} for "
+                    f"{self.meta.num_saved_for_backward} saved values"
                 )
 
     def _grad_accumulator_args(
@@ -464,8 +495,9 @@ class GraphTrainerStageGraphs(SplitStageGraphs):
         """Pack backward graph inputs in placeholder order.
 
         Calling convention:
-            Each name in ``partition.bwd_input_names`` selects a saved value or
-            a next-stage output gradient.
+            Each name in ``bw_no_fsdp_input_names`` selects a saved value or a
+            next-stage output gradient. Reduction-only runtime inputs are
+            retained separately and are not passed to the compute graph.
         """
 
         if runtime_validate and self.meta.is_last_stage and output_grads_from_next:
@@ -495,7 +527,7 @@ class GraphTrainerStageGraphs(SplitStageGraphs):
             )
         )
         bwd_args = []
-        for name in self.meta.partition.bwd_input_names:
+        for name in self.meta.bw_no_fsdp_input_names:
             if name in saved_by_name:
                 bwd_args.append(saved_by_name[name])
             elif name in backward_grad_by_name:
@@ -641,10 +673,40 @@ class GraphTrainerStageGraphs(SplitStageGraphs):
             )
         return raw_grads
 
+    def select_reduce_grad_runtime_inputs(
+        self,
+        saved_values_for_backward: tuple[Any, ...],
+        *,
+        runtime_validate: bool = False,
+    ) -> tuple[Any, ...]:
+        """Resolve deferred reduction inputs while backward values are live."""
+
+        if (
+            runtime_validate
+            and len(saved_values_for_backward) != self.meta.num_saved_for_backward
+        ):
+            raise ValueError(
+                "GraphPP saved-value count mismatch while selecting reduce-grad "
+                f"inputs: expected {self.meta.num_saved_for_backward}, got "
+                f"{len(saved_values_for_backward)}"
+            )
+        runtime_inputs = []
+        for source in self.meta.reduce_grad_runtime_input_sources:
+            if source.runtime_mesh_index is not None:
+                runtime_inputs.append(self.runtime_meshes[source.runtime_mesh_index])
+            else:
+                runtime_inputs.append(
+                    saved_values_for_backward[
+                        cast(int, source.saved_for_backward_index)
+                    ]
+                )
+        return tuple(runtime_inputs)
+
     def reduce_grads(
         self,
         unsharded_param_grads: list[Any],
         *,
+        runtime_inputs: tuple[Any, ...] = (),
         runtime_validate: bool = False,
     ) -> list[Any]:
         """Run the optional FSDP reduce-grad graph.
@@ -660,6 +722,14 @@ class GraphTrainerStageGraphs(SplitStageGraphs):
         )
         if self.modules.reduce_grad is None:
             return raw_grads
+        if runtime_validate and len(runtime_inputs) != len(
+            self.meta.reduce_grad_runtime_input_sources
+        ):
+            raise ValueError(
+                "GraphPP reduce-grad runtime input count mismatch: expected "
+                f"{len(self.meta.reduce_grad_runtime_input_sources)}, got "
+                f"{len(runtime_inputs)}"
+            )
         # ``compute_module`` returns one raw grad slot per trainable parameter.
         # ``reduce_grad`` consumes the subset/name order selected by the FSDP
         # split pass and returns the original sharded/reduced grad slots.
@@ -673,10 +743,7 @@ class GraphTrainerStageGraphs(SplitStageGraphs):
         reduce_grad_args = [
             grad_values_by_name[name] for name in self.meta.reduce_grad_input_names
         ]
-        reduce_grad_args.extend(
-            self.runtime_meshes[index]
-            for index in self.meta.reduce_grad_runtime_mesh_indices
-        )
+        reduce_grad_args.extend(runtime_inputs)
         return list(_execute_graph_module(self.modules.reduce_grad, reduce_grad_args))
 
     def param_grads_for_accumulation(
@@ -1170,13 +1237,34 @@ def _build_stage_graphs(
         runtime_mesh_index(flat_index, graph_name="GraphPP unshard")
         for flat_index in fsdp_fw.unshard_flat_runtime_input_indices
     )
-    reduce_grad_runtime_mesh_indices = tuple(
-        runtime_mesh_index(
-            flat_index_by_name[name],
-            graph_name="GraphPP gradient reduction",
-        )
-        for name in fsdp_bw.reduce_grad_runtime_input_names
-    )
+    saved_value_index_by_name = {
+        name: index
+        for index, name in enumerate(partition_meta.saved_for_backward_names)
+    }
+    reduce_grad_runtime_input_sources = []
+    for name in fsdp_bw.reduce_grad_runtime_input_names:
+        if name in flat_index_by_name:
+            reduce_grad_runtime_input_sources.append(
+                _ReduceGradRuntimeInputSource(
+                    runtime_mesh_index=runtime_mesh_index(
+                        flat_index_by_name[name],
+                        graph_name="GraphPP gradient reduction",
+                    ),
+                    saved_for_backward_index=None,
+                )
+            )
+        elif name in saved_value_index_by_name:
+            reduce_grad_runtime_input_sources.append(
+                _ReduceGradRuntimeInputSource(
+                    runtime_mesh_index=None,
+                    saved_for_backward_index=saved_value_index_by_name[name],
+                )
+            )
+        else:
+            raise ValueError(
+                "GraphPP gradient reduction runtime input is neither a traced "
+                f"runtime mesh nor a forward-saved value: {name}"
+            )
     didw_split = stage_builder._split_stage_backward_graph(
         full_bw_repeat,
         num_param_grads=num_param_grad_values,
@@ -1239,11 +1327,14 @@ def _build_stage_graphs(
         fwd_input_names=fsdp_fw.compute_input_names,
         fwd_flat_input_indices=fsdp_fw.compute_flat_input_indices,
         uses_dist_moe_activation_slot=activation_slot_id_1 is not None,
+        bw_no_fsdp_input_names=fsdp_bw.compute_input_names,
         bw_no_fsdp_output_names=fsdp_bw.compute_output_names,
         reduce_grad_input_names=fsdp_bw.reduce_grad_input_names,
         unshard_flat_param_indices=fsdp_fw.unshard_flat_param_indices,
         unshard_runtime_mesh_indices=unshard_runtime_mesh_indices,
-        reduce_grad_runtime_mesh_indices=reduce_grad_runtime_mesh_indices,
+        reduce_grad_runtime_input_sources=tuple(
+            reduce_grad_runtime_input_sources
+        ),
         num_fw_param_inputs=fsdp_fw.num_compute_param_inputs,
         num_unshard_launch_values=num_unshard_launch_values,
         is_last_stage=stage.is_last,

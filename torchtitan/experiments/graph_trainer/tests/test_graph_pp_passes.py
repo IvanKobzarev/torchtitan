@@ -3002,6 +3002,7 @@ class GraphPPFSDPCollectiveSplitTest(unittest.TestCase):
         )
         self.assertEqual(split.reduce_grad_input_names, ("add_tensor_1",))
         self.assertEqual(split.reduce_grad_runtime_input_names, ("process_group",))
+        self.assertEqual(split.compute_input_names, ("local_grad_0", "local_grad_1"))
         self.assertNotIn(
             torch.ops._c10d_functional.reduce_scatter_tensor.default,
             _call_targets(split.compute_module),
