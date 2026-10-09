@@ -243,6 +243,7 @@ mapfile -t pytorch_overlay_files < <(
 for overlay_path in "${pytorch_overlay_files[@]}"; do
   case "$overlay_path" in
     torch/distributed/pipelining/stage.py|\
+    torch/distributed/pipelining/schedules.py|\
     torch/nn/attention/varlen.py|\
     torch/fx/_graph_pickler.py|\
     torch/_inductor/fx_passes/bucketing.py|\
