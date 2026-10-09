@@ -237,8 +237,10 @@ targeting `cuda:0`, and CooR handles rank-specific computation dynamically
 at runtime via `_runtime_compute_coordinate_on_dim`.
 </details>
 
-For GraphPP, do not pass `--virtual-local-rank`. Launch one process per PP
-rank for both phases and preserve the logical world size through `NGPU`:
+For GraphPP artifact generation, do not pass `--virtual-local-rank`. Launch one
+process per PP rank with the hybrid backend and preserve the logical world size
+through `NGPU`. Normal training launches the full logical world with the default
+backend, so each PP-rank bundle fans out across its SPMD ranks:
 
 ```bash
 NGPU=4 torchrun --standalone --nproc-per-node=2 \
@@ -247,11 +249,11 @@ NGPU=4 torchrun --standalone --nproc-per-node=2 \
     --config deepseek_v3_dist_moe_precompile_fsdp2_ep2_pp2 \
     --comm-backend real_pp_fake_spmd
 
-NGPU=4 torchrun --standalone --nproc-per-node=2 \
+NGPU=4 torchrun --standalone --nproc-per-node=4 \
     -m torchtitan.train \
     --module torchtitan_recipes.tests.graph_trainer.precompile \
     --config deepseek_v3_dist_moe_precompile_fsdp2_ep2_pp2 \
-    --comm-backend real_pp_fake_spmd
+    --comm-backend default
 ```
 
 Both commands also require `TORCHTITAN_PRECOMPILE_ARTIFACT_DIR` to name the

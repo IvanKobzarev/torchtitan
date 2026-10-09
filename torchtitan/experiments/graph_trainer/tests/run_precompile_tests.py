@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-Separate test runner for CooR precompile integration tests.
+Separate test runner for precompile integration tests.
 
 Each test has two steps:
 1. Generate either a rank-agnostic CooR artifact on one process or rank-local
@@ -87,9 +87,9 @@ def _build_precompile_tests() -> list[PrecompileTestDefinition]:
         PrecompileTestDefinition(
             config=deepseek_v3_dist_moe_precompile_fsdp2_ep2_pp2,
             artifact_dir=tempfile.mkdtemp(prefix="dsv3_graph_pp_precompile_"),
-            test_descr="aot_fx_trace deepseek_v3 GraphPP precompile FSDP+EP+PP",
-            test_name="aot_fx_trace_deepseek_v3_graph_pp_precompile",
-            ngpu=2,
+            test_descr="deepseek_v3 GraphPP precompile FSDP+EP+PP",
+            test_name="deepseek_v3_graph_pp_precompile",
+            ngpu=4,
             pp_degree=2,
             logical_world_size=4,
         ),
@@ -158,11 +158,12 @@ def run_precompile_tests(args):
 
         # Step 2: training with the precompiled artifact
         if test.pp_degree > 1:
+            assert test.logical_world_size is not None
             cmd = (
                 f"torchrun --standalone --nnodes 1 --nproc-per-node "
-                f"{test.pp_degree} --local-ranks-filter {all_ranks} "
+                f"{test.logical_world_size} --local-ranks-filter {all_ranks} "
                 f"--role rank --tee 3 -m torchtitan.train {config_args} "
-                f"{comm_backend_arg} {output_dir_arg}"
+                f"--comm-backend default {output_dir_arg}"
             )
         else:
             cmd = f"NGPU={test.ngpu} LOG_RANK={all_ranks} ./{RUN_TRAIN_SCRIPT}"
