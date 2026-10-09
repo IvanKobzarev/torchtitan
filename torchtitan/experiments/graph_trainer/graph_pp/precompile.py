@@ -19,6 +19,7 @@ import torch.fx as fx
 from torch.distributed.device_mesh import DeviceMesh
 
 from torchtitan.experiments.graph_trainer.precompile import (
+    _bind_bucketed_all_gather_runtime_ranks,
     _execution_plan_signature,
     _map_precompiled_graph_device,
     _register_coor_ops,
@@ -151,6 +152,7 @@ def _deserialize_graph_module(
             runtime_device=device,
         ),
     )
+    _bind_bucketed_all_gather_runtime_ranks(graph_module)
     graph_module.recompile()
     return graph_module
 

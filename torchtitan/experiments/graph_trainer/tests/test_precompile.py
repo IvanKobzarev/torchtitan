@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import operator
 import os
 import pickle
 import tempfile
@@ -990,6 +991,58 @@ class TestPrecompiledFxTraceArtifact(unittest.TestCase):
 
 
 class TestPrecompiledScheduledFwdBwdArtifact(unittest.TestCase):
+    def test_runtime_process_group_rank_method_accepts_process_group(self):
+        store = torch.distributed.HashStore()
+        group = torch.distributed.ProcessGroupGloo(store, 0, 1)
+        graph = torch.fx.Graph()
+        process_group = graph.placeholder("process_group")
+        rank = graph.call_method("rank", args=(process_group,))
+        graph.output(rank)
+        graph_module = torch.fx.GraphModule({}, graph)
+
+        runtime_rank = graph_module(group)
+
+        self.assertEqual(runtime_rank, 0)
+
+    def test_bucketed_all_gather_uses_runtime_group_rank(self):
+        from torch._inductor.fx_passes import bucketing as _bucketing  # noqa: F401
+
+        from torchtitan.experiments.graph_trainer.precompile import (
+            _bind_bucketed_all_gather_runtime_ranks,
+        )
+
+        graph = torch.fx.Graph()
+        group_name = graph.placeholder("group_name")
+        local_input = graph.placeholder("local_input")
+        bucket = graph.call_function(
+            torch.ops.bucketing._pre_bucket_all_gather.default,
+            args=([local_input], 4, torch.bfloat16, [1], 0),
+        )
+        local_bucket = graph.call_function(
+            torch.ops.aten.slice.Tensor,
+            args=(bucket, 0, 0, 8),
+        )
+        gathered = graph.call_function(
+            torch.ops._c10d_functional.all_gather_into_tensor_out.default,
+            args=(local_bucket, 4, group_name),
+            kwargs={"out": bucket},
+        )
+        graph.output(gathered)
+        graph_module = torch.fx.GraphModule({}, graph)
+
+        _bind_bucketed_all_gather_runtime_ranks(graph_module)
+        runtime_rank = bucket.args[4]
+        self.assertEqual(runtime_rank.op, "call_method")
+        self.assertEqual(runtime_rank.target, "rank")
+        self.assertEqual(runtime_rank.args, (group_name,))
+        self.assertEqual(local_bucket.args[2].target, operator.mul)
+        self.assertEqual(local_bucket.args[3].target, operator.add)
+
+        # The rewrite is idempotent once the trace-time integer is gone.
+        _bind_bucketed_all_gather_runtime_ranks(graph_module)
+        rank_nodes = graph_module.graph.find_nodes(op="call_method", target="rank")
+        self.assertEqual(len(rank_nodes), 1)
+
     def test_save_load_roundtrip(self):
         from torch._subclasses.fake_tensor import FakeTensorMode
 

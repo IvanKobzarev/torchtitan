@@ -24,6 +24,8 @@ from torchtitan.experiments.graph_trainer.graph_pp.pp_graph_builder import (
     GraphTrainerStageGraphs,
 )
 from torchtitan.experiments.graph_trainer.graph_pp.precompile import (
+    _deserialize_graph_module,
+    _serialize_graph_module,
     graph_pp_rank_artifact_key,
     graph_pp_stage_config_fingerprint,
     load_graph_pp_rank_artifact,
@@ -87,6 +89,55 @@ def _make_plan() -> GraphExecutionPlan:
 
 
 class TestGraphPPPrecompileArtifact(unittest.TestCase):
+    def test_stage_load_binds_bucketed_all_gather_runtime_rank(self) -> None:
+        from torch._inductor.fx_passes import bucketing as _bucketing  # noqa: F401
+
+        from torchtitan.experiments.graph_trainer.precompile import _register_coor_ops
+
+        _register_coor_ops()
+        graph = torch.fx.Graph()
+        mesh = graph.placeholder("mesh")
+        local_input = graph.placeholder("local_input")
+        bucket = graph.call_function(
+            torch.ops.bucketing._pre_bucket_all_gather.default,
+            args=([local_input], 4, torch.bfloat16, [1], 0),
+        )
+        local_bucket = graph.call_function(
+            torch.ops.aten.slice.Tensor,
+            args=(bucket, 0, 0, 8),
+        )
+        submesh = graph.call_function(
+            torch.ops.device_mesh._get_submesh.default,
+            args=(mesh, [0]),
+        )
+        group_name = graph.call_function(
+            torch.ops._dtensor.mesh_get_process_group.default,
+            args=(submesh, 0),
+        )
+        gathered = graph.call_function(
+            torch.ops._c10d_functional.all_gather_into_tensor_out.default,
+            args=(local_bucket, 4, group_name),
+            kwargs={"out": bucket},
+        )
+        graph.output(gathered)
+
+        loaded = _deserialize_graph_module(
+            _serialize_graph_module(torch.fx.GraphModule({}, graph)),
+            device=torch.device("cpu"),
+        )
+
+        (loaded_bucket,) = loaded.graph.find_nodes(
+            op="call_function",
+            target=torch.ops.bucketing._pre_bucket_all_gather.default,
+        )
+        self.assertEqual(loaded_bucket.args[4].op, "call_method")
+        self.assertEqual(loaded_bucket.args[4].target, "rank")
+        loaded_group_name = loaded_bucket.args[4].args[0]
+        self.assertEqual(
+            loaded_group_name.target,
+            torch.ops._dtensor.mesh_get_process_group.default,
+        )
+
     def test_stage_fingerprint_uses_target_outer_cudagraph_state(self) -> None:
         stage = SimpleNamespace(
             stage_index=0,

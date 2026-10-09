@@ -11,6 +11,7 @@ import enum
 import functools
 import hashlib
 import logging
+import operator
 import os
 import pickle
 from dataclasses import dataclass
@@ -387,6 +388,118 @@ def _map_precompiled_graph_device(
     )
 
 
+def _bind_bucketed_all_gather_runtime_ranks(gm: torch.fx.GraphModule) -> None:
+    """Replace trace-time all-gather ranks with runtime process-group ranks.
+
+    Inductor's custom-op all-gather bucket writes the local input into the
+    caller's rank slice of its output buffer. Its bucketing pass records that
+    rank as a Python integer. A compile-on-one-rank artifact would otherwise
+    replay the precompile process's rank on every worker, violating the
+    in-place all-gather alias contract.
+    """
+    graph = gm.graph
+    changed = False
+    for pre_bucket in graph.find_nodes(
+        op="call_function",
+        target=torch.ops.bucketing._pre_bucket_all_gather.default,
+    ):
+        group_size = pre_bucket.args[1]
+        trace_rank = pre_bucket.args[4]
+        if type(trace_rank) is not int:
+            continue
+        if type(group_size) is not int:
+            raise ValueError(
+                "Precompiled bucketed all-gather expected a static group size, "
+                f"got {group_size}"
+            )
+
+        input_slices = [
+            user
+            for user in pre_bucket.users
+            if user.target == torch.ops.aten.slice.Tensor
+        ]
+        if len(input_slices) != 1:
+            raise ValueError(
+                "Precompiled bucketed all-gather expected exactly one input slice, "
+                f"got {len(input_slices)}"
+            )
+        input_slice = input_slices[0]
+        _, axis, start, end = input_slice.args
+        if axis != 0 or type(start) is not int or type(end) is not int:
+            raise ValueError(
+                "Precompiled bucketed all-gather expected a static dim-0 input "
+                f"slice, got args={input_slice.args}"
+            )
+        input_numel = end - start
+        if input_numel < 0 or start != input_numel * trace_rank:
+            raise ValueError(
+                "Precompiled bucketed all-gather input slice does not match its "
+                f"trace-time rank: start={start}, end={end}, rank={trace_rank}"
+            )
+
+        all_gathers = [
+            user
+            for user in input_slice.users
+            if user.target
+            == torch.ops._c10d_functional.all_gather_into_tensor_out.default
+        ]
+        if len(all_gathers) != 1:
+            raise ValueError(
+                "Precompiled bucketed all-gather expected exactly one collective, "
+                f"got {len(all_gathers)}"
+            )
+        process_group = all_gathers[0].args[2]
+        if isinstance(process_group, torch.fx.Node):
+            node_positions = {node: index for index, node in enumerate(graph.nodes)}
+            if node_positions[process_group] > node_positions[pre_bucket]:
+                process_group_targets = {
+                    torch.ops._dtensor.mesh_get_process_group.default,
+                    torch.ops.device_mesh._get_submesh,
+                    torch.ops.device_mesh._get_submesh.default,
+                }
+                late_group_nodes: list[torch.fx.Node] = []
+
+                def collect_late_group_nodes(node: torch.fx.Node) -> None:
+                    if node_positions[node] < node_positions[pre_bucket]:
+                        return
+                    if (
+                        node.op != "call_function"
+                        or node.target not in process_group_targets
+                    ):
+                        raise ValueError(
+                            "Precompiled bucketed all-gather expected runtime "
+                            f"process-group lookup nodes, got {node.format_node()}"
+                        )
+                    for input_node in node.all_input_nodes:
+                        collect_late_group_nodes(input_node)
+                    if node not in late_group_nodes:
+                        late_group_nodes.append(node)
+
+                collect_late_group_nodes(process_group)
+                for group_node in late_group_nodes:
+                    pre_bucket.prepend(group_node)
+        with graph.inserting_before(pre_bucket):
+            runtime_rank = graph.call_method("rank", args=(process_group,))
+            runtime_start = graph.call_function(
+                operator.mul,
+                args=(runtime_rank, input_numel),
+            )
+            runtime_end = graph.call_function(
+                operator.add,
+                args=(runtime_start, input_numel),
+            )
+
+        pre_bucket_args = list(pre_bucket.args)
+        pre_bucket_args[4] = runtime_rank
+        pre_bucket.args = tuple(pre_bucket_args)
+        input_slice.args = (pre_bucket, 0, runtime_start, runtime_end)
+        changed = True
+
+    if changed:
+        graph.lint()
+        gm.recompile()
+
+
 def _execution_plan_signature(plan: GraphExecutionPlan) -> tuple[tuple[str, Any], ...]:
     """Return the graph-affecting resolved accumulation policy."""
     return tuple(
@@ -494,6 +607,7 @@ class PrecompiledScheduledFwdBwdArtifact:
                     runtime_device=device,
                 ),
             )
+            _bind_bucketed_all_gather_runtime_ranks(gm)
             gm.recompile()
             metadata = self.call_specs[key]
             computation_type = _GraphComputationType(key)
