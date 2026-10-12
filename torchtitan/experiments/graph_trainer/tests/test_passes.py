@@ -5849,6 +5849,40 @@ class TestCanonicalizeGraphPass(TestCase):
 
 
 class TestStandaloneInductorCompilationPass(TestCase):
+    def test_regional_compile_scopes_eager_numerics_config(self):
+        import torch._inductor.config as inductor_config
+
+        from torchtitan.experiments.graph_trainer.inductor_passes import (
+            regional_inductor_pass,
+        )
+
+        graph = torch.fx.Graph()
+        x_node = graph.placeholder("x")
+        graph.output(x_node)
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+        seen = {}
+
+        def fake_regional_inductor(graph_module, *_example_inputs):
+            seen["division_rounding"] = (
+                inductor_config.eager_numerics.division_rounding
+            )
+            return graph_module
+
+        with (
+            inductor_config.patch(
+                {"eager_numerics.division_rounding": False}
+            ),
+            patch(
+                "torchtitan.experiments.graph_trainer.inductor_passes."
+                "regional_inductor",
+                side_effect=fake_regional_inductor,
+            ),
+        ):
+            regional_inductor_pass(gm, (torch.ones(4),))
+            self.assertFalse(inductor_config.eager_numerics.division_rounding)
+
+        self.assertTrue(seen["division_rounding"])
+
     def test_prunes_unused_placeholders_and_restores_outer_signature(self):
         from torchtitan.experiments.graph_trainer.inductor_passes import (
             standalone_inductor_compilation_pass,
