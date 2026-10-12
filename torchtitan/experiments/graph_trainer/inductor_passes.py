@@ -6,10 +6,9 @@
 
 """Inductor compilation passes for GraphTrainer.
 
-``regional_inductor_pass`` compiles only explicitly tagged regions. The
-``full_inductor_compilation_pass`` convenience wrapper tags the whole graph and uses that same regional pipeline.
-``standalone_inductor_compilation_pass`` bypasses region discovery which saves compilation time and
-invokes ``standalone_compile`` once without additional overhead.
+``regional_inductor_pass`` compiles only explicitly tagged regions.
+``full_inductor_compilation_pass`` uses ``standalone_compile`` once for the
+whole graph, without regional discovery and extraction overhead.
 """
 
 from __future__ import annotations
@@ -416,14 +415,13 @@ def full_inductor_compilation_pass(
     boxed_codegen: bool = False,
     inductor_configs=None,
 ) -> torch.fx.GraphModule:
-    """Compile the whole graph as one ``regional_inductor`` region.
+    """Compile the whole graph with one direct ``standalone_compile`` call.
 
-    Marks every non-placeholder/output node with the ``compile_with_inductor``
-    custom metadata key so ``regional_inductor`` scoops the entire graph as
-    one compiled region. This reuses the regional path (which goes through
-    ``standalone_compile`` and gets c10d functionalization, PG unboxing,
-    decompositions, and caching for free) instead of duplicating that prep
-    around a direct ``compile_fx_inner`` call.
+    The graph already represents the intended GraphTrainer compilation unit,
+    so routing it through regional discovery would copy and extract the same
+    full graph before invoking ``standalone_compile``. The direct path keeps
+    the same compiler entry point and configuration without that redundant
+    transformation.
 
     The collapse hides CUDA-graph-incompatible ops (unpinned D2H copies,
     sm<10 ``_grouped_mm``) inside the opaque ``standalone_compile_inner``
@@ -443,48 +441,23 @@ def full_inductor_compilation_pass(
         inductor_configs: Optional Inductor config overrides for the full
             compiled region.
     """
-    import torch._inductor.config as ic
-
     from torchtitan.experiments.graph_trainer.cuda_graph import is_cuda_graph_compatible
 
     pre_collapse_cuda_graph_compatible = is_cuda_graph_compatible(
         gm, skip_flex_attention_check=True
     )
 
-    full_inductor_configs = {
-        # Preserve the mainline full-compile behavior: AOT autograd via
-        # standalone_compile reorders fwd/bwd unless Inductor restores the
-        # peak-memory schedule.
-        "reorder_for_peak_memory": True,
-        **dict(inductor_configs or {}),
-    }
     _migrate_cpu_get_attrs_to_cuda(gm)
-    for module in gm.modules():
-        if not isinstance(module, torch.fx.GraphModule):
-            continue
-        for node in module.graph.nodes:
-            if node.op in ("placeholder", "output"):
-                continue
-            custom = node.meta.setdefault("custom", {})
-            compile_with_inductor = custom.setdefault(
-                "compile_with_inductor", {"inductor_configs": {}}
-            )
-            custom["compile_with_inductor"] = {
-                **compile_with_inductor,
-                "inductor_configs": {
-                    **compile_with_inductor.get("inductor_configs", {}),
-                    **full_inductor_configs,
-                },
-            }
-    # AOT autograd (via ``standalone_compile``) reorders the gm and breaks
-    # fwd/bwd interleaving, blowing up the baseline schedule. Re-enable
-    # Inductor's reorder pass (disabled globally in ``compile.py``) to fix.
-    with ic.patch(reorder_for_peak_memory=True):
-        result = regional_inductor_pass(
-            gm,
-            example_inputs,
-            boxed_codegen=boxed_codegen,
-        )
+    result = standalone_inductor_compilation_pass(
+        gm,
+        example_inputs,
+        artifact_mode="runtime",
+        boxed_codegen=boxed_codegen,
+        inductor_configs={
+            "eager_numerics.division_rounding": True,
+            **dict(inductor_configs or {}),
+        },
+    )
 
     # Carry the pre-collapse CUDA graph verdict forward via gm.meta. The
     # collapse is information-destroying; this is how downstream passes
