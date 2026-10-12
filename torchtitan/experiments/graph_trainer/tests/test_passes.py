@@ -5897,6 +5897,9 @@ class TestStandaloneInductorCompilationPass(TestCase):
             seen["compile_inputs"] = compile_inputs
             seen["kwargs"] = kwargs
             seen["reorder_for_peak_memory"] = ic.reorder_for_peak_memory
+            seen["remat_using_tags"] = (
+                torch._functorch.config.remat_using_tags_for_fwd_loss_bwd_graph
+            )
 
             def compiled_fn(a, b):
                 return a - b
@@ -5910,6 +5913,8 @@ class TestStandaloneInductorCompilationPass(TestCase):
             wrapped = standalone_inductor_compilation_pass(
                 gm,
                 (x, y, unused),
+                artifact_mode="serializable",
+                boxed_codegen=True,
                 inductor_configs={"reorder_for_peak_memory": False},
             )
 
@@ -5927,6 +5932,7 @@ class TestStandaloneInductorCompilationPass(TestCase):
             },
         )
         self.assertFalse(seen["reorder_for_peak_memory"])
+        self.assertFalse(seen["remat_using_tags"])
 
         wrapped_placeholders = [
             node.target for node in wrapped.graph.find_nodes(op="placeholder")
@@ -5936,8 +5942,11 @@ class TestStandaloneInductorCompilationPass(TestCase):
             node for node in wrapped.graph.nodes if node.op == "call_function"
         )
         self.assertIs(wrapped_call.target.__wrapped__, seen["compiled_fn"])
+        self.assertTrue(wrapped.meta["graph_trainer_boxed_codegen"])
 
-        torch.testing.assert_close(wrapped(x, y, unused), x - y)
+        boxed_args = [x, y, unused]
+        torch.testing.assert_close(wrapped(boxed_args), x - y)
+        self.assertEqual(boxed_args, [])
 
 
 class TestAsyncTensorParallelPass(FSDPTest):

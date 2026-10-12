@@ -15,6 +15,7 @@ invokes ``standalone_compile`` once without additional overhead.
 from __future__ import annotations
 
 import logging
+from typing import Literal
 
 import torch
 from torch.fx.passes.regional_inductor import _dummy_wrapper, regional_inductor
@@ -126,16 +127,26 @@ def _copy_graph_with_used_placeholders(
 
 
 def standalone_inductor_compilation_pass(
-    gm: torch.fx.GraphModule, example_inputs: tuple, *, inductor_configs=None
+    gm: torch.fx.GraphModule,
+    example_inputs: tuple,
+    *,
+    artifact_mode: Literal["runtime", "serializable"],
+    boxed_codegen: bool = False,
+    inductor_configs=None,
 ) -> torch.fx.GraphModule:
-    """Compile the whole graph with one direct Inductor invocation.
+    """Compile a joint GraphTrainer graph with one Inductor invocation.
 
-    Use it when you want full inductor compilation and minimal compilation time,
-    identical to torch.compile on full model without any additional compile time overhead.
+    GraphTrainer has already traced and scheduled the joint forward/backward
+    graph. Runtime compilation therefore needs a directly callable cache
+    artifact, while offline precompilation needs a serializable bundled AOT
+    artifact.
 
     Args:
         gm: The graph module to compile.
         example_inputs: Example inputs corresponding to the graph placeholders.
+        artifact_mode: ``"runtime"`` returns an online callable;
+            ``"serializable"`` produces an artifact for precompile save/load.
+        boxed_codegen: Whether the returned graph uses boxed calling convention.
         inductor_configs: Optional Inductor config overrides.
     """
     import torch._inductor.config as ic
@@ -156,18 +167,24 @@ def standalone_inductor_compilation_pass(
     with (
         torch._guards.tracing(tracing_ctx),
         ic.patch(full_inductor_configs),
+        torch._functorch.config.patch(
+            remat_using_tags_for_fwd_loss_bwd_graph=False
+        ),
         torch.no_grad(),
     ):
         compiled_fn = torch._inductor.standalone_compile(
             compile_gm,
             compile_inputs,
             dynamic_shapes="from_tracing_context",
-            aot=True,
+            aot=artifact_mode == "serializable",
             donate_graph_module=False,
         )
 
-    return _wrap_compiled_artifact_as_graph_module(
-        gm, compiled_fn, used_placeholder_indices
+    return set_graph_module_boxed_codegen(
+        _wrap_compiled_artifact_as_graph_module(
+            gm, compiled_fn, used_placeholder_indices
+        ),
+        boxed=boxed_codegen,
     )
 
 
