@@ -362,7 +362,9 @@ class TestPrecompiledFxTraceArtifact(unittest.TestCase):
         expected = train_step(x, unused)
         traced = minimal_fx_tracer(train_step, module=model)(x, unused)
         traced.gm = standalone_inductor_compilation_pass(
-            traced.gm, traced.example_inputs
+            traced.gm,
+            traced.example_inputs,
+            artifact_mode="serializable",
         )
 
         with tempfile.TemporaryDirectory() as tmpdir:
