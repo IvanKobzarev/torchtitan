@@ -5867,6 +5867,66 @@ class TestCanonicalizeGraphPass(TestCase):
 
 class TestStandaloneInductorCompilationPass(TestCase):
     StructuredOutput = namedtuple("StructuredOutput", ("first", "second"))
+
+    def test_full_compile_uses_one_direct_runtime_artifact(self):
+        from torchtitan.experiments.graph_trainer.inductor_passes import (
+            full_inductor_compilation_pass,
+        )
+
+        graph = torch.fx.Graph()
+        x_node = graph.placeholder("x")
+        graph.output(graph.call_function(operator.add, args=(x_node, 1)))
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+        x = torch.ones(4)
+        seen = {}
+
+        def fake_standalone_compile(graph_module, example_inputs, **kwargs):
+            seen["graph_module"] = graph_module
+            seen["example_inputs"] = example_inputs
+            seen["kwargs"] = kwargs
+            return graph_module
+
+        with (
+            patch(
+                "torchtitan.experiments.graph_trainer.inductor_passes."
+                "standalone_inductor_compilation_pass",
+                side_effect=fake_standalone_compile,
+            ) as standalone_compile,
+            patch(
+                "torchtitan.experiments.graph_trainer.cuda_graph."
+                "is_cuda_graph_compatible",
+                return_value=False,
+            ),
+        ):
+            result = full_inductor_compilation_pass(
+                gm,
+                (x,),
+                boxed_codegen=True,
+                inductor_configs={"max_autotune": True},
+            )
+
+        standalone_compile.assert_called_once()
+        self.assertIs(seen["graph_module"], gm)
+        self.assertEqual(seen["example_inputs"], (x,))
+        self.assertEqual(
+            seen["kwargs"],
+            {
+                "artifact_mode": "runtime",
+                "boxed_codegen": True,
+                "inductor_configs": {
+                    "eager_numerics.division_rounding": True,
+                    "max_autotune": True,
+                },
+            },
+        )
+        self.assertFalse(result.meta["cuda_graph_compatible"])
+        self.assertFalse(
+            any(
+                "compile_with_inductor" in node.meta.get("custom", {})
+                for node in gm.graph.nodes
+            )
+        )
+
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
     def test_compiles_structured_outputs(self):
         from torchtitan.experiments.graph_trainer.inductor_passes import (
