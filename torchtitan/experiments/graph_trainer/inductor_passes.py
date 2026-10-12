@@ -15,10 +15,16 @@ invokes ``standalone_compile`` once without additional overhead.
 from __future__ import annotations
 
 import logging
+import operator
+from dataclasses import dataclass
 from typing import Literal
 
 import torch
-from torch.fx.passes.regional_inductor import _dummy_wrapper, regional_inductor
+from torch.fx.passes.regional_inductor import (
+    _disable_remat_for_regional_subcompile,
+    _dummy_wrapper,
+    regional_inductor,
+)
 
 from torchtitan.experiments.graph_trainer.common_utils import (
     set_graph_module_boxed_codegen,
@@ -77,6 +83,8 @@ def _wrap_compiled_artifact_as_graph_module(
     root: torch.fx.GraphModule,
     compiled_fn,
     used_placeholder_indices: list[int],
+    output_spec: torch.utils._pytree.TreeSpec,
+    output_leaf_meta: list[dict],
 ) -> torch.fx.GraphModule:
     graph = torch.fx.Graph()
     placeholders = []
@@ -91,7 +99,28 @@ def _wrap_compiled_artifact_as_graph_module(
     call = graph.call_function(_dummy_wrapper(compiled_fn), args=call_args)
     if output_meta:
         call.meta = output_meta
-    graph.output(call)
+
+    flat_outputs = []
+    for index, leaf_meta in enumerate(output_leaf_meta):
+        leaf = graph.call_function(operator.getitem, args=(call, index))
+        leaf.meta = leaf_meta
+        flat_outputs.append(leaf)
+
+    output_iterator = iter(flat_outputs)
+
+    def reconstruct_output(spec):
+        if spec.is_leaf():
+            return next(output_iterator)
+        children = [reconstruct_output(child) for child in spec.children()]
+        if torch.utils._pytree.is_namedtuple_class(spec.context):
+            return graph.call_function(spec.context, args=tuple(children))
+        if torch.utils._pytree.is_structseq_class(spec.type):
+            return graph.call_function(spec.type, args=(tuple(children),))
+        return torch.utils._pytree.SUPPORTED_NODES[spec.type].unflatten_fn(
+            children, spec.context
+        )
+
+    graph.output(reconstruct_output(output_spec))
     graph.lint()
 
     wrapped = torch.fx.GraphModule(root, graph)
@@ -99,10 +128,19 @@ def _wrap_compiled_artifact_as_graph_module(
     return wrapped
 
 
-def _copy_graph_with_used_placeholders(
+@dataclass(frozen=True)
+class _StandaloneCompileGraph:
+    gm: torch.fx.GraphModule
+    example_inputs: tuple
+    used_placeholder_indices: list[int]
+    output_spec: torch.utils._pytree.TreeSpec
+    output_leaf_meta: list[dict]
+
+
+def _copy_graph_for_standalone_compile(
     gm: torch.fx.GraphModule,
     example_inputs: tuple,
-) -> tuple[torch.fx.GraphModule, tuple, list[int]]:
+) -> _StandaloneCompileGraph:
     original_placeholders = list(gm.graph.find_nodes(op="placeholder"))
     used_placeholder_indices = [
         i for i, node in enumerate(original_placeholders) if len(node.users) > 0
@@ -122,8 +160,88 @@ def _copy_graph_with_used_placeholders(
 
     copied_gm = torch.fx.GraphModule(gm, graph)
     copied_gm.meta.update(gm.meta)
+    output_node = copied_gm.graph.output_node()
+
+    flat_outputs = []
+    output_leaf_meta = []
+
+    def output_leaf(value):
+        flat_outputs.append(value)
+        output_leaf_meta.append(
+            value.meta.copy() if isinstance(value, torch.fx.Node) else {}
+        )
+        return object()
+
+    def extract_path(value, example_value, path):
+        for key in path:
+            if isinstance(
+                key,
+                (
+                    torch.utils._pytree.SequenceKey,
+                    torch.utils._pytree.MappingKey,
+                ),
+            ):
+                index = key.idx if hasattr(key, "idx") else key.key
+                target = operator.getitem
+            elif isinstance(key, torch.utils._pytree.GetAttrKey):
+                index = key.name
+                target = getattr
+            else:
+                raise ValueError(
+                    "standalone Inductor output normalization does not support "
+                    f"pytree key {key!r}"
+                )
+            with copied_gm.graph.inserting_before(output_node):
+                value = copied_gm.graph.call_function(target, args=(value, index))
+            example_value = key.get(example_value)
+            value.meta["val"] = example_value
+        return value
+
+    def flatten_output(value):
+        if isinstance(value, torch.fx.Node):
+            if "val" in value.meta:
+                example_value = value.meta["val"]
+                path_leaves, example_spec = torch.utils._pytree.tree_flatten_with_path(
+                    example_value
+                )
+                if not example_spec.is_leaf():
+                    structure_leaves = [
+                        output_leaf(extract_path(value, example_value, path))
+                        for path, _ in path_leaves
+                    ]
+                    return torch.utils._pytree.tree_unflatten(
+                        structure_leaves, example_spec
+                    )
+            elif (
+                isinstance(value.target, torch._ops.OpOverload)
+                and len(value.target._schema.returns) > 1
+            ):
+                raise ValueError(
+                    f"multi-output node {value.name!r} requires val metadata before "
+                    "standalone Inductor compilation"
+                )
+            return output_leaf(value)
+
+        children, value_spec = torch.utils._pytree.tree_flatten(value)
+        if value_spec.is_leaf():
+            return output_leaf(value)
+        return torch.utils._pytree.tree_unflatten(
+            [flatten_output(child) for child in children], value_spec
+        )
+
+    output_structure = flatten_output(output_node.args[0])
+    _, output_spec = torch.utils._pytree.tree_flatten(output_structure)
+    output_node.args = (tuple(flat_outputs),)
+    copied_gm.graph.lint()
+    copied_gm.recompile()
     used_example_inputs = tuple(example_inputs[i] for i in used_placeholder_indices)
-    return copied_gm, used_example_inputs, used_placeholder_indices
+    return _StandaloneCompileGraph(
+        gm=copied_gm,
+        example_inputs=used_example_inputs,
+        used_placeholder_indices=used_placeholder_indices,
+        output_spec=output_spec,
+        output_leaf_meta=output_leaf_meta,
+    )
 
 
 def standalone_inductor_compilation_pass(
@@ -151,6 +269,12 @@ def standalone_inductor_compilation_pass(
     """
     import torch._inductor.config as ic
 
+    if artifact_mode not in ("runtime", "serializable"):
+        raise ValueError(
+            "artifact_mode must be 'runtime' or 'serializable', "
+            f"got {artifact_mode!r}"
+        )
+
     fake_mode = _get_fake_mode_from_gm(gm)
     tracing_ctx = torch._guards.TracingContext(fake_mode)
     full_inductor_configs = {
@@ -158,23 +282,17 @@ def standalone_inductor_compilation_pass(
         **dict(inductor_configs or {}),
     }
 
-    (
-        compile_gm,
-        compile_inputs,
-        used_placeholder_indices,
-    ) = _copy_graph_with_used_placeholders(gm, example_inputs)
+    compile_graph = _copy_graph_for_standalone_compile(gm, example_inputs)
 
     with (
         torch._guards.tracing(tracing_ctx),
         ic.patch(full_inductor_configs),
-        torch._functorch.config.patch(
-            remat_using_tags_for_fwd_loss_bwd_graph=False
-        ),
+        _disable_remat_for_regional_subcompile(),
         torch.no_grad(),
     ):
         compiled_fn = torch._inductor.standalone_compile(
-            compile_gm,
-            compile_inputs,
+            compile_graph.gm,
+            compile_graph.example_inputs,
             dynamic_shapes="from_tracing_context",
             aot=artifact_mode == "serializable",
             donate_graph_module=False,
@@ -182,7 +300,11 @@ def standalone_inductor_compilation_pass(
 
     return set_graph_module_boxed_codegen(
         _wrap_compiled_artifact_as_graph_module(
-            gm, compiled_fn, used_placeholder_indices
+            gm,
+            compiled_fn,
+            compile_graph.used_placeholder_indices,
+            compile_graph.output_spec,
+            compile_graph.output_leaf_meta,
         ),
         boxed=boxed_codegen,
     )

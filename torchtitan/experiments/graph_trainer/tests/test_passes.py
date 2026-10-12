@@ -7,7 +7,8 @@
 import inspect
 import operator
 import sys
-from collections import Counter, defaultdict
+import unittest
+from collections import Counter, defaultdict, namedtuple
 from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -5865,6 +5866,59 @@ class TestCanonicalizeGraphPass(TestCase):
 
 
 class TestStandaloneInductorCompilationPass(TestCase):
+    StructuredOutput = namedtuple("StructuredOutput", ("first", "second"))
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_compiles_structured_outputs(self):
+        from torchtitan.experiments.graph_trainer.inductor_passes import (
+            standalone_inductor_compilation_pass,
+        )
+
+        def f(value):
+            return value + 1, torch.ops.aten.native_dropout.default(value, 0.0, False)
+
+        value = torch.randn(8, device="cuda")
+        gm = make_fx(f)(value)
+        output_node = gm.graph.output_node()
+        first = output_node.args[0][0]
+        pair = next(
+            node
+            for node in gm.graph.nodes
+            if node.target == torch.ops.aten.native_dropout.default
+        )
+        output_node.args = ((first, pair),)
+        gm.graph.eliminate_dead_code()
+        gm.recompile()
+        compiled = standalone_inductor_compilation_pass(
+            gm,
+            (value,),
+            artifact_mode="runtime",
+        )
+
+        expected = f(value)
+        actual = compiled(value)
+        self.assertEqual(
+            torch.utils._pytree.tree_flatten(actual)[1],
+            torch.utils._pytree.tree_flatten(expected)[1],
+        )
+        torch.testing.assert_close(actual, expected)
+
+    def test_rejects_unknown_artifact_mode(self):
+        from torchtitan.experiments.graph_trainer.inductor_passes import (
+            standalone_inductor_compilation_pass,
+        )
+
+        graph = torch.fx.Graph()
+        x_node = graph.placeholder("x")
+        graph.output(x_node)
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+        with self.assertRaisesRegex(ValueError, "artifact_mode must be"):
+            standalone_inductor_compilation_pass(
+                gm,
+                (torch.ones(4),),
+                artifact_mode="serialize",
+            )
+
     def test_prunes_unused_placeholders_and_restores_outer_signature(self):
         from torchtitan.experiments.graph_trainer.inductor_passes import (
             standalone_inductor_compilation_pass,
@@ -5897,12 +5951,12 @@ class TestStandaloneInductorCompilationPass(TestCase):
             seen["compile_inputs"] = compile_inputs
             seen["kwargs"] = kwargs
             seen["reorder_for_peak_memory"] = ic.reorder_for_peak_memory
-            seen["remat_using_tags"] = (
-                torch._functorch.config.remat_using_tags_for_fwd_loss_bwd_graph
-            )
+            seen[
+                "remat_using_tags"
+            ] = torch._functorch.config.remat_using_tags_for_fwd_loss_bwd_graph
 
             def compiled_fn(a, b):
-                return a - b
+                return (a - b,)
 
             seen["compiled_fn"] = compiled_fn
             return compiled_fn
@@ -5947,6 +6001,184 @@ class TestStandaloneInductorCompilationPass(TestCase):
         boxed_args = [x, y, unused]
         torch.testing.assert_close(wrapped(boxed_args), x - y)
         self.assertEqual(boxed_args, [])
+
+    def test_flattens_structured_outputs_for_standalone_compile(self):
+        from torchtitan.experiments.graph_trainer.inductor_passes import (
+            standalone_inductor_compilation_pass,
+        )
+
+        x = torch.ones(4)
+        graph = torch.fx.Graph()
+        x_node = graph.placeholder("x")
+        first = graph.call_function(torch.ops.aten.add.Tensor, args=(x_node, 1))
+        pair = graph.call_function(
+            torch.ops.aten.native_dropout.default,
+            args=(x_node, 0.0, False),
+        )
+        pair.meta["val"] = (torch.empty_like(x), torch.empty_like(x, dtype=torch.bool))
+        graph.output((first, pair))
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+        seen = {}
+
+        def fake_standalone_compile(compile_gm, _compile_inputs, **_kwargs):
+            seen["output"] = compile_gm.graph.output_node().args[0]
+
+            def compiled_fn(value):
+                return value + 1, value + 2, value + 3
+
+            return compiled_fn
+
+        with patch(
+            "torch._inductor.standalone_compile",
+            side_effect=fake_standalone_compile,
+        ):
+            wrapped = standalone_inductor_compilation_pass(
+                gm,
+                (x,),
+                artifact_mode="runtime",
+            )
+
+        self.assertIsInstance(seen["output"], tuple)
+        self.assertEqual(len(seen["output"]), 3)
+        self.assertTrue(
+            all(isinstance(value, torch.fx.Node) for value in seen["output"])
+        )
+        expected = (x + 1, (x + 2, x + 3))
+        actual = wrapped(x)
+        self.assertEqual(
+            torch.utils._pytree.tree_flatten(actual)[1],
+            torch.utils._pytree.tree_flatten(expected)[1],
+        )
+        torch.testing.assert_close(actual, expected)
+
+    def test_preserves_namedtuple_output_specs(self):
+        from torchtitan.experiments.graph_trainer.inductor_passes import (
+            standalone_inductor_compilation_pass,
+        )
+
+        output_type = self.StructuredOutput
+
+        def make_pair(value):
+            return output_type(value + 2, value + 3)
+
+        x = torch.ones(4)
+        graph = torch.fx.Graph()
+        x_node = graph.placeholder("x")
+        first = graph.call_function(torch.ops.aten.add.Tensor, args=(x_node, 1))
+        pair = graph.call_function(make_pair, args=(x_node,))
+        pair.meta["val"] = output_type(torch.empty_like(x), torch.empty_like(x))
+        graph.output(output_type(first, pair))
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+        seen = {}
+
+        def fake_standalone_compile(compile_gm, _compile_inputs, **_kwargs):
+            seen["output"] = compile_gm.graph.output_node().args[0]
+
+            def compiled_fn(value):
+                return value + 1, value + 2, value + 3
+
+            return compiled_fn
+
+        with patch(
+            "torch._inductor.standalone_compile",
+            side_effect=fake_standalone_compile,
+        ):
+            wrapped = standalone_inductor_compilation_pass(
+                gm,
+                (x,),
+                artifact_mode="runtime",
+            )
+
+        self.assertEqual(len(seen["output"]), 3)
+        expected = output_type(x + 1, output_type(x + 2, x + 3))
+        actual = wrapped(x)
+        self.assertEqual(type(actual), output_type)
+        self.assertEqual(type(actual.second), output_type)
+        self.assertEqual(
+            torch.utils._pytree.tree_structure(actual),
+            torch.utils._pytree.tree_structure(expected),
+        )
+        torch.testing.assert_close(actual, expected)
+
+    def test_preserves_list_valued_node_output(self):
+        from torchtitan.experiments.graph_trainer.inductor_passes import (
+            standalone_inductor_compilation_pass,
+        )
+
+        def make_list(value):
+            return [value + 1, value + 2]
+
+        x = torch.ones(4)
+        graph = torch.fx.Graph()
+        x_node = graph.placeholder("x")
+        pair = graph.call_function(make_list, args=(x_node,))
+        pair.meta["val"] = [torch.empty_like(x), torch.empty_like(x)]
+        graph.output(pair)
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+        with patch(
+            "torch._inductor.standalone_compile",
+            return_value=lambda value: (value + 1, value + 2),
+        ):
+            wrapped = standalone_inductor_compilation_pass(
+                gm,
+                (x,),
+                artifact_mode="runtime",
+            )
+
+        actual = wrapped(x)
+        self.assertIsInstance(actual, list)
+        torch.testing.assert_close(actual, make_list(x))
+
+    def test_preserves_torch_return_type_output(self):
+        from torchtitan.experiments.graph_trainer.inductor_passes import (
+            standalone_inductor_compilation_pass,
+        )
+
+        x = torch.arange(4.0)
+        graph = torch.fx.Graph()
+        x_node = graph.placeholder("x")
+        pair = graph.call_function(torch.ops.aten.max.dim, args=(x_node, 0))
+        pair.meta["val"] = torch.max(x, dim=0)
+        graph.output(pair)
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+        with patch(
+            "torch._inductor.standalone_compile",
+            return_value=lambda value: tuple(torch.max(value, dim=0)),
+        ):
+            wrapped = standalone_inductor_compilation_pass(
+                gm,
+                (x,),
+                artifact_mode="runtime",
+            )
+
+        expected = torch.max(x, dim=0)
+        actual = wrapped(x)
+        self.assertEqual(type(actual), type(expected))
+        torch.testing.assert_close(actual, expected)
+
+    def test_requires_metadata_for_multi_output_nodes(self):
+        from torchtitan.experiments.graph_trainer.inductor_passes import (
+            standalone_inductor_compilation_pass,
+        )
+
+        x = torch.ones(4)
+        graph = torch.fx.Graph()
+        x_node = graph.placeholder("x")
+        pair = graph.call_function(
+            torch.ops.aten.native_dropout.default,
+            args=(x_node, 0.0, False),
+        )
+        graph.output(pair)
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+        with self.assertRaisesRegex(ValueError, "requires val metadata"):
+            standalone_inductor_compilation_pass(
+                gm,
+                (x,),
+                artifact_mode="runtime",
+            )
 
 
 class TestAsyncTensorParallelPass(FSDPTest):
