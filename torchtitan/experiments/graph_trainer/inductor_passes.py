@@ -225,9 +225,7 @@ def regional_inductor_pass(
             "not a normal FX GraphModule callable."
         )
 
-    # Ensure inductor produces bitwise-equal numerics vs eager.
-    ic.eager_numerics.division_rounding = True
-    # Recommended by inductor team — uncomment as needed:
+    # Recommended by inductor team -- enable as needed:
     # ic.emulate_precision_casts = True
     # ic.eager_numerics.disable_ftz = True
     # ic.eager_numerics.use_pytorch_libdevice = True
@@ -245,6 +243,7 @@ def regional_inductor_pass(
     if serializable:
         with (
             torch._guards.tracing(tracing_ctx),
+            ic.patch({"eager_numerics.division_rounding": True}),
             torch._functorch.config.patch("force_autograd_cache", True),
         ):
             result = regional_inductor(gm, example_inputs)
@@ -263,7 +262,10 @@ def regional_inductor_pass(
             )
         return result
 
-    with torch._guards.tracing(tracing_ctx):
+    with (
+        torch._guards.tracing(tracing_ctx),
+        ic.patch({"eager_numerics.division_rounding": True}),
+    ):
         gm = regional_inductor(gm, example_inputs)
 
     return set_graph_module_boxed_codegen(gm, boxed=boxed_codegen)
