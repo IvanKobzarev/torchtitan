@@ -7,6 +7,7 @@
 import inspect
 import operator
 import sys
+import unittest
 from collections import Counter, defaultdict
 from copy import deepcopy
 from types import SimpleNamespace
@@ -5849,6 +5850,31 @@ class TestCanonicalizeGraphPass(TestCase):
 
 
 class TestStandaloneInductorCompilationPass(TestCase):
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_compiles_structured_outputs(self):
+        from torchtitan.experiments.graph_trainer.inductor_passes import (
+            standalone_inductor_compilation_pass,
+        )
+
+        def f(value):
+            return value + 1, (value + 2, value + 3)
+
+        value = torch.randn(8, device="cuda")
+        gm = make_fx(f)(value)
+        compiled = standalone_inductor_compilation_pass(
+            gm,
+            (value,),
+            artifact_mode="runtime",
+        )
+
+        expected = f(value)
+        actual = compiled(value)
+        self.assertEqual(
+            torch.utils._pytree.tree_flatten(actual)[1],
+            torch.utils._pytree.tree_flatten(expected)[1],
+        )
+        torch.testing.assert_close(actual, expected)
+
     def test_regional_compile_scopes_eager_numerics_config(self):
         import torch._inductor.config as inductor_config
 
@@ -5863,15 +5889,11 @@ class TestStandaloneInductorCompilationPass(TestCase):
         seen = {}
 
         def fake_regional_inductor(graph_module, *_example_inputs):
-            seen["division_rounding"] = (
-                inductor_config.eager_numerics.division_rounding
-            )
+            seen["division_rounding"] = inductor_config.eager_numerics.division_rounding
             return graph_module
 
         with (
-            inductor_config.patch(
-                {"eager_numerics.division_rounding": False}
-            ),
+            inductor_config.patch({"eager_numerics.division_rounding": False}),
             patch(
                 "torchtitan.experiments.graph_trainer.inductor_passes."
                 "regional_inductor",
@@ -5915,12 +5937,12 @@ class TestStandaloneInductorCompilationPass(TestCase):
             seen["compile_inputs"] = compile_inputs
             seen["kwargs"] = kwargs
             seen["reorder_for_peak_memory"] = ic.reorder_for_peak_memory
-            seen["remat_using_tags"] = (
-                torch._functorch.config.remat_using_tags_for_fwd_loss_bwd_graph
-            )
+            seen[
+                "remat_using_tags"
+            ] = torch._functorch.config.remat_using_tags_for_fwd_loss_bwd_graph
 
             def compiled_fn(a, b):
-                return a - b
+                return (a - b,)
 
             seen["compiled_fn"] = compiled_fn
             return compiled_fn
@@ -5965,6 +5987,55 @@ class TestStandaloneInductorCompilationPass(TestCase):
         boxed_args = [x, y, unused]
         torch.testing.assert_close(wrapped(boxed_args), x - y)
         self.assertEqual(boxed_args, [])
+
+    def test_flattens_structured_outputs_for_standalone_compile(self):
+        from torchtitan.experiments.graph_trainer.inductor_passes import (
+            standalone_inductor_compilation_pass,
+        )
+
+        x = torch.ones(4)
+        graph = torch.fx.Graph()
+        x_node = graph.placeholder("x")
+        first = graph.call_function(torch.ops.aten.add.Tensor, args=(x_node, 1))
+        pair = graph.call_function(
+            torch.ops.aten.native_dropout.default,
+            args=(x_node, 0.0, False),
+        )
+        pair.meta["val"] = (torch.empty_like(x), torch.empty_like(x, dtype=torch.bool))
+        graph.output((first, pair))
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+        seen = {}
+
+        def fake_standalone_compile(compile_gm, _compile_inputs, **_kwargs):
+            seen["output"] = compile_gm.graph.output_node().args[0]
+
+            def compiled_fn(value):
+                return value + 1, value + 2, value + 3
+
+            return compiled_fn
+
+        with patch(
+            "torch._inductor.standalone_compile",
+            side_effect=fake_standalone_compile,
+        ):
+            wrapped = standalone_inductor_compilation_pass(
+                gm,
+                (x,),
+                artifact_mode="runtime",
+            )
+
+        self.assertIsInstance(seen["output"], tuple)
+        self.assertEqual(len(seen["output"]), 3)
+        self.assertTrue(
+            all(isinstance(value, torch.fx.Node) for value in seen["output"])
+        )
+        expected = (x + 1, (x + 2, x + 3))
+        actual = wrapped(x)
+        self.assertEqual(
+            torch.utils._pytree.tree_flatten(actual)[1],
+            torch.utils._pytree.tree_flatten(expected)[1],
+        )
+        torch.testing.assert_close(actual, expected)
 
 
 class TestAsyncTensorParallelPass(FSDPTest):
