@@ -1451,6 +1451,27 @@ class TestTraceDTensor(unittest.TestCase):
                 actual = actual[0]
             torch.testing.assert_close(actual, expected)
 
+    def test_full_inductor_pass_flattens_tuple_intermediate_outputs(self):
+        from torchtitan.experiments.graph_trainer.inductor_passes import (
+            full_inductor_compilation_pass,
+        )
+
+        def f(_state, x):
+            output, mask = torch.ops.aten.native_dropout.default(x, 0.25, False)
+            return output + 1, mask
+
+        x = torch.randn(8, device=self.DEVICE)
+        traced = minimal_fx_tracer(f)({}, x)
+        traced.gm.meta["cuda_graph_compatible"] = False
+        compiled_gm = full_inductor_compilation_pass(traced.gm, traced.example_inputs)
+
+        self.assertIs(compiled_gm.meta["cuda_graph_compatible"], False)
+        expected = f({}, x)
+        actual = compiled_gm(x)
+        self.assertEqual(len(actual), len(expected))
+        for actual_value, expected_value in zip(actual, expected, strict=True):
+            torch.testing.assert_close(actual_value, expected_value)
+
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestMetadataPropagation(unittest.TestCase):

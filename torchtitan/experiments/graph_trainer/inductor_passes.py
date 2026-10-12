@@ -7,9 +7,9 @@
 """Inductor compilation passes for GraphTrainer.
 
 ``regional_inductor_pass`` compiles only explicitly tagged regions. The
-``full_inductor_compilation_pass`` convenience wrapper tags the whole graph and uses that same regional pipeline.
-``standalone_inductor_compilation_pass`` bypasses region discovery which saves compilation time and
-invokes ``standalone_compile`` once without additional overhead.
+``full_inductor_compilation_pass`` compiles the whole graph directly with one
+``standalone_compile`` invocation. ``standalone_inductor_compilation_pass``
+provides that direct compilation primitive.
 """
 
 from __future__ import annotations
@@ -126,7 +126,11 @@ def _copy_graph_with_used_placeholders(
 
 
 def standalone_inductor_compilation_pass(
-    gm: torch.fx.GraphModule, example_inputs: tuple, *, inductor_configs=None
+    gm: torch.fx.GraphModule,
+    example_inputs: tuple,
+    *,
+    boxed_codegen: bool = False,
+    inductor_configs=None,
 ) -> torch.fx.GraphModule:
     """Compile the whole graph with one direct Inductor invocation.
 
@@ -136,6 +140,8 @@ def standalone_inductor_compilation_pass(
     Args:
         gm: The graph module to compile.
         example_inputs: Example inputs corresponding to the graph placeholders.
+        boxed_codegen: When True, the returned FX graph uses boxed calling
+            convention and clears its mutable runtime arg list.
         inductor_configs: Optional Inductor config overrides.
     """
     import torch._inductor.config as ic
@@ -166,8 +172,11 @@ def standalone_inductor_compilation_pass(
             donate_graph_module=False,
         )
 
-    return _wrap_compiled_artifact_as_graph_module(
-        gm, compiled_fn, used_placeholder_indices
+    return set_graph_module_boxed_codegen(
+        _wrap_compiled_artifact_as_graph_module(
+            gm, compiled_fn, used_placeholder_indices
+        ),
+        boxed=boxed_codegen,
     )
 
 
@@ -337,18 +346,16 @@ def full_inductor_compilation_pass(
     boxed_codegen: bool = False,
     inductor_configs=None,
 ) -> torch.fx.GraphModule:
-    """Compile the whole graph as one ``regional_inductor`` region.
+    """Compile the whole graph with one direct ``standalone_compile`` call.
 
-    Marks every non-placeholder/output node with the ``compile_with_inductor``
-    custom metadata key so ``regional_inductor`` scoops the entire graph as
-    one compiled region. This reuses the regional path (which goes through
-    ``standalone_compile`` and gets c10d functionalization, PG unboxing,
-    decompositions, and caching for free) instead of duplicating that prep
-    around a direct ``compile_fx_inner`` call.
+    Direct compilation avoids introducing a regional partition boundary for
+    a graph that is already the desired compilation unit. The standalone AOT
+    path still performs collective functionalization, process-group unboxing,
+    decompositions, and caching.
 
-    Must be the **terminal** pass — no FX-graph-level passes (e.g.
-    ``custom_codegen_pass``) can
-    run after this because the FX graph is no longer authoritative.
+    Must be the **terminal** pass -- no FX-graph-level passes (e.g.
+    ``custom_codegen_pass``) can run after this because the FX graph is no
+    longer authoritative.
 
     Args:
         gm: The graph module to compile.
@@ -368,31 +375,12 @@ def full_inductor_compilation_pass(
         **dict(inductor_configs or {}),
     }
     _migrate_cpu_get_attrs_to_cuda(gm)
-    for module in gm.modules():
-        if not isinstance(module, torch.fx.GraphModule):
-            continue
-        for node in module.graph.nodes:
-            if node.op in ("placeholder", "output"):
-                continue
-            custom = node.meta.setdefault("custom", {})
-            compile_with_inductor = custom.setdefault(
-                "compile_with_inductor", {"inductor_configs": {}}
-            )
-            custom["compile_with_inductor"] = {
-                **compile_with_inductor,
-                "inductor_configs": {
-                    **compile_with_inductor.get("inductor_configs", {}),
-                    **full_inductor_configs,
-                },
-            }
-    # AOT autograd (via ``standalone_compile``) reorders the gm and breaks
-    # fwd/bwd interleaving, blowing up the baseline schedule. Re-enable
-    # Inductor's reorder pass (disabled globally in ``compile.py``) to fix.
-    with ic.patch(reorder_for_peak_memory=True):
-        result = regional_inductor_pass(
-            gm,
-            example_inputs,
-            boxed_codegen=boxed_codegen,
-        )
-
-    return result
+    # Keep the eager-numerics setting that regional_inductor_pass applied for
+    # this public full-compile path before it compiled the tagged region.
+    ic.eager_numerics.division_rounding = True
+    return standalone_inductor_compilation_pass(
+        gm,
+        example_inputs,
+        boxed_codegen=boxed_codegen,
+        inductor_configs=full_inductor_configs,
+    )
