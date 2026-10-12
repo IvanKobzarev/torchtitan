@@ -15,6 +15,7 @@ invokes ``standalone_compile`` once without additional overhead.
 from __future__ import annotations
 
 import logging
+import operator
 from typing import Literal
 
 import torch
@@ -77,6 +78,8 @@ def _wrap_compiled_artifact_as_graph_module(
     root: torch.fx.GraphModule,
     compiled_fn,
     used_placeholder_indices: list[int],
+    output_spec: torch.utils._pytree.TreeSpec,
+    output_leaf_meta: list[dict],
 ) -> torch.fx.GraphModule:
     graph = torch.fx.Graph()
     placeholders = []
@@ -91,7 +94,13 @@ def _wrap_compiled_artifact_as_graph_module(
     call = graph.call_function(_dummy_wrapper(compiled_fn), args=call_args)
     if output_meta:
         call.meta = output_meta
-    graph.output(call)
+
+    flat_outputs = []
+    for index, leaf_meta in enumerate(output_leaf_meta):
+        leaf = graph.call_function(operator.getitem, args=(call, index))
+        leaf.meta = leaf_meta
+        flat_outputs.append(leaf)
+    graph.output(torch.utils._pytree.tree_unflatten(flat_outputs, output_spec))
     graph.lint()
 
     wrapped = torch.fx.GraphModule(root, graph)
@@ -102,7 +111,13 @@ def _wrap_compiled_artifact_as_graph_module(
 def _copy_graph_with_used_placeholders(
     gm: torch.fx.GraphModule,
     example_inputs: tuple,
-) -> tuple[torch.fx.GraphModule, tuple, list[int]]:
+) -> tuple[
+    torch.fx.GraphModule,
+    tuple,
+    list[int],
+    torch.utils._pytree.TreeSpec,
+    list[dict],
+]:
     original_placeholders = list(gm.graph.find_nodes(op="placeholder"))
     used_placeholder_indices = [
         i for i, node in enumerate(original_placeholders) if len(node.users) > 0
@@ -122,8 +137,49 @@ def _copy_graph_with_used_placeholders(
 
     copied_gm = torch.fx.GraphModule(gm, graph)
     copied_gm.meta.update(gm.meta)
+    output_node = copied_gm.graph.output_node()
+
+    flat_outputs = []
+    output_leaf_meta = []
+
+    def flatten_output(value):
+        if isinstance(value, torch.fx.Node):
+            example_value = value.meta.get("val")
+            if isinstance(example_value, (tuple, list)):
+                child_structures = []
+                for index, child_value in enumerate(example_value):
+                    with copied_gm.graph.inserting_before(output_node):
+                        child = copied_gm.graph.call_function(
+                            operator.getitem,
+                            args=(value, index),
+                        )
+                    child.meta["val"] = child_value
+                    child_structures.append(flatten_output(child))
+                return type(example_value)(child_structures)
+        elif isinstance(value, tuple):
+            return tuple(flatten_output(child) for child in value)
+        elif isinstance(value, list):
+            return [flatten_output(child) for child in value]
+
+        flat_outputs.append(value)
+        output_leaf_meta.append(
+            value.meta.copy() if isinstance(value, torch.fx.Node) else {}
+        )
+        return object()
+
+    output_structure = flatten_output(output_node.args[0])
+    _, output_spec = torch.utils._pytree.tree_flatten(output_structure)
+    output_node.args = (tuple(flat_outputs),)
+    copied_gm.graph.lint()
+    copied_gm.recompile()
     used_example_inputs = tuple(example_inputs[i] for i in used_placeholder_indices)
-    return copied_gm, used_example_inputs, used_placeholder_indices
+    return (
+        copied_gm,
+        used_example_inputs,
+        used_placeholder_indices,
+        output_spec,
+        output_leaf_meta,
+    )
 
 
 def standalone_inductor_compilation_pass(
@@ -162,14 +218,14 @@ def standalone_inductor_compilation_pass(
         compile_gm,
         compile_inputs,
         used_placeholder_indices,
+        output_spec,
+        output_leaf_meta,
     ) = _copy_graph_with_used_placeholders(gm, example_inputs)
 
     with (
         torch._guards.tracing(tracing_ctx),
         ic.patch(full_inductor_configs),
-        torch._functorch.config.patch(
-            remat_using_tags_for_fwd_loss_bwd_graph=False
-        ),
+        torch._functorch.config.patch(remat_using_tags_for_fwd_loss_bwd_graph=False),
         torch.no_grad(),
     ):
         compiled_fn = torch._inductor.standalone_compile(
@@ -182,7 +238,11 @@ def standalone_inductor_compilation_pass(
 
     return set_graph_module_boxed_codegen(
         _wrap_compiled_artifact_as_graph_module(
-            gm, compiled_fn, used_placeholder_indices
+            gm,
+            compiled_fn,
+            used_placeholder_indices,
+            output_spec,
+            output_leaf_meta,
         ),
         boxed=boxed_codegen,
     )
