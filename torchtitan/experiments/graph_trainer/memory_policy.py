@@ -623,11 +623,12 @@ def tag_min_cut_saved_values(
 
 
 @register_memory_policy("min_cut")
-def _min_cut_memory_policy_pass(
-    gm: torch.fx.GraphModule,
+def min_cut_memory_policy_pass(
+    gm,
+    example_inputs=None,
     *,
-    config: "GraphTrainer.Config",
-) -> torch.fx.GraphModule:
+    config=None,
+):
     """Choose saved activations with the min-cut partitioner."""
     backward_side = _backward_side_nodes(gm)
     node_info = _node_info_for_graph_trainer(gm, backward_side)
