@@ -521,6 +521,35 @@ def mark_invoke_subgraph(
     return region_node
 
 
+def outline_backward_subgraph_pass(gm, example_inputs=None):
+    """Outline contiguous backward regions in a flat training graph.
+
+    Run after activation rematerialization so recomputed operations are inside
+    the backward boundary. Tracing already identifies backward operations with
+    ``autograd_backward``; no model annotations are required.
+    """
+    regions = []
+    nodes = []
+    for node in gm.graph.nodes:
+        if node.op not in ("placeholder", "output") and node.meta.get(
+            "autograd_backward", False
+        ):
+            nodes.append(node)
+        elif node.op != "get_attr" and nodes:
+            regions.append(nodes)
+            nodes = []
+    if nodes:
+        regions.append(nodes)
+
+    for i, nodes in enumerate(regions):
+        mark_invoke_subgraph(
+            gm.graph, nodes, region_name_prefix=f"backward_subgraph_{i}"
+        )
+    gm.graph.lint()
+    gm.recompile()
+    return gm
+
+
 def _record_subgraph_region(
     module: torch.fx.GraphModule,
     region_node: Node,
