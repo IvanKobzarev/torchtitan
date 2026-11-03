@@ -634,6 +634,35 @@ def _min_cut_memory_policy_pass(
     if node_info is None:
         return gm
 
+    # Unlike AOT's functional joint graph, minimal_fx retains in-place writes.
+    # Recreating a tensor's allocation does not replay writes through its aliases.
+    written_storages = set()
+    for node in gm.graph.nodes:
+        if not isinstance(node.target, torch._ops.OpOverload):
+            continue
+        for i, arg in enumerate(node.target._schema.arguments):
+            if arg.alias_info is None or not arg.alias_info.is_write:
+                continue
+            value = node.kwargs.get(
+                arg.name, node.args[i] if i < len(node.args) else None
+            )
+            for inp in torch.utils._pytree.tree_leaves(value):
+                value = inp.meta.get("val") if isinstance(inp, torch.fx.Node) else inp
+                if isinstance(value, torch.Tensor):
+                    written_storages.add(value.untyped_storage()._cdata)
+    for node in node_info.required_fw_nodes:
+        value = node.meta.get("val")
+        if (
+            node.op == "call_function"
+            and isinstance(value, torch.Tensor)
+            and value.untyped_storage()._cdata in written_storages
+        ):
+            if node.meta.get("recompute") == CheckpointPolicy.MUST_RECOMPUTE:
+                raise RuntimeError(
+                    f"min_cut cannot recompute mutated storage at {node.name}"
+                )
+            node.meta["recompute"] = CheckpointPolicy.MUST_SAVE
+
     force_save_collectives(gm)
     force_save_effectful_ops(gm)
     force_save_bw_mutation_src(gm)
